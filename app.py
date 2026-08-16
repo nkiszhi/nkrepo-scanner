@@ -12,6 +12,7 @@ from scanner import HashSignatureDB, Scanner, YaraScanner
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIG_DIR = os.path.join(BASE_DIR, "signatures")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")  # 仅供放置测试样本, /scan 不再落盘
+os.makedirs(UPLOAD_DIR, exist_ok=True)  # 启动时自动创建, 目录缺失时动态生成
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 # 默认配置 (config.json 中的同名键会覆盖对应项)
