@@ -40,23 +40,27 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 
 ## 存储架构（千万级容量）
 
-哈希签名不是明文 `.hdb` 直读，而是三层架构，`check()` 接口对上层透明：
+哈希签名不是明文 `.hdb` 直读，而是 **Bloom 预过滤 + 256 前缀分片 SQLite**，`check()` 接口对上层透明：
 
 ```
-查询 hash
+查询 hash (md5 / sha1 / sha256)
    │
    ▼
 ① Bloom 预过滤 ──── 1% 误判率位图（k=7），肯定不在库 → 直接返回未命中
    │ 可能命中
    ▼
-② 内存排序数组 ──── 32B/条二进制摘要，bisect 二分查找（>200 万条时启用）
+② 前缀分片定位 ──── 取哈希前 2 个 hex 字符（= 摘要首字节），映射 256 个分片之一
    │
    ▼
-③ SQLite 持久层 ─── BLOB 主键 + WITHOUT ROWID，磁盘存储，增量导入
+③ 分片点查 ─────── 只打开该前缀对应的 signatures.db.shards/XX.db（只读连接，
+                    懒加载 + LRU 缓存，上限 64 个），BLOB 主键点查
 ```
 
+- 分片目录 `signatures/signatures.db.shards/`：`00.db` ~ `ff.db` 共 256 个小库 + `_meta.db`（导入记录与分片计数）；单分片体量仅为全库 1/256，点查与增量导入互不干扰
+- MD5 / SHA1 / SHA256 签名按**各自哈希**的前缀路由，一次文件扫描最多打开 3 个分片；冷启动 0 分片加载，随查询按需打开
 - `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` 下的新文件（`imported_files` 表去重，幂等）
-- Bloom 位图持久化到 `signatures/signatures.db.bloom`，签名总数不变不重建（首次构建千万条约 43s，之后启动即加载）
+- Bloom 位图持久化到 `signatures/signatures.db.bloom`，签名总数不变不重建
+- 兼容迁移：检测到旧版单一 `signatures.db` 时自动按前缀拆入 256 分片（原文件保留为 `signatures.db.migrated`）
 
 ### 千万级实测数据（1000 万条合成签名）
 
@@ -89,7 +93,7 @@ venv\Scripts\python app.py
 ```
 nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/、/scan、/api/stats）
-├── scanner.py                    # 扫描核心（HashSignatureDB 三层存储 + YaraScanner）
+├── scanner.py                    # 扫描核心（HashSignatureDB 分片存储 + YaraScanner）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
 ├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章）
@@ -99,7 +103,7 @@ nkrepo-scanner/
 ├── signatures/
 │   ├── hashes.hdb                # 本地哈希签名（含 EICAR）
 │   ├── rules.yar                 # YARA 规则集
-│   ├── signatures.db             # SQLite 签名库（运行时生成）
+│   ├── signatures.db.shards/     # 256 前缀分片（00.db~ff.db + _meta.db，运行时生成）
 │   └── signatures.db.bloom       # Bloom 位图（运行时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd

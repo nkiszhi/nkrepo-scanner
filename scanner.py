@@ -2,11 +2,11 @@
 NKREPO Scanner - 轻量级静态恶意软件扫描核心引擎
 仅实现两类静态检测: 哈希签名 (兼容 ClamAV .hdb 格式) + YARA 规则
 
-哈希签名存储采用三层架构, 支持千万级签名库:
-  1. Bloom 预过滤器  - 常驻内存位图, 快速排除"肯定不在库"的查询 (~1.2MB/百万条 @1% 误判率)
-  2. SQLite 持久层   - hash 以 BLOB 主键存储 (WITHOUT ROWID), 支持增量导入, 容量到亿级
-  3. 内存排序数组    - 可选, 签名数低于阈值时启动加载, 二分查找免去 SQL 开销
-     (阈值默认 300 万, 超过则只走 Bloom + SQLite, 与 ClamAV 的排序数组思路一致)
+哈希签名存储采用两层架构, 支持千万级签名库:
+  1. Bloom 预过滤器 - 常驻内存位图, 快速排除"肯定不在库"的查询 (~1.2MB/百万条 @1% 误判率)
+  2. 前缀分片 SQLite - 按哈希前 2 个 hex 字符(首字节)拆成 256 个独立小库,
+     查询时只懒加载前缀匹配的那 1 个分片 (只读连接 + LRU 缓存),
+     单分片体量仅为全库 1/256, 点查与增量导入互不干扰
 """
 import hashlib
 import math
@@ -15,6 +15,7 @@ import sqlite3
 import struct
 import threading
 import time
+from collections import OrderedDict
 
 import filetype as ft
 
@@ -120,47 +121,204 @@ class BloomFilter:
 
 
 # ============================================================
-# 哈希签名库 (SQLite + Bloom + 可选内存排序数组)
+# 哈希签名库 (Bloom + 256 前缀分片 SQLite)
 # ============================================================
 class HashSignatureDB:
-    """千万级哈希签名库
+    """千万级哈希签名库 (前缀分片存储)
 
-    - 存储: SQLite, 表 sigs(h BLOB PRIMARY KEY, size, name) WITHOUT ROWID
-      h 存二进制摘要 (比 hex 省一半), 算法由长度自动判定 (16=MD5/20=SHA1/32=SHA256)
-    - 导入: .hdb/.hsb 明文文件只是"导入格式", 增量 INSERT OR IGNORE, 已导入文件不重复导
-    - 查询: Bloom 先排除 → (命中候选时) 排序数组二分或 SQL 点查
+    - 分片: 哈希 hex 的前 2 个字符 (= 摘要首字节) 决定归属, 共 256 个小库
+      signatures.db.shards/00.db ... ff.db, 每片表 sigs(h BLOB PK, size, name) WITHOUT ROWID
+      MD5/SHA1/SHA256 签名按各自哈希前缀路由, 查询三种算法时分别定位对应分片
+    - 元数据: signatures.db.shards/_meta.db 存 imported_files 与各分片计数
+    - 查询: Bloom 先排除 → (候选时) 只打开前缀匹配的 1 个分片做只读点查,
+      连接懒加载 + LRU 缓存 (默认上限 64), 冷启动零分片加载
+    - 迁移: 检测到旧版单一 signatures.db 时自动分片迁移, 原文件保留为 .migrated
     """
 
-    def __init__(self, db_path, bloom_fp_rate=0.01, max_mem_digests=3_000_000):
+    def __init__(self, db_path, bloom_fp_rate=0.01, max_open_shards=64):
         self.db_path = db_path
+        self.shard_dir = db_path + ".shards"
+        self.meta_path = os.path.join(self.shard_dir, "_meta.db")
         self.bloom_path = db_path + ".bloom"
         self.bloom_fp_rate = bloom_fp_rate
-        self.max_mem_digests = max_mem_digests
+        self.max_open_shards = max(4, max_open_shards)
         self._lock = threading.RLock()
         self.source_files = []
 
-        self.db = sqlite3.connect(db_path, check_same_thread=False)
-        self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=NORMAL")
-        self.db.execute("PRAGMA cache_size=-65536")  # 64MB 页缓存
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS sigs("
-            " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
-        )
-        self.db.execute(
-            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)"
-        )
-        self.db.commit()
+        os.makedirs(self.shard_dir, exist_ok=True)
+        self.meta = self._open_rw(self.meta_path)
+        self._init_meta_schema(self.meta)
 
-        self._count = self._db_count()
+        # 旧版单库自动迁移 (一次性)
+        if os.path.exists(db_path):
+            self._migrate_legacy(db_path)
+
+        self._conns = OrderedDict()  # prefix -> 只读连接 (LRU)
+        self._count = self._load_count()
+        self.source_files = [
+            r[0] for r in self.meta.execute("SELECT name FROM imported_files")
+        ]
         self.bloom = None
-        self.mem_arrays = None  # {摘要字节数: bytes 排序块}
         self._load_bloom()
 
-    # ---------- 内部 ----------
-    def _db_count(self):
-        return self.db.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+    # ---------- 连接管理 ----------
+    @staticmethod
+    def _open_rw(path):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
 
+    @staticmethod
+    def _init_meta_schema(conn):
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS shard_counts(prefix TEXT PRIMARY KEY, cnt INTEGER NOT NULL)"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        conn.commit()
+
+    @staticmethod
+    def _shard_path(shard_dir, prefix):
+        return os.path.join(shard_dir, prefix + ".db")
+
+    def _ro_conn(self, prefix):
+        """获取分片只读连接 (懒加载 + LRU 淘汰); 分片文件不存在则返回 None"""
+        conn = self._conns.get(prefix)
+        if conn is not None:
+            self._conns.move_to_end(prefix)
+            return conn
+        path = self._shard_path(self.shard_dir, prefix)
+        if not os.path.exists(path):
+            return None  # 该前缀无签名, 无需建库
+        conn = sqlite3.connect(
+            f"file:{path}?mode=ro", uri=True, check_same_thread=False
+        )
+        self._conns[prefix] = conn
+        while len(self._conns) > self.max_open_shards:
+            _, old = self._conns.popitem(last=False)
+            try:
+                old.close()
+            except sqlite3.Error:
+                pass
+        return conn
+
+    # ---------- 计数 ----------
+    def _load_count(self):
+        """优先读分片计数缓存; 缓存失效(未标记)时逐片重数"""
+        valid = self.meta.execute(
+            "SELECT v FROM meta WHERE k='counts_valid'"
+        ).fetchone()
+        if valid and valid[0] == "1":
+            row = self.meta.execute("SELECT SUM(cnt) FROM shard_counts").fetchone()
+            return row[0] or 0
+        total = 0
+        counts = []
+        for i in range(256):
+            prefix = "%02x" % i
+            path = self._shard_path(self.shard_dir, prefix)
+            if not os.path.exists(path):
+                continue
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                cnt = conn.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+            except sqlite3.Error:
+                cnt = 0
+            conn.close()
+            counts.append((prefix, cnt))
+            total += cnt
+        with self.meta:
+            self.meta.executemany(
+                "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)", counts
+            )
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')"
+            )
+        return total
+
+    # ---------- 旧库迁移 ----------
+    def _migrate_legacy(self, legacy_path):
+        """把旧版单一 signatures.db 的签名按前缀拆入 256 分片"""
+        try:
+            legacy = sqlite3.connect(legacy_path)  # rw 打开以恢复可能存在的 WAL
+            tables = {
+                r[0] for r in legacy.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "sigs" not in tables:
+                legacy.close()
+                os.replace(legacy_path, legacy_path + ".migrated")
+                return
+            t0 = time.time()
+            total = 0
+            counts = []
+            for i in range(256):
+                prefix = "%02x" % i
+                shard = self._open_rw(self._shard_path(self.shard_dir, prefix))
+                shard.execute(
+                    "CREATE TABLE IF NOT EXISTS sigs("
+                    " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
+                )
+                before = shard.total_changes
+                if i < 255:
+                    cur = legacy.execute(
+                        "SELECT h,size,name FROM sigs WHERE h>=? AND h<?",
+                        (bytes([i]), bytes([i + 1])),
+                    )
+                else:
+                    cur = legacy.execute(
+                        "SELECT h,size,name FROM sigs WHERE h>=?", (b"\xff",)
+                    )
+                while True:
+                    rows = cur.fetchmany(50_000)
+                    if not rows:
+                        break
+                    shard.executemany(
+                        "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)", rows
+                    )
+                shard.commit()
+                inserted = shard.total_changes - before
+                shard.close()
+                if inserted:
+                    counts.append((prefix, inserted))
+                    total += inserted
+            # 迁移导入记录
+            try:
+                names = [r[0] for r in legacy.execute("SELECT name FROM imported_files")]
+                with self.meta:
+                    self.meta.executemany(
+                        "INSERT OR IGNORE INTO imported_files(name) VALUES(?)",
+                        [(n,) for n in names],
+                    )
+            except sqlite3.Error:
+                pass
+            legacy.close()
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                    counts,
+                )
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')"
+                )
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('migrated_from','1')"
+                )
+            os.replace(legacy_path, legacy_path + ".migrated")
+            for suffix in ("-wal", "-shm"):
+                try:
+                    os.remove(legacy_path + suffix)
+                except OSError:
+                    pass
+            print(f"[NKREPO] 旧单库已迁移至 256 分片: {total:,} 条, "
+                  f"耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
+        except Exception as e:
+            print(f"[NKREPO] 旧库迁移失败(将按空分片库启动): {e}")
+
+    # ---------- Bloom ----------
     def _load_bloom(self):
         """加载持久化 Bloom; 若与当前签名数不匹配则标记待重建 (在 finalize 中执行)"""
         if os.path.exists(self.bloom_path):
@@ -176,7 +334,7 @@ class HashSignatureDB:
 
     def already_imported(self, filename):
         with self._lock:
-            row = self.db.execute(
+            row = self.meta.execute(
                 "SELECT 1 FROM imported_files WHERE name=?", (filename,)
             ).fetchone()
             return row is not None
@@ -185,10 +343,9 @@ class HashSignatureDB:
     def import_hdb(self, filepath, batch=50_000):
         """导入 .hdb/.hsb 明文签名文件 (增量, 幂等), 返回新插入条数"""
         basename = os.path.basename(filepath)
-        buf = []
+        pending = {}  # prefix -> [(digest, size, name)]
         start = time.time()
         with self._lock:
-            before = self.db.total_changes
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line = line.strip()
@@ -207,22 +364,36 @@ class HashSignatureDB:
                     size_field = parts[1].strip()
                     size = None if size_field == "*" else int(size_field)
                     name = parts[2].strip()
-                    buf.append((digest, size, name))
-                    if len(buf) >= batch:
-                        self.db.executemany(
-                            "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)", buf
-                        )
-                        buf.clear()
-            if buf:
-                self.db.executemany(
-                    "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)", buf
+                    pending.setdefault(digest[:1].hex(), []).append((digest, size, name))
+            inserted = 0
+            count_updates = []
+            for prefix, rows in pending.items():
+                shard = self._open_rw(self._shard_path(self.shard_dir, prefix))
+                shard.execute(
+                    "CREATE TABLE IF NOT EXISTS sigs("
+                    " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
                 )
-            inserted = self.db.total_changes - before
-            self.db.execute(
-                "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,)
-            )
-            self.db.commit()
-        self._count = self._db_count()
+                before = shard.total_changes
+                for i in range(0, len(rows), batch):
+                    shard.executemany(
+                        "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)",
+                        rows[i:i + batch],
+                    )
+                shard.commit()
+                delta = shard.total_changes - before
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                shard.close()
+                inserted += delta
+                count_updates.append((cnt, prefix))
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                    [(p, c) for c, p in count_updates],
+                )
+                self.meta.execute(
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,)
+                )
+            self._count += inserted
         if basename not in self.source_files:
             self.source_files.append(basename)
         return inserted
@@ -232,59 +403,40 @@ class HashSignatureDB:
         return self.import_hdb(filepath)
 
     def finalize(self):
-        """导入完成后调用: 重建过期 Bloom, 重载内存排序数组。返回状态 dict"""
+        """导入完成后调用: 按需重建 Bloom。返回状态 dict"""
         status = {}
         with self._lock:
             if self._count > 0 and (self.bloom is None or self.bloom.n != self._count):
                 t0 = time.time()
                 bf = BloomFilter(self._count, self.bloom_fp_rate)
-                cur = self.db.execute("SELECT h FROM sigs")
-                while True:
-                    rows = cur.fetchmany(100_000)
-                    if not rows:
-                        break
-                    for (h,) in rows:
-                        bf.add(h)
+                for i in range(256):
+                    prefix = "%02x" % i
+                    path = self._shard_path(self.shard_dir, prefix)
+                    if not os.path.exists(path):
+                        continue
+                    conn = self._ro_conn(prefix)
+                    cur = conn.execute("SELECT h FROM sigs")
+                    while True:
+                        rows = cur.fetchmany(100_000)
+                        if not rows:
+                            break
+                        for (h,) in rows:
+                            bf.add(h)
                 bf.save(self.bloom_path)
                 self.bloom = bf
                 status["bloom_rebuilt_s"] = round(time.time() - t0, 1)
-            self.mem_arrays = None
-            if 0 < self._count <= self.max_mem_digests:
-                t0 = time.time()
-                arrays = {}
-                cur = self.db.execute("SELECT h FROM sigs ORDER BY h")  # 主键序
-                while True:
-                    rows = cur.fetchmany(100_000)
-                    if not rows:
-                        break
-                    for (h,) in rows:
-                        arrays.setdefault(len(h), bytearray()).extend(h)
-                self.mem_arrays = {ln: bytes(b) for ln, b in arrays.items()}
-                status["mem_arrays_loaded_s"] = round(time.time() - t0, 1)
         return status
 
     # ---------- 查询 ----------
-    @staticmethod
-    def _bisect_blob(blob, item_len, digest):
-        """在按主键序拼接的二进制大块上做二分查找"""
-        lo, hi = 0, len(blob) // item_len
-        while lo < hi:
-            mid = (lo + hi) // 2
-            chunk = blob[mid * item_len:(mid + 1) * item_len]
-            if chunk < digest:
-                lo = mid + 1
-            elif chunk > digest:
-                hi = mid
-            else:
-                return True
-        return False
-
     @property
     def count(self):
         return self._count
 
     def check(self, file_path, file_size, md5, sha1, sha256):
-        """检查文件哈希是否命中签名, 返回命中列表 (接口与旧版一致)"""
+        """检查文件哈希是否命中签名, 返回命中列表 (接口与旧版一致)
+
+        每个哈希按自身前 2 个 hex 字符定位 1 个分片, 只对该分片做点查
+        """
         hits = []
         with self._lock:
             for hexh in (md5, sha1, sha256):
@@ -292,19 +444,13 @@ class HashSignatureDB:
                 # 第 1 层: Bloom 排除 (干净文件在此全部短路, 零 SQL 开销)
                 if self.bloom is not None and digest not in self.bloom:
                     continue
-                # 第 2 层: 内存排序数组二分 / 第 3 层: SQLite 点查
-                arr = (self.mem_arrays or {}).get(len(digest))
-                if arr is not None:
-                    if not self._bisect_blob(arr, len(digest), digest):
-                        continue
-                    row = self.db.execute(
-                        "SELECT size, name FROM sigs WHERE h=?", (digest,)
-                    ).fetchone()
-                else:
-                    row = self.db.execute(
-                        "SELECT size, name FROM sigs WHERE h=?"
-                        " AND (size IS NULL OR size=?)", (digest, file_size)
-                    ).fetchone()
+                # 第 2 层: 前缀分片点查 (只加载 hex 前 2 位匹配的那个分片)
+                conn = self._ro_conn(digest[:1].hex())
+                if conn is None:
+                    continue
+                row = conn.execute(
+                    "SELECT size, name FROM sigs WHERE h=?", (digest,)
+                ).fetchone()
                 if row is None:
                     continue
                 sig_size, name = row
@@ -329,36 +475,44 @@ class HashSignatureDB:
                 "hash_funcs": self.bloom.k,
                 "fp_rate": self.bloom.fp_rate,
             }
-        mem_arrays_info = None
-        if self.mem_arrays:
-            mem_arrays_info = {
-                ln: f"{len(b) // ln:,} 条 / {len(b) / 1048576:.1f}MB"
-                for ln, b in self.mem_arrays.items()
-            }
-        db_size = 0
-        for suffix in ("", "-wal", "-shm"):
-            try:
-                db_size += os.path.getsize(self.db_path + suffix)
-            except OSError:
-                pass
-        tier = "sqlite"
-        if self.bloom is not None and self.mem_arrays:
-            tier = "bloom+memarray+sqlite"
-        elif self.bloom is not None:
-            tier = "bloom+sqlite"
-        elif self.mem_arrays:
-            tier = "memarray+sqlite"
+        shard_files = [
+            f for f in os.listdir(self.shard_dir)
+            if len(f) == 5 and f.endswith(".db")  # "00.db" ~ "ff.db"
+        ]
+        shard_sizes = []
+        for f in shard_files:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    shard_sizes.append(os.path.getsize(os.path.join(self.shard_dir, f + suffix)))
+                except OSError:
+                    pass
+        db_size = sum(shard_sizes)
+        try:
+            db_size += os.path.getsize(self.meta_path)
+        except OSError:
+            pass
+        tier = "bloom+sharded-sqlite" if self.bloom is not None else "sharded-sqlite"
         return {
             "count": self._count,
             "tier": tier,
             "bloom": bloom_info,
-            "mem_arrays": mem_arrays_info,
+            "shards": {
+                "total": len(shard_files),
+                "open_conns": len(self._conns),
+                "max_open": self.max_open_shards,
+            },
             "db_size_mb": round(db_size / 1048576, 1),
         }
 
     def close(self):
         with self._lock:
-            self.db.close()
+            for conn in self._conns.values():
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self._conns.clear()
+            self.meta.close()
 
 
 # ============================================================

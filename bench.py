@@ -51,8 +51,12 @@ def main():
         b = st["bloom"]
         print(f"[bench] Bloom    : {b['mem_mb']} MB 常驻内存, "
               f"k={b['hash_funcs']}, fp={b['fp_rate']}")
-    if st["mem_arrays"]:
+    if st.get("mem_arrays"):
         print(f"[bench] 排序数组 : {st['mem_arrays']}")
+    if st.get("shards"):
+        sh = st["shards"]
+        print(f"[bench] 分片     : {sh['total']} 个 SQLite 库, "
+              f"当前已加载 {sh['open_conns']}/{sh['max_open']} 连接")
 
     # ---------- 未命中延迟 (干净文件路径: Bloom 短路) ----------
     miss_ms = []
@@ -69,11 +73,24 @@ def main():
     print(f"[bench] 未命中(干净文件) : avg {sum(miss_ms)/len(miss_ms):.3f} ms | "
           f"p50 {pct(miss_ms,50):.3f} | p95 {pct(miss_ms,95):.3f}")
 
-    # ---------- 命中延迟 (报毒文件路径: Bloom 通过 + 精确查询) ----------
-    total = st["count"]
-    sample_rows = db.db.execute(
-        "SELECT h, size FROM sigs LIMIT ? OFFSET ?", (args.hits, random.randint(0, max(1, total - args.hits - 1)))
-    ).fetchall()
+    # ---------- 命中延迟 (报毒文件路径: Bloom 通过 + 分片点查) ----------
+    # 从随机分片中采样真实签名
+    shard_files = [
+        f for f in os.listdir(db.shard_dir)
+        if len(f) == 5 and f.endswith(".db")
+    ]
+    sample_rows = []
+    random.shuffle(shard_files)
+    for sf in shard_files:
+        conn = db._ro_conn(sf[:2])
+        if conn is None:
+            continue
+        sample_rows.extend(conn.execute(
+            "SELECT h, size FROM sigs LIMIT ?", (args.hits,)
+        ).fetchall())
+        if len(sample_rows) >= args.hits:
+            break
+    sample_rows = sample_rows[:args.hits]
     hit_ms = []
     n_hit = 0
     for h, size in sample_rows:

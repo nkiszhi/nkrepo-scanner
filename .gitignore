@@ -4,6 +4,8 @@ signatures/*.db.bloom
 signatures/*.db-journal
 signatures/*.db-shm
 signatures/*.db-wal
+signatures/*.db.migrated
+signatures/*.db.shards/
 
 # 病毒库原始文件与解包产物（README 有下载/重建方法）
 cvd/
