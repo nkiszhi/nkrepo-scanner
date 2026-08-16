@@ -1,26 +1,70 @@
 """
 NKREPO Scanner - Web 服务入口
-启动: python app.py  →  http://127.0.0.1:5000
+启动: python app.py  →  http://127.0.0.1:5000 (地址/端口可由 config.json 修改)
 """
+import json
 import os
-import tempfile
 
 from flask import Flask, jsonify, render_template, request
-from werkzeug.utils import secure_filename
 
 from scanner import HashSignatureDB, Scanner, YaraScanner
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIG_DIR = os.path.join(BASE_DIR, "signatures")
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
-MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
+UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")  # 仅供放置测试样本, /scan 不再落盘
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
+# 默认配置 (config.json 中的同名键会覆盖对应项)
+DEFAULT_CONFIG = {
+    "bloom": {
+        "shards": 4,               # Bloom Filter 分片数, 同时驱动 SQLite 动态分片数 (任意正整数)
+        "fp_rate": 0.01,           # Bloom 误判率
+    },
+    "hash_db": {
+        "max_open_shards": 4,      # 分片 SQLite 连接 / Bloom 位图懒加载 LRU 上限
+    },
+    "server": {
+        "host": "127.0.0.1",
+        "port": 5000,
+        "max_upload_mb": 50,
+    },
+}
+
+
+def load_config(path=CONFIG_PATH):
+    """加载 config.json 并与默认值逐节合并 (忽略以 _ 开头的注释键)"""
+    cfg = {k: dict(v) for k, v in DEFAULT_CONFIG.items()}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                user = json.load(f)
+            for section, values in user.items():
+                if section not in cfg or not isinstance(values, dict):
+                    continue
+                for key, val in values.items():
+                    if not key.startswith("_"):
+                        cfg[section][key] = val
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[NKREPO] 配置文件解析失败, 使用默认配置: {e}")
+    return cfg
+
+
+cfg = load_config()
+bcfg = cfg["bloom"]
+hcfg = cfg["hash_db"]
+scfg = cfg["server"]
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH
+app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 
 # ---------- 初始化扫描引擎 ----------
-# 哈希签名持久化在 SQLite (signatures/signatures.db), .hdb 明文仅作增量导入格式
-hash_db = HashSignatureDB(os.path.join(SIG_DIR, "signatures.db"))
+# 哈希签名持久化在动态分片 SQLite (signatures/signatures.db.shards/),
+# 分片数 = config 中 bloom.shards, Bloom 位图按同样分片数懒加载
+hash_db = HashSignatureDB(
+    os.path.join(SIG_DIR, "signatures.db"),
+    shard_count=int(bcfg["shards"]),
+    bloom_fp_rate=float(bcfg["fp_rate"]),
+    max_open_shards=int(hcfg["max_open_shards"]),
+)
 yara_scanner = YaraScanner()
 
 for fname in sorted(os.listdir(SIG_DIR)):
@@ -37,7 +81,6 @@ if finalize_status:
     print(f"[NKREPO] 签名库整理: {finalize_status}")
 
 scanner = Scanner(hash_db, yara_scanner)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 @app.route("/")
@@ -66,27 +109,17 @@ def scan():
     if not f.filename:
         return jsonify({"error": "空文件名"}), 400
 
-    # 保存到临时文件 (保留原始扩展名便于魔数/类型判断)
-    safe_name = secure_filename(f.filename) or "unnamed"
-    fd, tmp_path = tempfile.mkstemp(
-        suffix="_" + safe_name, dir=UPLOAD_DIR
-    )
-    try:
-        os.close(fd)
-        f.save(tmp_path)
-        result = scanner.scan_file(tmp_path, filename=f.filename)
-        return jsonify(result)
-    finally:
-        try:
-            os.remove(tmp_path)
-        except OSError:
-            pass
+    # 直接内存读取扫描 (受 MAX_CONTENT_LENGTH 限制), 哈希/类型/YARA 复用同一缓冲, 全程不落盘
+    data = f.read()
+    result = scanner.scan_bytes(data, filename=f.filename)
+    return jsonify(result)
 
 
 if __name__ == "__main__":
     st = hash_db.stats()
     print(f"[NKREPO] 哈希签名: {hash_db.count:,} 条 (存储层: {st['tier']}, "
-          f"DB {st['db_size_mb']}MB) | YARA 规则: {yara_scanner.rule_count} 条")
+          f"分片: {st['shards']['configured']}, DB {st['db_size_mb']}MB) "
+          f"| YARA 规则: {yara_scanner.rule_count} 条")
     if yara_scanner.error:
         print(f"[NKREPO] YARA 警告: {yara_scanner.error}")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=scfg["host"], port=int(scfg["port"]), debug=False, threaded=True)

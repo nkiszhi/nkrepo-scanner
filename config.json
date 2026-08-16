@@ -1,0 +1,20 @@
+{
+  "bloom": {
+    "_comment_shards": "Bloom Filter 分片数, 同时驱动 SQLite 动态分片数 (任意正整数, 如 16/64/256/1024); 路由规则 = 哈希前4字节 % shards; 修改后已有数据在下次启动时自动重分片",
+    "shards": 4,
+
+    "_comment_fp_rate": "Bloom 过滤器误判率 (0.01 = 1%), 越小内存越大",
+    "fp_rate": 0.01
+  },
+
+  "hash_db": {
+    "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图的懒加载 LRU 缓存上限",
+    "max_open_shards": 4
+  },
+
+  "server": {
+    "host": "127.0.0.1",
+    "port": 5000,
+    "max_upload_mb": 50
+  }
+}

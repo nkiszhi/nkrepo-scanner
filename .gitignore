@@ -1,11 +1,14 @@
 # 运行时生成物
 signatures/*.db
 signatures/*.db.bloom
+signatures/*.db.bloom.legacy
+signatures/*.db.bloom/
 signatures/*.db-journal
 signatures/*.db-shm
 signatures/*.db-wal
 signatures/*.db.migrated
 signatures/*.db.shards/
+signatures/*.db.shards.legacy/
 
 # 病毒库原始文件与解包产物（README 有下载/重建方法）
 cvd/
@@ -17,6 +20,10 @@ uploads/*
 !uploads/eicar.com
 !uploads/marker.txt
 !uploads/clean.txt
+
+# 调试/迁移临时文件
+_mig_*.py
+_mig_*.txt
 
 # Python
 __pycache__/

@@ -49,8 +49,8 @@ def main():
     print(f"[bench] SQLite   : {st['db_size_mb']} MB 磁盘")
     if st["bloom"]:
         b = st["bloom"]
-        print(f"[bench] Bloom    : {b['mem_mb']} MB 常驻内存, "
-              f"k={b['hash_funcs']}, fp={b['fp_rate']}")
+        print(f"[bench] Bloom    : {b['shards_loaded']}/{b['shards_configured']} 分片已加载 "
+              f"({b['mem_mb']} MB), k={b['hash_funcs']}, fp={b['fp_rate']}")
     if st.get("mem_arrays"):
         print(f"[bench] 排序数组 : {st['mem_arrays']}")
     if st.get("shards"):
@@ -77,12 +77,12 @@ def main():
     # 从随机分片中采样真实签名
     shard_files = [
         f for f in os.listdir(db.shard_dir)
-        if len(f) == 5 and f.endswith(".db")
+        if len(f) == 7 and f.endswith(".db") and f[:-3].isdigit()
     ]
     sample_rows = []
     random.shuffle(shard_files)
     for sf in shard_files:
-        conn = db._ro_conn(sf[:2])
+        conn = db._ro_conn(int(sf[:-3]))
         if conn is None:
             continue
         sample_rows.extend(conn.execute(
