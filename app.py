@@ -11,8 +11,6 @@ from scanner import HashSignatureDB, Scanner, YaraScanner
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIG_DIR = os.path.join(BASE_DIR, "signatures")
-UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")  # 仅供放置测试样本, /scan 不再落盘
-os.makedirs(UPLOAD_DIR, exist_ok=True)  # 启动时自动创建, 目录缺失时动态生成
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 # 默认配置 (config.json 中的同名键会覆盖对应项)
@@ -28,6 +26,7 @@ DEFAULT_CONFIG = {
         "host": "127.0.0.1",
         "port": 5000,
         "max_upload_mb": 50,
+        "uploads_dir": "uploads",  # 上传测试样本目录 (相对项目根目录或绝对路径), 启动时自动创建
     },
 }
 
@@ -54,6 +53,11 @@ cfg = load_config()
 bcfg = cfg["bloom"]
 hcfg = cfg["hash_db"]
 scfg = cfg["server"]
+
+# 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建; 仅用于放置测试样本, /scan 不落盘
+_uploads_cfg = str(scfg.get("uploads_dir", "uploads")).strip()
+UPLOAD_DIR = _uploads_cfg if os.path.isabs(_uploads_cfg) else os.path.join(BASE_DIR, _uploads_cfg)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 

@@ -95,7 +95,8 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
   "server": {
     "host": "127.0.0.1",
     "port": 5000,
-    "max_upload_mb": 50
+    "max_upload_mb": 50,    // /scan 上传大小上限 (MB)
+    "uploads_dir": "uploads" // 上传测试样本目录: 相对路径基于项目根目录解析, 也支持绝对路径; 启动时目录不存在会自动创建
   }
 }
 ```
@@ -140,7 +141,7 @@ nkrepo-scanner/
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
 ├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章）
-├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口）
+├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口/上传目录）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
 ├── bench.py                      # 性能基准（延迟 / 内存 / 磁盘）
@@ -152,7 +153,7 @@ nkrepo-scanner/
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd
-├── uploads/                      # 测试样本（marker.txt / clean.txt；eicar.com 需手动生成，不入库）；/scan 上传不再落盘
+├── uploads/                      # 测试样本目录（路径由 server.uploads_dir 配置，相对项目根目录或绝对路径；启动时不存在会自动创建；/scan 上传不落盘）
 └── requirements.txt
 ```
 
