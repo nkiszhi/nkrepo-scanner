@@ -1,1 +1,0 @@
-NKREPO-MALWARE-TEST-MARKER fake bad file
