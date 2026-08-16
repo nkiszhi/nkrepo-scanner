@@ -16,6 +16,8 @@ import struct
 import threading
 import time
 
+import filetype as ft
+
 try:
     import yara
     YARA_AVAILABLE = True
@@ -45,30 +47,16 @@ def compute_hashes(file_path):
 
 
 def guess_file_type(file_path):
-    """通过魔数粗略判断文件类型"""
-    magic_map = [
-        (b"MZ", "PE 可执行文件"),
-        (b"\x7fELF", "ELF 可执行文件"),
-        (b"\xd0\xcf\x11\xe0", "OLE2 文档 (doc/xls/ppt)"),
-        (b"PK\x03\x04", "ZIP 容器 (zip/docx/jar...)"),
-        (b"%PDF", "PDF 文档"),
-        (b"\x1f\x8b", "GZIP 压缩"),
-        (b"Rar!", "RAR 压缩"),
-        (b"7z\xbc\xaf", "7z 压缩"),
-        (b"<?xml", "XML 文档"),
-        (b"{\\rtf", "RTF 文档"),
-    ]
+    """通过魔数判断文件类型 (兼容旧接口, 返回显示名)
+
+    实际逻辑在 filetype.py 中实现, 移植自 ClamAV 的 FTM 魔数签名表:
+      固定偏移魔数 (type-0) → 模式搜索 (type-1: PE/SFX/HTML) → 尾部魔数 (DMG) → 文本编码检测
+    """
     try:
-        with open(file_path, "rb") as f:
-            head = f.read(8)
+        head, tail = ft.read_head_tail(file_path)
+        return ft.detect_file_type(head, tail)["name"]
     except OSError:
         return "未知"
-    for magic, name in magic_map:
-        if head.startswith(magic):
-            return name
-    if b"\x00" not in head and head:
-        return "文本文件"
-    return "未知 (二进制)"
 
 
 # ============================================================
@@ -463,6 +451,14 @@ class Scanner:
         file_size = os.path.getsize(file_path)
         md5, sha1, sha256 = compute_hashes(file_path)
 
+        # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
+        ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
+        try:
+            head, tail = ft.read_head_tail(file_path)
+            ftype = ft.detect_file_type(head, tail, filename)
+        except OSError:
+            pass
+
         detections = []
         detections.extend(self.hash_db.check(file_path, file_size, md5, sha1, sha256))
         detections.extend(self.yara_scanner.scan(file_path))
@@ -472,7 +468,8 @@ class Scanner:
             "filename": filename or os.path.basename(file_path),
             "size": file_size,
             "size_human": _human_size(file_size),
-            "file_type": guess_file_type(file_path),
+            "file_type": ftype["name"],          # 显示名 (向后兼容)
+            "file_type_info": ftype,             # 结构化: name/cl_type/category/method
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,

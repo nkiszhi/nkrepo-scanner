@@ -126,6 +126,42 @@ h1 { font-size: 22px; font-weight: 600; }
 .ok-line { color: var(--green); font-size: 13px; }
 .scan-info { color: var(--text-dim); font-size: 12px; margin-top: 10px; }
 
+/* 文件类型徽章 (ClamAV FTM 风格) */
+.ftype-row {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; padding: 10px 14px;
+  background: rgba(74,158,255,.05); border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.ftype-row .ft-icon { font-size: 16px; }
+.ftype-row .ft-name { font-size: 13px; font-weight: 600; }
+.ftype-row .ft-cat {
+  font-size: 11px; padding: 1px 10px; border-radius: 12px;
+  font-family: var(--mono); letter-spacing: .3px;
+}
+.ft-cat.executable { background: rgba(255,93,93,.12); color: var(--red); border: 1px solid rgba(255,93,93,.35); }
+.ft-cat.document    { background: rgba(74,158,255,.12); color: var(--accent); border: 1px solid rgba(74,158,255,.35); }
+.ft-cat.archive     { background: rgba(255,180,84,.12); color: var(--amber); border: 1px solid rgba(255,180,84,.35); }
+.ft-cat.graphics    { background: rgba(61,220,132,.12); color: var(--green); border: 1px solid rgba(61,220,132,.35); }
+.ft-cat.media       { background: rgba(186,104,255,.12); color: #ba68ff; border: 1px solid rgba(186,104,255,.35); }
+.ft-cat.script      { background: rgba(255,180,84,.12); color: var(--amber); border: 1px solid rgba(255,180,84,.35); }
+.ft-cat.mail        { background: rgba(139,148,163,.15); color: var(--text-dim); border: 1px solid var(--border); }
+.ft-cat.text        { background: rgba(139,148,163,.15); color: var(--text-dim); border: 1px solid var(--border); }
+.ft-cat.disk        { background: rgba(186,104,255,.12); color: #ba68ff; border: 1px solid rgba(186,104,255,.35); }
+.ft-cat.ai-model    { background: rgba(61,220,132,.12); color: var(--green); border: 1px solid rgba(61,220,132,.35); }
+.ft-cat.data        { background: rgba(139,148,163,.15); color: var(--text-dim); border: 1px solid var(--border); }
+.ft-cat.binary      { background: rgba(139,148,163,.15); color: var(--text-dim); border: 1px solid var(--border); }
+.ft-cat.other       { background: rgba(139,148,163,.15); color: var(--text-dim); border: 1px solid var(--border); }
+.ftype-row .ft-code {
+  font-family: var(--mono); font-size: 11px; color: var(--text-dim);
+}
+.ftype-row .ft-method {
+  margin-left: auto; font-size: 11px; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px;
+}
+
+
+
 footer { margin-top: 36px; color: var(--text-dim); font-size: 12px; text-align: center; }
 footer a { color: var(--accent); text-decoration: none; }
 </style>
@@ -162,6 +198,14 @@ footer a { color: var(--accent); text-decoration: none; }
 const dz = document.getElementById('dz');
 const fi = document.getElementById('fi');
 const results = document.getElementById('results');
+
+// 文件类型分类图标 (配合 ftype-row 徽章)
+const ftCatIcons = {
+  executable: '\u2699', document: '\u{1F4C4}', archive: '\u{1F4E6}',
+  graphics: '\u{1F5BC}', media: '\u{1F3AC}', script: '\u{1F4DD}', mail: '\u2709',
+  text: '\u{1F4C6}', disk: '\u{1F4BF}', 'ai-model': '\u{1F916}', data: '\u{1F5C2}',
+  binary: '\u{1F576}', other: '\u2753'
+};
 
 dz.addEventListener('click', () => fi.click());
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
@@ -204,7 +248,21 @@ function render(card, d) {
   v.textContent = d.clean ? 'CLEAN' : 'DETECTED';
   head.querySelector('.fmeta').textContent = d.size_human + ' · ' + d.file_type;
 
+  const fti = d.file_type_info || {};
+  const cat = fti.category || 'other';
+  const methodName = { 'magic': '魔数匹配', 'magic+ooxml': '魔数+OOXML解析', 'pattern': '模式搜索',
+    'tail-magic': '尾部魔数', 'text-detect': '文本检测', 'fallback': '兜底判定',
+    'empty': '空文件', 'n/a': '不可用' }[fti.method] || fti.method;
+
   let html = '';
+  html += '<div class="ftype-row">' +
+    '<span class="ft-icon">' + (ftCatIcons[cat] || ftCatIcons.other) + '</span>' +
+    '<span class="ft-name">' + esc(fti.name || d.file_type) + '</span>' +
+    '<span class="ft-cat ' + cat + '">' + esc(cat) + '</span>' +
+    (fti.cl_type && fti.cl_type !== 'CL_TYPE_ANY' ?
+      '<span class="ft-code">' + esc(fti.cl_type) + '</span>' : '') +
+    '<span class="ft-method">' + methodName + '</span>' +
+    '</div>';
   if (!d.clean) {
     html += '<div class="dets">' + d.detections.map(x =>
       '<div class="det">' +

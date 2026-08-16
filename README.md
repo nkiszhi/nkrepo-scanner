@@ -4,12 +4,39 @@
 
 仅实现两类静态检测，无其它特征类型：
 
-| 引擎 | 说明 | 签名格式 |
-|------|------|----------|
+| 引擎      | 说明                         | 签名格式                                          |
+| ------- | -------------------------- | --------------------------------------------- |
 | Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
-| YARA | 字节模式 + 规则逻辑 | 标准 `.yar` 规则语法 |
+| YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
+
+另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
 当前签名库为 **ClamAV 官方真实病毒库**（main v63 + daily v28092，2026-08-14 快照）中的全部整文件哈希签名，共 **540,357 条**。
+
+## 文件类型识别（ClamAV FTM 机制移植）
+
+ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**（`filetypes_int.h`，镜像官方 `daily.ftm`）判断文件类型，签名格式 `type:offset:magic:名称:父类型:CL_TYPE_xxx`。`filetype.py` 按同样的四层判定链实现：
+
+```
+文件头 1024B (CL_FILE_MBUFF_SIZE)
+   │
+   ▼
+① 固定偏移魔数 (type-0) ── ELF/Mach-O/ZIP/RAR/PDF/OLE2/PNG/LNK/pyc... 70+ 种
+   │ 命中 ZIP 时 → 解析 local file header 条目名细分 OOXML (word/ xl/ ppt/)
+   ▼
+② 模式搜索 (type-1) ── MZ+PE\0\0 → PE；MZ+偏移魔数 → ZIP/RAR/7z/CAB SFX；HTML 标签
+   │
+   ▼
+③ 尾部魔数 ── DMG 'koly' @ EOF-512
+   │
+   ▼
+④ 文本编码检测兜底 ── BOM/UTF-8/UTF-16/ASCII（对应 ClamAV cli_texttype）
+```
+
+- 类型码沿用 ClamAV 的 `CL_TYPE_*` 命名，共 12 个 UI 分类（executable / document / archive / graphics / media / script / mail / text / disk / ai-model / data / binary）
+- OOXML 细分与 ClamAV `ooxml_detect` 表一致：遍历前 1024 字节内全部 ZIP 条目名，强前缀（`word/`、`xl/`、`ppt/`、`META-INF/MANIFEST.MF`）优先于通用条目（`[Content_Types].xml`）
+- `/scan` 响应新增 `file_type_info` 字段：`{"name": 类型名, "cl_type": "CL_TYPE_xxx", "category": 分类, "method": "magic|magic+ooxml|pattern|tail-magic|text-detect"}`
+- 验证：`python test_filetype.py`（27 类样本全覆盖）
 
 ## 存储架构（千万级容量）
 
@@ -33,14 +60,14 @@
 
 ### 千万级实测数据（1000 万条合成签名）
 
-| 指标 | 数值 |
-|------|------|
-| 常驻内存 | 11.43 MB（仅 Bloom 位图） |
-| 磁盘占用 | 590 MB（SQLite） |
-| 启动耗时 | ~1.0 s |
-| 未命中查询 | 0.009 ms/次 |
-| 命中查询 | 0.014 ms/次（200/200 验证） |
-| 端到端扫描 | ~1 ms（含哈希计算） |
+| 指标    | 数值                     |
+| ----- | ---------------------- |
+| 常驻内存  | 11.43 MB（仅 Bloom 位图）   |
+| 磁盘占用  | 590 MB（SQLite）         |
+| 启动耗时  | ~1.0 s                 |
+| 未命中查询 | 0.009 ms/次             |
+| 命中查询  | 0.014 ms/次（200/200 验证） |
+| 端到端扫描 | ~1 ms（含哈希计算）           |
 
 对比纯内存 dict 方案（千万条约 3GB+ 内存、每次重启重新解析明文），内存降低两个数量级，且获得持久化与增量更新能力。
 
@@ -53,7 +80,7 @@ venv\Scripts\pip install -r requirements.txt   # Windows
 venv\Scripts\python app.py
 ```
 
-打开 http://127.0.0.1:5000
+打开 <http://127.0.0.1:5000>
 
 依赖：`flask` + `yara-python`（Windows 下 pip 有预编译 wheel）。
 
@@ -63,7 +90,9 @@ venv\Scripts\python app.py
 nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/、/scan、/api/stats）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 三层存储 + YaraScanner）
-├── templates/index.html          # Web 界面（拖拽上传 + 结果展示）
+├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
+├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
+├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
 ├── bench.py                      # 性能基准（延迟 / 内存 / 磁盘）
@@ -114,11 +143,11 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 ## API
 
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/` | GET | Web 界面 |
-| `/scan` | POST | 上传文件（multipart 字段 `file`），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`elapsed_ms` |
-| `/api/stats` | GET | 签名统计：哈希签名数、YARA 规则数、存储层（tier）、Bloom/内存数组状态 |
+| 接口           | 方法   | 说明                                                                                                 |
+| ------------ | ---- | -------------------------------------------------------------------------------------------------- |
+| `/`          | GET  | Web 界面                                                                                             |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`elapsed_ms` |
+| `/api/stats` | GET  | 签名统计：哈希签名数、YARA 规则数、存储层（tier）、Bloom/内存数组状态                                                         |
 
 ## 验证
 
@@ -135,3 +164,4 @@ python -c "open('eicar.com','wb').write(b'X5O!P%@AP[4\\\\PZX54(P^)7CC)7}\$EICAR-
 - 哈希存储的「排序数组 + 二分查找 + 按需分层」思路对齐 ClamAV `libclamav/matcher-hash.c` 的实现
 - Bloom 预过滤利用安全检测「宁误报不漏报」的特性，先以 1.2MB/百万条 的内存成本拒绝绝大部分干净查询
 - YARA 部分由 yara-python 编译执行，规则本身即可高效处理上万条
+- 文件类型识别移植自 ClamAV `libclamav/filetypes.c` + `filetypes_int.h`（FTM 签名表、MAGIC_BUFFER_SIZE=1024、ooxml_detect 条目名细分、cli_texttype 文本检测兜底）
