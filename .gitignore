@@ -15,9 +15,10 @@ cvd/
 extracted/
 *.cvd
 
-# 上传样本目录（运行时生成），但保留三个测试样本
+# 上传样本目录（运行时生成），仅保留文本测试样本
+# 注: eicar.com 为 EICAR 测试样本, 因安全工具会拦截其文件读写, 不入库;
+#     本地测试可手动生成 (见 README「测试样本」)
 uploads/*
-!uploads/eicar.com
 !uploads/marker.txt
 !uploads/clean.txt
 

@@ -152,7 +152,7 @@ nkrepo-scanner/
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd
-├── uploads/                      # 测试样本（eicar.com / marker.txt / clean.txt）；/scan 上传不再落盘
+├── uploads/                      # 测试样本（marker.txt / clean.txt；eicar.com 需手动生成，不入库）；/scan 上传不再落盘
 └── requirements.txt
 ```
 
@@ -207,7 +207,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 python -c "open('eicar.com','wb').write(b'X5O!P%@AP[4\\\\PZX54(P^)7CC)7}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H+H*')"
 ```
 
-`uploads/` 下已有现成测试样本：`eicar.com`（报毒）、`marker.txt`（YARA 报毒）、`clean.txt`（放行）。
+`uploads/` 下现有测试样本：`marker.txt`（YARA 报毒）、`clean.txt`（放行）；`eicar.com` 因安全工具会拦截其文件读写、不入库，用上面命令在 `uploads/` 下生成即可（其余 `tmp*` 为上传残留，自动忽略）。
 
 ## 设计参考
 
