@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NKREPO Scanner</title>
+<style>
+:root {
+  --bg: #16181d;
+  --panel: #1e2229;
+  --panel-2: #252a33;
+  --border: #333a47;
+  --text: #d7dce4;
+  --text-dim: #8b94a3;
+  --accent: #4a9eff;
+  --green: #3ddc84;
+  --red: #ff5d5d;
+  --amber: #ffb454;
+  --mono: "Cascadia Code", "Consolas", monospace;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+  min-height: 100vh;
+}
+.container { max-width: 860px; margin: 0 auto; padding: 40px 24px 60px; }
+
+header { display: flex; align-items: center; gap: 14px; margin-bottom: 8px; }
+.logo {
+  width: 40px; height: 40px; border-radius: 10px;
+  background: var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 20px; font-weight: 700; color: #fff;
+}
+h1 { font-size: 22px; font-weight: 600; }
+.sub { color: var(--text-dim); font-size: 13px; margin-bottom: 28px; }
+.sub .badge {
+  display: inline-block; padding: 2px 10px; border-radius: 20px;
+  border: 1px solid var(--border); margin-left: 8px; font-size: 12px;
+}
+
+.dropzone {
+  border: 2px dashed var(--border);
+  border-radius: 14px;
+  padding: 52px 24px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .18s, background .18s;
+  background: var(--panel);
+}
+.dropzone:hover, .dropzone.over {
+  border-color: var(--accent);
+  background: var(--panel-2);
+}
+.dz-icon { font-size: 40px; margin-bottom: 12px; }
+.dz-main { font-size: 15px; margin-bottom: 6px; }
+.dz-hint { color: var(--text-dim); font-size: 12px; }
+
+.stats {
+  display: flex; gap: 12px; margin: 20px 0 28px; flex-wrap: wrap;
+}
+.stat {
+  flex: 1; min-width: 180px;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 12px 16px;
+}
+.stat .num { font-size: 20px; font-weight: 600; font-family: var(--mono); }
+.stat .lbl { color: var(--text-dim); font-size: 12px; margin-top: 2px; }
+.stat .num.ok { color: var(--green); }
+.stat .num.warn { color: var(--amber); }
+
+.results { display: flex; flex-direction: column; gap: 16px; }
+
+.card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 12px; overflow: hidden;
+  animation: slideIn .25s ease;
+}
+@keyframes slideIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+.card-head {
+  display: flex; align-items: center; gap: 12px;
+  padding: 14px 18px; border-bottom: 1px solid var(--border);
+}
+.verdict {
+  padding: 4px 14px; border-radius: 6px; font-weight: 700;
+  font-size: 13px; font-family: var(--mono); letter-spacing: .5px;
+}
+.verdict.clean { background: rgba(61,220,132,.12); color: var(--green); border: 1px solid rgba(61,220,132,.4); }
+.verdict.detected { background: rgba(255,93,93,.12); color: var(--red); border: 1px solid rgba(255,93,93,.4); }
+.verdict.scanning { background: rgba(74,158,255,.12); color: var(--accent); border: 1px solid rgba(74,158,255,.4); }
+.fname { font-weight: 600; font-size: 14px; word-break: break-all; }
+.fmeta { color: var(--text-dim); font-size: 12px; margin-left: auto; white-space: nowrap; }
+
+.card-body { padding: 14px 18px; }
+
+.spinner {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  animation: spin .8s linear infinite; display: inline-block;
+  vertical-align: -4px; margin-right: 8px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.hashes {
+  display: grid; grid-template-columns: 72px 1fr; gap: 6px 12px;
+  font-family: var(--mono); font-size: 12px; margin-top: 12px;
+}
+.hashes .k { color: var(--text-dim); }
+.hashes .v { color: var(--text); word-break: break-all; }
+
+.dets { display: flex; flex-direction: column; gap: 10px; margin-bottom: 14px; }
+.det {
+  background: rgba(255,93,93,.07); border: 1px solid rgba(255,93,93,.25);
+  border-radius: 8px; padding: 10px 14px;
+}
+.det-name { font-weight: 600; color: var(--red); font-family: var(--mono); font-size: 13px; }
+.det-detail { color: var(--text-dim); font-size: 12px; margin-top: 4px; word-break: break-all; }
+.det-engine {
+  float: right; font-size: 11px; color: var(--text-dim);
+  border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px;
+}
+
+.ok-line { color: var(--green); font-size: 13px; }
+.scan-info { color: var(--text-dim); font-size: 12px; margin-top: 10px; }
+
+footer { margin-top: 36px; color: var(--text-dim); font-size: 12px; text-align: center; }
+footer a { color: var(--accent); text-decoration: none; }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="logo">N</div>
+    <div>
+      <h1>NKREPO Scanner</h1>
+      <div class="sub">轻量级静态恶意软件扫描 <span class="badge">哈希签名 + YARA</span></div>
+    </div>
+  </header>
+
+  <div class="dropzone" id="dz">
+    <div class="dz-icon">&#128737;</div>
+    <div class="dz-main">拖拽文件到此处，或点击选择</div>
+    <div class="dz-hint">支持任意类型 · 单文件最大 50MB · 可多选</div>
+    <input type="file" id="fi" multiple hidden>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名 (MD5/SHA1/SHA256)</div></div>
+    <div class="stat"><div class="num" id="yaraCount">-</div><div class="lbl">YARA 规则</div></div>
+    <div class="stat"><div class="num" id="engineState">-</div><div class="lbl">引擎状态</div></div>
+  </div>
+
+  <div class="results" id="results"></div>
+
+  <footer>NKREPO Scanner · 参考 <a href="https://www.clamav.net" target="_blank">ClamAV</a> 签名格式 · 仅用于安全研究</footer>
+</div>
+
+<script>
+const dz = document.getElementById('dz');
+const fi = document.getElementById('fi');
+const results = document.getElementById('results');
+
+dz.addEventListener('click', () => fi.click());
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('over'));
+dz.addEventListener('drop', e => {
+  e.preventDefault(); dz.classList.remove('over');
+  [...e.dataTransfer.files].forEach(upload);
+});
+fi.addEventListener('change', () => { [...fi.files].forEach(upload); fi.value = ''; });
+
+function upload(file) {
+  const card = mkScanCard(file);
+  results.prepend(card);
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/scan', { method: 'POST', body: fd })
+    .then(r => r.json())
+    .then(d => { if (d.error) { renderErr(card, d.error); } else { render(card, d); } })
+    .catch(e => renderErr(card, '请求失败: ' + e.message));
+}
+
+function mkScanCard(file) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML =
+    '<div class="card-head">' +
+      '<span class="verdict scanning">SCANNING</span>' +
+      '<span class="fname">' + esc(file.name) + '</span>' +
+      '<span class="fmeta">' + fmtSize(file.size) + '</span>' +
+    '</div>' +
+    '<div class="card-body"><div><span class="spinner"></span>正在扫描…</div></div>';
+  return card;
+}
+
+function render(card, d) {
+  const head = card.querySelector('.card-head');
+  const body = card.querySelector('.card-body');
+  const v = head.querySelector('.verdict');
+  v.className = 'verdict ' + (d.clean ? 'clean' : 'detected');
+  v.textContent = d.clean ? 'CLEAN' : 'DETECTED';
+  head.querySelector('.fmeta').textContent = d.size_human + ' · ' + d.file_type;
+
+  let html = '';
+  if (!d.clean) {
+    html += '<div class="dets">' + d.detections.map(x =>
+      '<div class="det">' +
+        '<span class="det-engine">' + esc(x.engine) + '</span>' +
+        '<div class="det-name">' + esc(x.name) + '</div>' +
+        '<div class="det-detail">' + esc(x.detail || '') + '</div>' +
+      '</div>').join('') + '</div>';
+  } else {
+    html += '<div class="ok-line">&#10003; 未发现已知威胁</div>';
+  }
+  html += '<div class="scan-info">耗时 ' + d.elapsed_ms + ' ms · 引擎: ' +
+          d.scanners.map(esc).join(' + ') + '</div>';
+  html += '<div class="hashes">' +
+    '<span class="k">MD5</span><span class="v">' + d.md5 + '</span>' +
+    '<span class="k">SHA1</span><span class="v">' + d.sha1 + '</span>' +
+    '<span class="k">SHA256</span><span class="v">' + d.sha256 + '</span></div>';
+  body.innerHTML = html;
+}
+
+function renderErr(card, msg) {
+  const v = card.querySelector('.verdict');
+  v.className = 'verdict detected';
+  v.textContent = 'ERROR';
+  card.querySelector('.card-body').innerHTML =
+    '<div class="det" style="background:rgba(255,180,84,.07);border-color:rgba(255,180,84,.3)">' +
+    '<div class="det-name" style="color:var(--amber)">扫描失败</div>' +
+    '<div class="det-detail">' + esc(msg) + '</div></div>';
+}
+
+function esc(s) { const d = document.createElement('span'); d.textContent = s ?? ''; return d.innerHTML; }
+function fmtSize(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
+
+fetch('/api/stats').then(r => r.json()).then(s => {
+  document.getElementById('hashCount').textContent = s.hash_signatures;
+  document.getElementById('yaraCount').textContent = s.yara_available ? s.yara_rules : 'N/A';
+  const es = document.getElementById('engineState');
+  es.textContent = s.yara_available ? '正常' : '降级';
+  es.className = 'num ' + (s.yara_available ? 'ok' : 'warn');
+});
+</script>
+</body>
+</html>

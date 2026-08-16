@@ -1,0 +1,7 @@
+# NKREPO Scanner 哈希签名库
+# 格式兼容 ClamAV .hdb: hash:size:virname
+# hash 支持 MD5(32) / SHA1(40) / SHA256(64), size 为 * 时通配大小
+# EICAR 标准测试文件 (68 字节) - 用于验证扫描链路
+44d88612fea8a8f36de82e1278abb02f:68:EICAR-Test-File
+3395856ce81f2b7382dee72602f798b642f14140:68:EICAR-Test-File
+275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f:68:EICAR-Test-File

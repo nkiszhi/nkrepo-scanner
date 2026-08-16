@@ -1,0 +1,28 @@
+# 运行时生成物
+signatures/*.db
+signatures/*.db.bloom
+signatures/*.db-journal
+signatures/*.db-shm
+signatures/*.db-wal
+
+# 病毒库原始文件与解包产物（README 有下载/重建方法）
+cvd/
+extracted/
+*.cvd
+
+# 上传样本目录（运行时生成），但保留三个测试样本
+uploads/*
+!uploads/eicar.com
+!uploads/marker.txt
+!uploads/clean.txt
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
