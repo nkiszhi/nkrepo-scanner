@@ -7,11 +7,7 @@ import tempfile
 from scanner import HashSignatureDB
 
 TEST_HASHES = [
-    # md5, size, name
-    ("44d88612fea8a8f36de82e1278abb02f", 68, "EICAR-Test-File"),
-    ("0123456789abcdeffedcba9876543210", 100, "Test.MD5.a"),
-    ("ffffffffffffffffffffffffffffffff", 200, "Test.MD5.b"),
-    # sha256
+    # sha256 (库 v3 起仅接受 SHA256 主键)
     ("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", 68, "EICAR-Test-File"),
     ("00000abcdeadbeef000000000000000000000000000000000000000000000123", 50, "Test.SHA256.a"),
     (("fffffabcdeadbeef" + "f" * 62)[:61] + "456", 60, "Test.SHA256.b"),
@@ -27,14 +23,12 @@ def write_hdb(path):
 def verify(db, tag):
     ok = True
     for h, size, name in TEST_HASHES:
-        md5 = h if len(h) == 32 else "0" * 32
-        sha256 = h if len(h) == 64 else "0" * 64
-        hits = db.check("", size, md5, "0" * 40, sha256)
+        hits = db.check("", size, "0" * 32, "0" * 40, h)
         if not any(x["name"] == name for x in hits):
             print(f"  [FAIL] {tag} 未命中 {name} ({h[:8]}...)")
             ok = False
     r = os.urandom(32)
-    if db.check("", 1, r[:16].hex(), r[:20].hex(), r.hex()):
+    if db.check("", 1, "0" * 32, "0" * 40, r.hex()):
         print(f"  [FAIL] {tag} 随机哈希误命中")
         ok = False
     print(f"  [{'PASS' if ok else 'FAIL'}] {tag}: {len(TEST_HASHES)} 命中 + 无误报")
@@ -76,10 +70,9 @@ def main():
         if st2["bloom"] and st2["bloom"]["shards_loaded"] != 0:
             print(f"  [FAIL] 冷启动应 0 个 bloom 加载, 实际 {st2['bloom']['shards_loaded']}")
             all_ok = False
-        # sha256 优先短路: EICAR 查询后只加载 sha256 所在分片 (1 个), 且命中 1 条
-        eicar_md5 = "44d88612fea8a8f36de82e1278abb02f"
+        # sha256 单次点查短路: EICAR 查询后只加载 sha256 所在分片 (1 个), 且命中 1 条
         eicar_sha256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
-        hits = db2.check("", 68, eicar_md5, "0" * 40, eicar_sha256)
+        hits = db2.check("", 68, "0" * 32, "0" * 40, eicar_sha256)
         st2 = db2.stats()
         loaded = st2["bloom"]["shards_loaded"] if st2["bloom"] else 0
         if loaded != 1:
@@ -88,7 +81,7 @@ def main():
         if len(hits) != 1:
             print(f"  [FAIL] EICAR 应命中 1 条, 实际 {len(hits)}")
             all_ok = False
-        print(f"  EICAR sha256 短路: 命中 {len(hits)} 条, 已加载 bloom 分片 {loaded}/1 ✓")
+        print(f"  EICAR sha256 单次点查: 命中 {len(hits)} 条, 已加载 bloom 分片 {loaded}/1 ✓")
         db2.close()
         db.close()
 

@@ -3,7 +3,7 @@ NKREPO Scanner - 千万级合成签名生成器
 用确定性随机摘要快速填充 signatures.db, 用于大规模压测。
 
 用法:
-  python gen_sigs.py --n 10000000            # 生成 1000 万条 (60% SHA256 / 30% MD5 / 10% SHA1)
+  python gen_sigs.py --n 10000000            # 生成 1000 万条 (全部 SHA256, 与库 v3 主键一致)
   python gen_sigs.py --n 1000000 --seed 42
 """
 import argparse
@@ -17,17 +17,10 @@ DB_PATH = os.path.join(BASE_DIR, "signatures", "signatures.db")
 
 
 def gen_digests(n, seed):
-    """确定性生成 n 条签名: (digest_bytes, size, name)"""
+    """确定性生成 n 条签名: (digest_bytes, size, name); 全部为 SHA256 (库 v3 主键)"""
     for i in range(n):
         data = f"{seed}:{i}".encode()
-        # 混合三种算法, 比例接近真实病毒库 (sha256 为主)
-        mod = i % 10
-        if mod < 6:
-            digest = hashlib.sha256(data).digest()      # 32B
-        elif mod < 9:
-            digest = hashlib.md5(data).digest()         # 16B
-        else:
-            digest = hashlib.sha1(data).digest()        # 20B
+        digest = hashlib.sha256(data).digest()      # 32B sha256 主键
         yield (digest, 100 + (i % 900), f"Test.Gen.{seed}.{i:09d}")
 
 

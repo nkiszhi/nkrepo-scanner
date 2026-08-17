@@ -86,23 +86,17 @@ def main():
         if conn is None:
             continue
         sample_rows.extend(conn.execute(
-            "SELECT h, size FROM sigs LIMIT ?", (args.hits,)
+            "SELECT sha256, size FROM sigs LIMIT ?", (args.hits,)
         ).fetchall())
         if len(sample_rows) >= args.hits:
             break
     sample_rows = sample_rows[:args.hits]
     hit_ms = []
     n_hit = 0
-    for h, size in sample_rows:
+    for h, size in sample_rows:  # v3: 库内全为 sha256 (32B)
         hexh = h.hex()
-        if len(h) == 16:
-            m5, s1, s2 = hexh, "0" * 40, "0" * 64
-        elif len(h) == 20:
-            m5, s1, s2 = "0" * 32, hexh, "0" * 64
-        else:
-            m5, s1, s2 = "0" * 32, "0" * 40, hexh
         t = time.perf_counter()
-        hits = db.check("", size, m5, s1, s2)
+        hits = db.check("", size, "0" * 32, "0" * 40, hexh)
         hit_ms.append((time.perf_counter() - t) * 1000)
         n_hit += len(hits)
     hit_ms.sort()

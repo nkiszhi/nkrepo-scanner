@@ -13,7 +13,7 @@
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
-当前签名库为 **ClamAV 官方真实病毒库**（main v63 + daily v28092，2026-08-14 快照）中的全部整文件哈希签名，共 **540,357 条**，当前按 `bloom.shards = 4` 拆为 4 个分片存储。
+当前签名库源自 **ClamAV 官方真实病毒库**（main v63 + daily v28092，2026-08-14 快照）整文件哈希签名。v3 迁移后库内仅保留其中的 **SHA256 签名 186 条**（原 540,357 条中 md5/sha1 签名因无法推算 sha256 而按用户决策移除，备份见 `000X.db.pre_multi_hash.bak` 与 `000X.db.pre_sha256_pk.bak`），当前按 `bloom.shards = 4` 拆为 4 个分片存储。
 
 ## 静态信息与模糊哈希
 
@@ -111,7 +111,7 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 哈希签名不是明文 `.hdb` 直读，而是 **Bloom 预过滤 + 动态分片 SQLite**。分片数 N 完全由 `config.json` 的 `bloom.shards` 决定（任意正整数，默认 4），修改后下次启动自动重分片，`check()` 接口对上层透明：
 
 ```
-查询 hash (md5 / sha1 / sha256)
+查询 hash (sha256)
    │
    ▼
 ① Bloom 预过滤 ──── 1% 误判率位图（k=7），按 N 拆成独立位图文件（懒加载 + LRU），
@@ -126,13 +126,12 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 ```
 
 - 分片目录 `signatures/signatures.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰
-- `sigs` 表为**多哈希列结构**（v2，`_meta.db` 中 `schema_version=2` 标记）：
-  `h BLOB PRIMARY KEY`（条目自身哈希原值，MD5 16B / SHA1 20B / SHA256 32B 混合，兼容旧查询与 Bloom）、
-  `hash_type`（md5 / sha1 / sha256）、`size`、`name`，
-  另有标准哈希列 `sha256` / `md5` / `sha1`（与 h 同源、按 hash_type 填充，其余为 NULL）
+- `sigs` 表为 **SHA256 主键结构**（v3，`_meta.db` 中 `schema_version=3` / `primary_key=sha256` 标记）：
+  `sha256 BLOB PRIMARY KEY`（库内仅存 SHA256 签名，32B）、`size`、`name`，
+  另有预留列 `md5` / `sha1`（同文件其它标准哈希，暂无数据源为 NULL）
   及 fuzzy 列 `ssdeep` / `tlsh` / `sdhash` / `mvhash`（预留：需原始样本源接入后回填）。
-  查询仍走 `h` 原值点查，Bloom 位图与既有逻辑不受影响；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`
-- MD5 / SHA1 / SHA256 签名按**各自哈希**的摘要路由，查询顺序 sha256 → sha1 → md5、命中即短路（见「并发与 IO 说明」），最坏情况打开 3 个分片、通常只需 1 个；冷启动 0 分片加载，随查询按需打开
+  查询走 `sha256` 主键点查；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`，切主键前备份为 `000X.db.pre_sha256_pk.bak`
+- **v3 起仅接受 SHA256 签名**：导入 `.hdb/.hsb` 时 64hex 行入库，32hex（md5）/ 40hex（sha1）行计数跳过并提示；查询只对 sha256 摘要做一次 Bloom 排除 + 主键点查（见「并发与 IO 说明」）；冷启动 0 分片加载，随查询按需打开
 - Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/signatures.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
 - `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` 下的新文件（`imported_files` 表去重，幂等）
 - 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `signatures.db.shards.legacy`
@@ -205,8 +204,8 @@ venv\Scripts\python app.py
 - **查询并发模型**：`HashSignatureDB.check()` 不再持全局锁 —— Bloom 位图查询期只读（无锁读），
   SQLite 分片连接用**连接级串行锁**（同一连接内串行、不同分片连接并行，并发度 = min(分片数, LRU 上限)），
   LRU 字典操作用细粒度缓存锁；被淘汰的连接延迟到 `close()` 统一关闭
-- **sha256 优先短路**：查询顺序 sha256 → sha1 → md5，任一命中即返回，恶意文件平均只做 1 次
-  Bloom + SQL 点查
+- **sha256 单次点查**：v3 起库内仅存 sha256 签名，查询只对 sha256 摘要做 1 次
+  Bloom + SQL 主键点查（md5/sha1 参数仅为接口兼容，必然未命中）
 - **Bloom 热路径**：`_positions`（blake2b 双哈希 → k 个位）带实例级 LRU 缓存（上限 4096），
   重复样本直接复用位置数组，省去重复哈希与求模
 - **内存扫描阈值**：`Scanner.INLINE_LIMIT = 64MB` —— ≤64MB 的文件一次性读入内存，

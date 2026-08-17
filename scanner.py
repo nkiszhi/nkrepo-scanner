@@ -10,7 +10,7 @@ NKREPO Scanner - 轻量级静态恶意软件扫描核心引擎
      内存随查询按需增长
   3. 查询: 路由到分片 → 该分片 Bloom 排除 → (候选时) 打开该分片 SQLite 只读点查;
      并发模型: 查询路径无全局锁 (Bloom 查询期只读无锁 + SQLite 连接级串行锁,
-     不同分片并行), 查询顺序 sha256 → sha1 → md5 命中即短路
+     不同分片并行); v3 起签名库仅存 SHA256, 查询单次点查即短路
   4. 布局一致性: meta 表记录 layout 版本与 shard_count; 检测到旧 hex 前缀布局
      (16/256/4096) 或修改 N 时启动自动重分片, 旧数据备份不丢失
 """
@@ -37,37 +37,32 @@ CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
 VALID_HASH_LENGTHS = {32: "md5", 40: "sha1", 64: "sha256"}
 HASH_ALGO_BY_BYTES = {16: "MD5", 20: "SHA1", 32: "SHA256"}
 
-# sigs 表多哈希列结构 (v2):
-#   h BLOB PRIMARY KEY       条目自身哈希 (16/20/32B 原值, 兼容旧查询与 Bloom)
-#   hash_type TEXT           该条目的哈希类型: md5 | sha1 | sha256
-#   sha256/md5/sha1 BLOB     三种标准哈希列 (能填则填, 与 h 同源)
+# sigs 表 sha256 主键结构 (v3):
+#   sha256 BLOB PRIMARY KEY       唯一主键, 库内仅存 SHA256 签名 (32B)
+#   size/name TEXT                签名元数据
+#   md5/sha1 BLOB                 同文件其它标准哈希列 (无数据源时 NULL, 预留)
 #   ssdeep/tlsh/sdhash/mvhash TEXT  4 个 fuzzy hash 列 (暂无数据源, 预留)
-SIGS_COLS = "h,hash_type,size,name,sha256,md5,sha1,ssdeep,tlsh,sdhash,mvhash"
+SIGS_COLS = "sha256,size,name,md5,sha1,ssdeep,tlsh,sdhash,mvhash"
 SIGS_DDL = (
     "CREATE TABLE IF NOT EXISTS sigs("
-    " h BLOB PRIMARY KEY, hash_type TEXT NOT NULL,"
+    " sha256 BLOB PRIMARY KEY,"
     " size INTEGER, name TEXT,"
-    " sha256 BLOB, md5 BLOB, sha1 BLOB,"
+    " md5 BLOB, sha1 BLOB,"
     " ssdeep TEXT, tlsh TEXT, sdhash TEXT, mvhash TEXT) WITHOUT ROWID"
 )
 SIGS_INSERT = (
     "INSERT OR IGNORE INTO sigs(" + SIGS_COLS + ")"
-    " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+    " VALUES(?,?,?,?,?,?,?,?,?)"
 )
 
-# 字节长度 -> (hash_type, 应填充的哈希列名); fuzzy 列恒 NULL
-def _sigs_row(h, size, name):
-    """把 (h,size,name) 映射为 11 列新结构行 (h 长度决定 hash_type 与填充列)"""
-    n = len(h)
-    try:
-        htype = HASH_ALGO_BY_BYTES[n].lower()
-    except KeyError:
-        raise ValueError(f"未知哈希长度: {n}")
-    return (h, htype, size, name,
-            h if n == 32 else None,  # sha256
-            h if n == 16 else None,  # md5
-            h if n == 20 else None,  # sha1
-            None, None, None, None)  # ssdeep/tlsh/sdhash/mvhash
+# 字节长度 -> 哈希类型; v3 起库内仅接受 SHA256 (32B)
+def _sigs_row(sha256_digest, size, name):
+    """把 (sha256_digest,size,name) 映射为 9 列新结构行; 非 32B 抛 ValueError"""
+    if len(sha256_digest) != 32:
+        raise ValueError(f"仅支持 SHA256 签名 (32B), 收到 {len(sha256_digest)}B")
+    return (sha256_digest, size, name,
+            None, None,        # md5 / sha1 (预留)
+            None, None, None, None)  # ssdeep/tlsh/sdhash/mvhash (预留)
 
 
 def compute_hashes(file_path):
@@ -191,7 +186,7 @@ class HashSignatureDB:
 
     - 分片数 N 由 config 中 bloom.shards 决定, 任意正整数:
       路由规则 = int.from_bytes(digest[:4], 'big') % N → 均匀分布到 0000.db ~ (N-1).db
-      MD5/SHA1/SHA256 签名按各自摘要路由, 查询三种算法时分别定位对应分片
+      v3 起库内仅存 SHA256 签名, 按 sha256 摘要路由并点查对应分片
     - Bloom 按同样的 N 分片: {db_path}.bloom/{shard_id:04d}.bloom, 与 SQLite 分片
       一一对应, 懒加载 + LRU 缓存, 冷启动零加载, 内存随查询按需增长
     - 查询: 路由 → 分片 Bloom 排除 (干净文件短路, 零 SQL) → 分片 SQLite 只读点查
@@ -338,13 +333,13 @@ class HashSignatureDB:
             pending = {}
             try:
                 cur = src_conn.execute(
-                    "SELECT h,hash_type,size,name,sha256,md5,sha1,"
+                    "SELECT sha256,size,name,md5,sha1,"
                     "ssdeep,tlsh,sdhash,mvhash FROM sigs")
                 while True:
                     rows = cur.fetchmany(50_000)
                     if not rows:
                         break
-                    for row in rows:  # 11 列整行透传 (结构已在迁移时统一为 v2)
+                    for row in rows:  # 9 列整行透传 (结构已在迁移时统一为 v3)
                         sid = self._route(row[0], self.shard_count)
                         pending.setdefault(sid, []).append(row)
             except sqlite3.Error:
@@ -504,6 +499,7 @@ class HashSignatureDB:
                 os.replace(legacy_path, legacy_path + ".migrated")
                 return
             t0 = time.time()
+            skipped = 0
             pending = {}
             cur = legacy.execute("SELECT h,size,name FROM sigs")  # 旧库为 v1 三列
             while True:
@@ -511,9 +507,13 @@ class HashSignatureDB:
                 if not rows:
                     break
                 for h, size, name in rows:
+                    try:
+                        row9 = _sigs_row(h, size, name)  # 映射为 v3 9 列 (仅 sha256)
+                    except ValueError:
+                        skipped += 1
+                        continue
                     sid = self._route(h, self.shard_count)
-                    pending.setdefault(sid, []).append(
-                        _sigs_row(h, size, name))  # 映射为 v2 11 列
+                    pending.setdefault(sid, []).append(row9)
             # 迁移导入记录
             try:
                 names = [r[0] for r in legacy.execute("SELECT name FROM imported_files")]
@@ -556,15 +556,18 @@ class HashSignatureDB:
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                     (str(self.shard_count),))
                 self.meta.execute(
-                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','2')")
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','3')")
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('primary_key','sha256')")
             os.replace(legacy_path, legacy_path + ".migrated")
             for suffix in ("-wal", "-shm"):
                 try:
                     os.remove(legacy_path + suffix)
                 except OSError:
                     pass
-            print(f"[NKREPO] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条, "
-                  f"耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
+            skip_note = f", 跳过非 sha256 {skipped:,} 条" if skipped else ""
+            print(f"[NKREPO] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条"
+                  f"{skip_note}, 耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
         except Exception as e:
             print(f"[NKREPO] 旧库迁移失败(将按空分片库启动): {e}")
 
@@ -635,6 +638,7 @@ class HashSignatureDB:
         """导入 .hdb/.hsb 明文签名文件 (增量, 幂等), 返回新插入条数"""
         basename = os.path.basename(filepath)
         pending = {}  # shard_id -> [(digest, size, name)]
+        skipped = 0   # 非 sha256 的合法哈希行 (库 v3 起仅接受 sha256 主键)
         start = time.time()
         with self._lock:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -646,7 +650,12 @@ class HashSignatureDB:
                     if len(parts) < 3:
                         continue
                     h = parts[0].strip().lower()
-                    if len(h) not in VALID_HASH_LENGTHS:
+                    if len(h) == 64:
+                        pass
+                    elif len(h) in VALID_HASH_LENGTHS:  # 32=md5 / 40=sha1: 计数跳过
+                        skipped += 1
+                        continue
+                    else:
                         continue
                     try:
                         digest = bytes.fromhex(h)
@@ -655,7 +664,7 @@ class HashSignatureDB:
                     size_field = parts[1].strip()
                     size = None if size_field == "*" else int(size_field)
                     name = parts[2].strip()
-                    # 按哈希长度分派 hash_type 与填充列 (32hex=md5 / 40hex=sha1 / 64hex=sha256)
+                    # 仅 sha256 签名入库 (v3 主键), 按摘要前缀路由分片
                     pending.setdefault(
                         self._route(digest, self.shard_count), []
                     ).append(_sigs_row(digest, size, name))
@@ -687,6 +696,9 @@ class HashSignatureDB:
             self._bloom_dirty |= dirty  # 新增签名的分片 bloom 失效, 待 finalize 重建
         if basename not in self.source_files:
             self.source_files.append(basename)
+        if skipped:
+            print(f"[NKREPO] 导入 {basename}: 跳过 {skipped:,} 条非 SHA256 签名"
+                  f" (库 v3 起仅接受 sha256 主键)")
         return inserted
 
     # 旧接口兼容
@@ -716,7 +728,7 @@ class HashSignatureDB:
                         if cnt == 0:
                             continue
                         bf = BloomFilter(cnt, self.bloom_fp_rate)
-                        cur = conn.execute("SELECT h FROM sigs")
+                        cur = conn.execute("SELECT sha256 FROM sigs")
                         while True:
                             rows = cur.fetchmany(100_000)
                             if not rows:
@@ -740,40 +752,39 @@ class HashSignatureDB:
     def check(self, file_path, file_size, md5, sha1, sha256):
         """检查文件哈希是否命中签名, 返回命中列表 (接口与旧版一致)
 
+        v3 起签名库仅存 SHA256 签名 (主键即 sha256), 查询只对 sha256 摘要做
+        一次 Bloom 排除 + SQLite 点查即短路; md5/sha1 参数保留仅为兼容接口,
+        库内无对应数据必然未命中。
+
         并发安全 (P0 优化): 查询路径不再持全局锁 ——
           · Bloom 位图查询期只读 (加载/淘汰只做引用替换, 不原地改位图) → 无锁读
           · 分片连接 check_same_thread=False, SQLite serialized 模式可跨线程并发读
           · 仅 _conns/_blooms 字典 LRU 操作在 _load_bloom_shard/_ro_conn 内部加细粒度锁
-        查询顺序 sha256 → sha1 → md5: sha256 最能唯一代表文件, 任一命中即短路
-        (同一文件无需再查其它哈希格式), 恶意文件平均只做 1 次 Bloom+SQL 点查。
         """
         hits = []
-        for hexh in (sha256, sha1, md5):
-            if not hexh:
-                continue
-            digest = bytes.fromhex(hexh)
-            shard_id = self._route(digest, self.shard_count)
-            # 第 1 层: 该分片 Bloom 排除 (干净文件短路, 零 SQL 开销)
-            bf = self._load_bloom_shard(shard_id)
-            if bf is not None and digest not in bf:
-                continue
-            # 第 2 层: 该分片 SQLite 点查 (只加载路由匹配的那个分片)
-            row = self._query_shard(
-                shard_id, "SELECT size, name FROM sigs WHERE h=?", (digest,)
-            )
-            if row is None:
-                continue
-            sig_size, name = row
-            if sig_size is not None and sig_size != file_size:
-                continue  # 大小不符, 视为未命中 (降低碰撞误报)
-            algo = HASH_ALGO_BY_BYTES[len(digest)]
-            hits.append({
-                "engine": "Hash DB",
-                "type": "hash",
-                "name": name,
-                "detail": f"{algo} 命中: {hexh}",
-            })
-            break  # 已唯一命中, 无需再查剩余哈希
+        if not sha256:
+            return hits
+        digest = bytes.fromhex(sha256)
+        shard_id = self._route(digest, self.shard_count)
+        # 第 1 层: 该分片 Bloom 排除 (干净文件短路, 零 SQL 开销)
+        bf = self._load_bloom_shard(shard_id)
+        if bf is not None and digest not in bf:
+            return hits
+        # 第 2 层: 该分片 SQLite 点查 (只加载路由匹配的那个分片)
+        row = self._query_shard(
+            shard_id, "SELECT size, name FROM sigs WHERE sha256=?", (digest,)
+        )
+        if row is None:
+            return hits
+        sig_size, name = row
+        if sig_size is not None and sig_size != file_size:
+            return hits  # 大小不符, 视为未命中 (降低碰撞误报)
+        hits.append({
+            "engine": "Hash DB",
+            "type": "hash",
+            "name": name,
+            "detail": f"SHA256 命中: {sha256}",
+        })
         return hits
 
     # ---------- 统计 ----------
