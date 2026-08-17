@@ -16,5 +16,11 @@
     "max_upload_mb": 50,
     "_comment_uploads_dir": "上传测试样本目录: 相对路径基于项目根目录解析 (如 uploads), 也支持绝对路径 (如 D:/scanner_uploads); 启动时若目录不存在会自动创建",
     "uploads_dir": "uploads"
+  },
+  "packer": {
+    "_comment_rules_dir": "外部 YARA 扩展壳库目录: 相对路径基于项目根目录解析 (如 packer_rules), 也支持绝对路径; 目录下所有 .yar/.yara 规则自动加载, 命中即作为精确特征进入壳识别 (规则约定见 packer_rules/README.md)",
+    "rules_dir": "packer_rules",
+    "_comment_max_yara_bytes": "外部规则匹配的样本大小上限 (字节), 超过则跳过外部规则; 内置 DIE/PEiD 特征不受此限制",
+    "max_yara_bytes": 16777216
   }
 }

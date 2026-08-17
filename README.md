@@ -9,7 +9,7 @@
 | Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
-| 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库） | 精确特征（magic/EP 字节/节名）+ 启发特征（节熵/导入/RWX/EP 位置） |
+| 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库 + 外部 YARA 扩展规则） | 精确特征（magic/EP 字节/节名/外部规则）+ 启发特征（节熵/导入/RWX/EP 位置） |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
@@ -38,18 +38,48 @@
 | **精确特征** | overlay / 文件内 magic 字符串 | DIE 特征体系风格，如 `UPX!`、`MPRESS`、`ASPack`；短 magic（<5B）仅限 overlay，避免全文件误报 |
 | | EP 字节模式 | PEiD 经典特征库风格，入口点 hex 序列前缀匹配（支持 `??` 通配），如 `60 E8 03 00 00 00 61 E9` |
 | | 特征节名 | `UPX0/UPX1`、`.aspack`、`.petite`、`.vmp0`、`.themida` 等 23 类 |
+| | 外部 YARA 规则 | `packer_rules/` 下 `.yar` 规则命中，即精确特征（meta 声明壳族，见下文） |
 | **启发特征** | 节熵 | 最高节熵 ≥ 7.0 或 ≥2 节 ≥ 6.5（疑似压缩/加密） |
 | | 导入表条目数 | ≤ 15 个函数（加壳程序导入极少） |
 | | RWX 节存在性 | 节特性含 READ\|WRITE\|EXECUTE（0xE0000000） |
 | | 入口点位于最后一节 | 壳代码通常垫在文件末尾 |
 
-融合判定输出：`detected`、`confidence`（high/medium/low）、`packers`（壳名 + 证据信号列表）、`packed_score`（0-100 加壳评分）、`heuristics`（启发信号明细）、`summary`。
+融合判定输出：`detected`、`confidence`（high/medium/low）、`packers`（壳名 + 证据信号列表）、`packed_score`（0-100 加壳评分）、`heuristics`（启发信号明细）、`summary`、`yara_rules_loaded`（外部规则数）、`yara_error`（规则编译错误汇总）。
 
 - 精确特征命中 → 直接报具体壳名（如 UPX），证据 ≥3 分判 high
 - 无精确特征但 ≥3 条启发信号（≥35 分）→ 报 `Unknown (启发式)`，medium
 - 未达判定线 → `detected=false`，启发信号仍随结果返回供研判
 - 所有哈希不可用时返回 `null`，原因汇总在 `static_info.notes`
 - TLSH 纯 Python 移植已用官方 JS 实现（trendmicro/tlsh `js_ext/tlsh.js`）交叉验证：9 类用例（文本/随机/低熵/256B 边界/真实 PE）输出**完全一致**；低熵输入同样返回不可用
+
+### 外部 YARA 扩展壳库（`packer_rules/`）
+
+内置 DIE + PEiD 特征之外，支持用 **YARA 规则扩展壳库**：`packer_rules/` 目录下所有 `.yar`/`.yara` 规则启动时自动编译加载，命中后作为「精确特征」进入同一融合判定（权重累加 → 置信度 → packed_score）。规则 meta 约定：
+
+| meta 字段 | 必选 | 说明 |
+| --------- | ---- | ---- |
+| `packer`  | 是   | 壳族名称（Web 显示名）；缺省取规则名 |
+| `weight`  | 否   | 证据权重 1-5，默认 2（与内置同量纲：overlay magic=3 / 节名·EP=2 / 文件内 magic=1） |
+| `desc`    | 否   | 证据描述，默认 `YARA 规则 <name> 命中` |
+| `confidence` | 否 | 可选；缺省由融合推导（权重 ≥3 high / ≥2 medium / 其余 low） |
+
+```yara
+rule Packer_MPRESS_Magic {
+    meta:
+        packer = "MPRESS"
+        weight = 3
+        desc = "MPRESS 压缩标记"
+    strings:
+        $m = "MPRESS" nocase
+    condition:
+        uint16(0) == 0x5A4D and $m
+}
+```
+
+- 建议 condition 加 `uint16(0) == 0x5A4D`（PE 魔数）前置，避免非 PE 误命中
+- 多条规则命中同一壳族时权重累加；单个文件编译失败不影响其它规则（启动日志与 Web 端警告）
+- 命中证据在 Web 端标注 `(YARA:<规则名>[...])` 来源；顶部徽章显示「外部规则 N 条」，加载有警告时置橙色
+- 规则目录与匹配大小上限可在 `config.json` 的 `packer.rules_dir` / `packer.max_yara_bytes` 调整（默认 `packer_rules` / 16MB）；修改规则后重启服务生效
 
 ## 文件类型识别（ClamAV FTM 机制移植）
 
@@ -135,6 +165,10 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
     "port": 5000,
     "max_upload_mb": 50,    // /scan 上传大小上限 (MB)
     "uploads_dir": "uploads" // 上传测试样本目录: 相对路径基于项目根目录解析, 也支持绝对路径; 启动时目录不存在会自动创建
+  },
+  "packer": {
+    "rules_dir": "packer_rules",   // 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径); 目录下所有 .yar/.yara 自动加载
+    "max_yara_bytes": 16777216     // 外部规则匹配的样本大小上限 (16MB); 内置 DIE/PEiD 特征不受限
   }
 }
 ```
@@ -177,7 +211,8 @@ nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/、/scan、/api/stats）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
-├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD + 启发特征融合判定）
+├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
+├── packer_rules/                 # 外部 YARA 扩展壳库（.yar 规则 + README.md 编写约定）
 ├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
@@ -225,6 +260,7 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 
 - **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
+- **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
 ### 压测
 
@@ -238,8 +274,8 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面                                                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash；`pe`：PE 元数据；`packer`：壳/保护器识别结果；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
-| `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash；`pe`：PE 元数据；`packer`：壳/保护器识别结果，含 `yara_rules_loaded`/`yara_error`；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
+| `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
 
 ## 验证
 

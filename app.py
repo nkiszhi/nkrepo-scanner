@@ -8,6 +8,7 @@ import os
 from flask import Flask, jsonify, render_template, request
 
 from scanner import HashSignatureDB, Scanner, YaraScanner
+import packer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SIG_DIR = os.path.join(BASE_DIR, "signatures")
@@ -27,6 +28,10 @@ DEFAULT_CONFIG = {
         "port": 5000,
         "max_upload_mb": 50,
         "uploads_dir": "uploads",  # 上传测试样本目录 (相对项目根目录或绝对路径), 启动时自动创建
+    },
+    "packer": {
+        "rules_dir": "packer_rules",      # 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径)
+        "max_yara_bytes": 16777216,       # 外部规则匹配的样本大小上限 (16MB)
     },
 }
 
@@ -53,6 +58,7 @@ cfg = load_config()
 bcfg = cfg["bloom"]
 hcfg = cfg["hash_db"]
 scfg = cfg["server"]
+pkcfg = cfg["packer"]
 
 # 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建; 仅用于放置测试样本, /scan 不落盘
 _uploads_cfg = str(scfg.get("uploads_dir", "uploads")).strip()
@@ -85,6 +91,18 @@ finalize_status = hash_db.finalize()
 if finalize_status:
     print(f"[NKREPO] 签名库整理: {finalize_status}")
 
+# 外部 YARA 扩展壳库: 读取 config.packer, 加载 packer_rules/ 下全部规则
+_pk_rules_dir = str(pkcfg.get("rules_dir", "packer_rules")).strip()
+_pk_rules_dir = _pk_rules_dir if os.path.isabs(_pk_rules_dir) else os.path.join(BASE_DIR, _pk_rules_dir)
+pk_engine = packer.configure(
+    rules_dir=_pk_rules_dir,
+    max_yara_bytes=int(pkcfg.get("max_yara_bytes", 16 * 1024 * 1024)),
+)
+if pk_engine.rule_count:
+    print(f"[NKREPO] 壳库 YARA 扩展规则: {pk_engine.rule_count} 条 ({len(pk_engine.source_files)} 文件, {_pk_rules_dir})")
+for f, err in pk_engine.errors[:5]:
+    print(f"[NKREPO] 壳库规则警告 [{f}]: {err}")
+
 scanner = Scanner(hash_db, yara_scanner)
 
 
@@ -100,6 +118,9 @@ def stats():
         "yara_rules": yara_scanner.rule_count,
         "yara_available": yara_scanner.rules is not None,
         "yara_error": yara_scanner.error,
+        "packer_yara_rules": pk_engine.rule_count,
+        "packer_yara_available": pk_engine.rules is not None,
+        "packer_yara_error": "; ".join(f"{f}: {e}" for f, e in pk_engine.errors[:3]) or None,
         "hash_sources": hash_db.source_files,
         "yara_sources": yara_scanner.source_files,
         "storage": hash_db.stats(),

@@ -7,6 +7,8 @@ packer.py - PE 壳 / 保护器识别 (参考 VirusTotal 静态查壳架构)
      - magic 字符串 : overlay / 全文件搜索 (如 UPX!, MPRESS, ASPack...)
      - EP 字节模式  : 入口点 hex 序列前缀匹配 (PEiD 经典特征, 支持 ?? 通配)
      - 特征节名      : UPX0 / .aspack / .petite / .vmp0 等
+     - 外部 YARA 规则: packer_rules/ 目录下的 .yar 规则 (meta.packer 声明壳族),
+                       命中即精确特征, 与内置特征同一权重体系 (扩展壳库)
 
   2. 启发特征 (加壳行为共性, 组合判定):
      - 节熵       : 压缩/加密壳节高熵 (>= 7.0)
@@ -24,16 +26,29 @@ packer.py - PE 壳 / 保护器识别 (参考 VirusTotal 静态查壳架构)
     "packers": [{"name", "confidence", "signals": [描述...]}],
     "packed_score": int (0-100),
     "heuristics": [{"key", "label", "weight"}],
-    "summary": str
+    "summary": str,
+    "yara_rules_loaded": int (外部 YARA 扩展规则数),
+    "yara_error": str | null (规则编译错误汇总)
   }
 """
 import math
+import os
+import re
 
 try:
     import pefile
     PEFILE_AVAILABLE = True
 except ImportError:  # pragma: no cover
     PEFILE_AVAILABLE = False
+
+try:
+    import yara
+    YARA_AVAILABLE = True
+except ImportError:  # pragma: no cover
+    YARA_AVAILABLE = False
+
+# 外部 YARA 扩展壳库默认目录 (相对本文件)
+DEFAULT_RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packer_rules")
 
 # ================================================================ 精确特征库
 
@@ -160,6 +175,128 @@ def _sec_name(sec):
     return sec.Name.rstrip(b"\x00").decode("latin-1", "replace")
 
 
+# ================================================================ 外部 YARA 扩展壳库
+
+class PackerYaraRules:
+    """外部 YARA 规则扩展壳库 (默认 packer_rules/*.yar, 目录可由 config.packer.rules_dir 配置)
+
+    规则编写约定 (meta 字段):
+      packer      : 壳族名称 (必选; 缺省时取规则名作为壳族名)
+      weight      : 证据权重 1-5 (可选, 默认 2; 与内置精确特征同一量纲:
+                    overlay magic=3 / 节名·EP=2 / 文件内 magic=1, YARA 命中默认视同强证据=2)
+      desc        : 证据描述 (可选, 默认 'YARA 规则 <name> 命中')
+      confidence  : 可选; 缺省由融合判定自动推导 (weight>=3 high / >=2 medium / else low)
+
+    命中后作为「精确特征」(kind="yara") 进入 detect_packer 的融合判定:
+    多条规则命中同一壳族时权重累加, 与内置 DIE/PEiD 特征共同计算 packed_score 与置信度。
+    """
+
+    def __init__(self, rules_dir=None, max_yara_bytes=16 * 1024 * 1024):
+        self.rules = None
+        self.rule_count = 0
+        self.source_files = []   # 成功加载的规则文件
+        self.errors = []         # [(文件名, 错误信息)] 编译失败的规则
+        self.max_yara_bytes = max_yara_bytes
+        self.rules_dir = rules_dir if rules_dir is not None else DEFAULT_RULES_DIR
+        self.load_dir(self.rules_dir)
+
+    def load_dir(self, rules_dir):
+        """加载目录下所有 .yar/.yara 规则; 单个文件编译失败不影响其它规则"""
+        if not YARA_AVAILABLE:
+            self.errors.append(("_", "yara-python 未安装, 外部规则不可用"))
+            return
+        if not rules_dir or not os.path.isdir(rules_dir):
+            return
+        files = sorted(f for f in os.listdir(rules_dir)
+                       if f.lower().endswith((".yar", ".yara")))
+        if not files:
+            return
+        paths = {}
+        for f in files:
+            path = os.path.join(rules_dir, f)
+            try:
+                yara.compile(filepath=path)  # 预编译校验语法
+                paths[f] = path
+            except yara.Error as e:
+                self.errors.append((f, str(e)))
+        if not paths:
+            return
+        try:
+            if len(paths) == 1:
+                self.rules = yara.compile(filepath=list(paths.values())[0])
+            else:
+                # filepaths: 每个文件独立 namespace, 规则名冲突互不干扰
+                self.rules = yara.compile(filepaths=paths)
+        except yara.Error as e:
+            self.errors.append(("_", f"合并编译失败: {e}"))
+            self.rules = None
+            return
+        self.source_files = list(paths.keys())
+        self.rule_count = self._count_rules()
+
+    def _count_rules(self):
+        try:
+            return len(self.rules)
+        except TypeError:  # pragma: no cover - 部分版本 Rules 不支持 len
+            n = 0
+            for f in self.source_files:
+                try:
+                    with open(os.path.join(self.rules_dir, f), "r",
+                              encoding="utf-8", errors="replace") as fh:
+                        n += len(re.findall(r"(?m)^\s*rule\s+[A-Za-z_]\w*\s*\{", fh.read()))
+                except OSError:
+                    pass
+            return n
+
+    def match_data(self, data):
+        """对内存数据跑外部规则; 返回命中列表 (空列表 = 无命中/不可用/超限)"""
+        if self.rules is None or not data or len(data) > self.max_yara_bytes:
+            return []
+        try:
+            matches = self.rules.match(data=data, timeout=10)
+        except (yara.TimeoutError, yara.Error):
+            return []
+        hits = []
+        for m in matches:
+            meta = m.meta or {}
+            family = str(meta.get("packer") or m.rule).strip() or m.rule
+            try:
+                weight = max(1, min(5, int(meta.get("weight", 2))))
+            except (TypeError, ValueError):
+                weight = 2
+            desc = str(meta.get("desc") or f"YARA 规则 {m.rule} 命中").strip()
+            strings = []
+            for s in m.strings:
+                ident = getattr(s, "identifier", None) or str(s)
+                strings.append(str(ident))
+            hits.append({
+                "rule": m.rule,
+                "family": family,
+                "weight": weight,
+                "desc": desc,
+                "strings": strings,
+            })
+        return hits
+
+
+# 模块级全局规则引擎 (服务进程内一次加载; configure() 在 app 启动时调用)
+_engine = None
+
+
+def configure(rules_dir=None, max_yara_bytes=16 * 1024 * 1024):
+    """配置并加载外部 YARA 扩展壳库 (服务启动时调用); 返回规则引擎实例"""
+    global _engine
+    _engine = PackerYaraRules(rules_dir, max_yara_bytes)
+    return _engine
+
+
+def _get_engine():
+    global _engine
+    if _engine is None:
+        _engine = PackerYaraRules()  # 惰性默认: packer_rules/
+    return _engine
+
+
 # ================================================================ 主入口
 
 def detect_packer(data):
@@ -210,6 +347,14 @@ def detect_packer(data):
         elif len(magic) >= 5 and lm in file_low:
             exact.append({"family": family, "kind": "magic",
                           "desc": f"文件内 magic '{magic.decode('latin-1')}'", "weight": 1})
+
+    # ---- 3.5) 外部 YARA 规则 (精确, 扩展壳库) ----
+    engine = _get_engine()
+    if engine.rules is not None and len(data) <= engine.max_yara_bytes:
+        for hit in engine.match_data(data):
+            tag = f"YARA:{hit['rule']}" + (f"[{','.join(hit['strings'][:3])}]" if hit["strings"] else "")
+            exact.append({"family": hit["family"], "kind": "yara",
+                          "desc": f"{hit['desc']} ({tag})", "weight": hit["weight"]})
 
     # ---- 4) 启发特征 ----
     # 4.1 节熵
@@ -313,6 +458,8 @@ def detect_packer(data):
         "packed_score": packed_score,
         "heuristics": heuristics,
         "summary": summary,
+        "yara_rules_loaded": engine.rule_count if engine.rules is not None else 0,
+        "yara_error": "; ".join(f"{f}: {e}" for f, e in engine.errors[:3]) or None,
     }
 
 

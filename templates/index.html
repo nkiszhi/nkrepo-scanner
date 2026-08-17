@@ -232,6 +232,14 @@ h1 { font-size: 22px; font-weight: 600; }
   font-size: 11px; color: var(--text-dim);
   border: 1px solid var(--border); border-radius: 10px; padding: 1px 8px;
 }
+.pk-yara {
+  margin-left: auto; font-size: 11px; color: var(--text-dim);
+  border: 1px dashed var(--border); border-radius: 4px; padding: 1px 8px;
+  font-family: var(--mono); white-space: nowrap;
+}
+.pk-yara b { color: var(--accent); font-weight: 600; }
+.pk-yara.err { color: #e67e22; border-color: rgba(230, 126, 34, .4); }
+.pk-yara.err b { color: #e67e22; }
 
 
 
@@ -398,6 +406,11 @@ function renderStatic(d) {
       html += '<span class="pk-clean">未检测到已知壳</span>';
       if (pk.packed_score > 0)
         html += '<span class="pk-score">启发评分 ' + pk.packed_score + ' / 100</span>';
+    }
+    if (pk.yara_rules_loaded > 0) {
+      const yTip = pk.yara_error ? ('规则加载警告: ' + pk.yara_error) : '外部 YARA 扩展壳库规则';
+      html += '<span class="pk-yara' + (pk.yara_error ? ' err' : '') + '" title="' +
+              esc(yTip) + '">外部规则 <b>' + pk.yara_rules_loaded + '</b> 条</span>';
     }
     html += '</div>';
     pk.packers.forEach(p => {
