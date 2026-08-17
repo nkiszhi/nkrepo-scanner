@@ -7,8 +7,8 @@ import tempfile
 from scanner import HashSignatureDB
 
 TEST_HASHES = [
-    # sha256 (库 v3 起仅接受 SHA256 主键)
-    ("275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f", 68, "EICAR-Test-File"),
+    # sha256 (库 v3 起仅接受 SHA256 主键; 测试约定: 不使用 EICAR 文件, 全部用自造签名)
+    ("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 32, "Test.SHA256.c"),
     ("00000abcdeadbeef000000000000000000000000000000000000000000000123", 50, "Test.SHA256.a"),
     (("fffffabcdeadbeef" + "f" * 62)[:61] + "456", 60, "Test.SHA256.b"),
 ]
@@ -70,18 +70,18 @@ def main():
         if st2["bloom"] and st2["bloom"]["shards_loaded"] != 0:
             print(f"  [FAIL] 冷启动应 0 个 bloom 加载, 实际 {st2['bloom']['shards_loaded']}")
             all_ok = False
-        # sha256 单次点查短路: EICAR 查询后只加载 sha256 所在分片 (1 个), 且命中 1 条
-        eicar_sha256 = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
-        hits = db2.check("", 68, "0" * 32, "0" * 40, eicar_sha256)
+        # sha256 单次点查短路: 命中样本查询后只加载其所在分片 (1 个), 且命中 1 条
+        probe_h, probe_size, probe_name = TEST_HASHES[0]
+        hits = db2.check("", probe_size, "0" * 32, "0" * 40, probe_h)
         st2 = db2.stats()
         loaded = st2["bloom"]["shards_loaded"] if st2["bloom"] else 0
         if loaded != 1:
             print(f"  [FAIL] sha256 短路后应只加载 1 个 bloom 分片, 实际 {loaded}")
             all_ok = False
         if len(hits) != 1:
-            print(f"  [FAIL] EICAR 应命中 1 条, 实际 {len(hits)}")
+            print(f"  [FAIL] {probe_name} 应命中 1 条, 实际 {len(hits)}")
             all_ok = False
-        print(f"  EICAR sha256 单次点查: 命中 {len(hits)} 条, 已加载 bloom 分片 {loaded}/1 ✓")
+        print(f"  sha256 单次点查: 命中 {len(hits)} 条, 已加载 bloom 分片 {loaded}/1 ✓")
         db2.close()
         db.close()
 

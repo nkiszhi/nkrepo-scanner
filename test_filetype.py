@@ -55,8 +55,6 @@ samples.append(("MAIL", b"Received: from mail.example.com by mx.test\n" + b" " *
 samples.append(("MBR", b"\x00" * 510 + b"\x55\xaa" + b"\x00" * 512))
 # SQLite
 samples.append(("SQLite", b"SQLite format 3\x00" + b"\x00" * 100))
-# EICAR
-samples.append(("EICAR", b"X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*" + b"\n"))
 
 # DMG 尾部
 dmg = b"\x00" * 2000 + b"koly" + b"\x00" * 508

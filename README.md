@@ -282,7 +282,7 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 
 ### 日常扩充
 
-- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中 EICAR 的 MD5/SHA1 两行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
+- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中非 64hex 行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
 - **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
@@ -345,21 +345,45 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 检查项 | 结果 |
 | ------ | ---- |
 | `GET /` 首页 / `GET /api/stats`（hash_signatures=62,587,049） | PASS |
-| `/scan` 上传 EICAR（68B）→ phase=hash、sha256 正确、命中 Hash DB `EICAR-Test-File` | PASS |
+| 库级 Hash DB 命中：从分片库读真实签名 → `db.check(sha256)` 命中（测试约定：**不使用 EICAR 文件**） | PASS |
 | `/scan` 上传普通文本 → 无检测 | PASS |
 | `/scan` 上传 MZ+UPX 伪样本 → 200 + 文件类型识别 | PASS |
 | 两段式：`/api/task/<id>` 轮询至 `status=done`，`result` 合并 `static_info`（ssdeep/tlsh/packer/pe）与 `verdict` | PASS |
 | 错误路径：缺 `file` 字段返回 400；超过 `max_upload_mb=10` 返回 413 | PASS |
 
-生成 EICAR 测试文件上传（应报 `EICAR-Test-File`，同时命中 YARA `EICAR_Test_String`）：
+按项目约定**测试不使用 EICAR 文件**（本机杀软会锁定 EICAR 导致文件读写失败，且哈希不可反推文件内容）。哈希命中采用**库级直查**（直接传 sha256 字符串，不依赖构造文件内容），Web 层用普通/特征样本验证路径：
 
 ```bash
-python -c "open('eicar.com','wb').write(b'X5O!P%@AP[4\\\\PZX54(P^)7CC)7}\$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!\$H+H*')"
+# 1) 库级 Hash DB 命中：从分片库读取一条真实签名并断言命中
+python -c "
+import sqlite3
+from scanner import HashSignatureDB
+db = HashSignatureDB('signatures/signatures.db')
+conn = sqlite3.connect('file:signatures/signatures.db.shards/0000.db?mode=ro', uri=True)
+h, size, name = conn.execute('SELECT hex(sha256), size, name FROM sigs LIMIT 1').fetchone()
+hits = db.check('', size, '0'*32, '0'*40, h)
+assert any(x['name'] == name for x in hits), f'应命中 {name}'
+print(f'Hash DB 命中: {name} ({h[:16]}...)')
+"
+
+# 2) Web 层放行路径：上传普通文本 → 无检测
+python -c "import requests; r = requests.post('http://127.0.0.1:5000/scan', files={'file': ('clean.txt', b'hello')}, timeout=30); print(r.status_code, r.json()['result']['detections'])"
+
+# 3) Web 层 YARA 命中：构造含 NKREPO_Test_Marker 特征串的样本上传, 轮询至 done 应见 YARA 命中
+python -c "
+import requests, time
+r = requests.post('http://127.0.0.1:5000/scan', files={'file': ('marker.txt', b'NKREPO-MALWARE-TEST-MARKER')}, timeout=30)
+tid = r.json()['task_id']
+for _ in range(20):
+    rr = requests.get(f'http://127.0.0.1:5000/api/task/{tid}', timeout=10).json()
+    if rr.get('status') == 'done':
+        break
+    time.sleep(0.5)
+print(rr['result']['detections'])
+"
 ```
 
-`uploads/` 下现有测试样本：`marker.txt`（YARA 报毒）、`clean.txt`（放行）；`eicar.com` 因安全工具会拦截其文件读写、不入库，用上面命令在 `uploads/` 下生成即可（其余 `tmp*` 为上传残留，自动忽略）。
-
-> 注意：本机杀软会锁定 EICAR 文件导致无法读取，验证时建议**内存构造字节直接上传**（系统本身即"全程内存不落盘"），勿依赖磁盘文件。
+`uploads/` 为运行时上传目录（重启清理，不入库）。库级自动化测试见 `test_shards.py`（自造 SHA256 签名导入临时库，验证命中 / 重分片保持命中 / Bloom 懒加载，运行 `python test_shards.py` 应 ALL PASS）；文件类型识别测试见 `test_filetype.py`；系统功能测试见上文表格（12/12 PASS）。
 
 ## 设计参考
 
