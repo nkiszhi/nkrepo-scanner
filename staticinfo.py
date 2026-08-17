@@ -17,6 +17,7 @@ import struct
 import time
 
 import tlsh as tlsh_mod
+import packer
 
 try:
     import pefile
@@ -180,6 +181,7 @@ def compute_static_info(data):
     结构:
       fuzzy:  {ssdeep, tlsh, imphash, authentihash}
       pe:     PE 元数据 (仅 PE 样本, 否则 None)
+      packer: 壳/保护器识别结果 (仅 PE 样本, 否则 None)
       notes:  说明列表 (不可用的原因)
     """
     notes = []
@@ -209,5 +211,6 @@ def compute_static_info(data):
     return {
         "fuzzy": fuzzy,
         "pe": compute_pe_meta(data) if _is_pe(data) else None,
+        "packer": packer.detect_packer(data) if _is_pe(data) else None,
         "notes": notes,
     }

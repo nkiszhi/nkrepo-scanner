@@ -2,13 +2,14 @@
 
 轻量级静态恶意软件扫描平台（类 VirusTotal 极简版）：**上传文件 → 干净 / 报毒**。
 
-仅实现三类静态检测，无其它特征类型：
+仅实现四类静态检测，无其它特征类型：
 
 | 引擎      | 说明                         | 签名格式                                          |
 | ------- | -------------------------- | --------------------------------------------- |
 | Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
+| 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库） | 精确特征（magic/EP 字节/节名）+ 启发特征（节熵/导入/RWX/EP 位置） |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
@@ -27,6 +28,26 @@
 
 - **8MB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，超大文件耗时失控，超过上限跳过（8MB 随机数据约 1s）；PE 的 imphash/authentihash 与元数据不受上限影响
 - **PE 静态元数据**（`static_info.pe`）：machine 架构、64 位标记、编译时间戳、subsystem、入口点、ImageBase、节表（名称/VirtualSize/RawSize/Flags）、导入表（每 DLL 最多列出 32 个函数）
+
+## 壳 / Packer 识别（`static_info.packer`）
+
+参考 **VirusTotal 静态查壳架构**，多特征融合识别（`packer.py`）：
+
+| 信号类型 | 特征 | 说明 |
+| ------ | ---- | ---- |
+| **精确特征** | overlay / 文件内 magic 字符串 | DIE 特征体系风格，如 `UPX!`、`MPRESS`、`ASPack`；短 magic（<5B）仅限 overlay，避免全文件误报 |
+| | EP 字节模式 | PEiD 经典特征库风格，入口点 hex 序列前缀匹配（支持 `??` 通配），如 `60 E8 03 00 00 00 61 E9` |
+| | 特征节名 | `UPX0/UPX1`、`.aspack`、`.petite`、`.vmp0`、`.themida` 等 23 类 |
+| **启发特征** | 节熵 | 最高节熵 ≥ 7.0 或 ≥2 节 ≥ 6.5（疑似压缩/加密） |
+| | 导入表条目数 | ≤ 15 个函数（加壳程序导入极少） |
+| | RWX 节存在性 | 节特性含 READ\|WRITE\|EXECUTE（0xE0000000） |
+| | 入口点位于最后一节 | 壳代码通常垫在文件末尾 |
+
+融合判定输出：`detected`、`confidence`（high/medium/low）、`packers`（壳名 + 证据信号列表）、`packed_score`（0-100 加壳评分）、`heuristics`（启发信号明细）、`summary`。
+
+- 精确特征命中 → 直接报具体壳名（如 UPX），证据 ≥3 分判 high
+- 无精确特征但 ≥3 条启发信号（≥35 分）→ 报 `Unknown (启发式)`，medium
+- 未达判定线 → `detected=false`，启发信号仍随结果返回供研判
 - 所有哈希不可用时返回 `null`，原因汇总在 `static_info.notes`
 - TLSH 纯 Python 移植已用官方 JS 实现（trendmicro/tlsh `js_ext/tlsh.js`）交叉验证：9 类用例（文本/随机/低熵/256B 边界/真实 PE）输出**完全一致**；低熵输入同样返回不可用
 
@@ -155,11 +176,12 @@ venv\Scripts\python app.py
 nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/、/scan、/api/stats）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
-├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据）
+├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
+├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD + 启发特征融合判定）
 ├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
-├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章 + 模糊哈希/PE 元数据）
+├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章 + 模糊哈希/PE 元数据/壳识别）
 ├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口/上传目录）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
@@ -216,7 +238,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面                                                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash；`pe`：PE 元数据；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash；`pe`：PE 元数据；`packer`：壳/保护器识别结果；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
 
 ## 验证
