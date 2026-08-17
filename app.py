@@ -10,6 +10,7 @@ import uuid
 from collections import OrderedDict, defaultdict, deque
 
 from flask import Flask, jsonify, render_template, request
+from werkzeug.exceptions import RequestEntityTooLarge
 
 from scanner import HashSignatureDB, Scanner, YaraScanner
 import packer
@@ -199,7 +200,16 @@ def stats():
         "hash_sources": hash_db.source_files,
         "yara_sources": yara_scanner.source_files,
         "storage": hash_db.stats(),
+        "max_upload_mb": int(scfg["max_upload_mb"]),  # 前端据此本地预检超限, 给出明确提示
     })
+
+
+# 文件超过 MAX_CONTENT_LENGTH 时 Flask/Werkzeug 抛出 413 RequestEntityTooLarge,
+# 默认返回 HTML 错误页 (前端 JSON 解析失败 → 模糊 ERROR)。统一返回明确 JSON 提示。
+@app.errorhandler(RequestEntityTooLarge)
+def handle_request_too_large(e):
+    limit_mb = int(scfg["max_upload_mb"])
+    return jsonify({"error": f"文件过大: 超过上传上限 {limit_mb}MB, 请压缩后重试"}), 413
 
 
 @app.route("/scan", methods=["POST"])

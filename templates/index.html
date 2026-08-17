@@ -294,6 +294,10 @@ const dz = document.getElementById('dz');
 const fi = document.getElementById('fi');
 const results = document.getElementById('results');
 
+// 上传大小上限 (MB): 默认 10, /api/stats 返回服务端配置后自动同步,
+// 供本地预检超限文件, 给出明确"文件过大"提示而不必发出请求
+let MAX_UPLOAD_MB = 10;
+
 // API 认证 (安全加固): URL 带 ?token=xxx 访问时自动记住到 localStorage;
 // 服务端配置了 api_token 后, 所有 API 请求自动携带 Authorization: Bearer 头
 const API_TOKEN = (() => {
@@ -327,18 +331,38 @@ fi.addEventListener('change', () => { [...fi.files].forEach(upload); fi.value = 
 function upload(file) {
   const card = mkScanCard(file);
   results.prepend(card);
+
+  // 本地预检: 超过上传上限直接拒绝, 不发请求, 给出明确"文件过大"提示
+  const limitBytes = MAX_UPLOAD_MB * 1024 * 1024;
+  if (file.size > limitBytes) {
+    renderErr(card,
+      '"' + file.name + '" 为 ' + fmtSize(file.size) + ', 超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试',
+      '文件过大');
+    return;
+  }
+
   const fd = new FormData();
   fd.append('file', file);
   fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
-    .then(r => r.json())
-    .then(d => {
+    .then(r => r.json()
+      .then(d => ({ ok: r.ok, status: r.status, d }))
+      .catch(() => ({ ok: false, status: r.status, d: null })))
+    .then(({ ok, status, d }) => {
+      // 非 2xx 响应 (如 413 超限): 优先用服务端 error 字段, 否则按状态码给出明确提示
+      if (!ok) {
+        if (status === 413)
+          renderErr(card, '文件超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试', '文件过大');
+        else if (d && d.error) renderErr(card, d.error);
+        else renderErr(card, '请求失败 (HTTP ' + status + '), 请稍后重试');
+        return;
+      }
       if (d.error) { renderErr(card, d.error); return; }
       // 两段式: 先渲染哈希查询结果 (阶段1, 毫秒级返回), 深度分析后台执行后动态更新
       renderPhase1(card, d.result);
       if (d.status === 'phase2' && d.task_id) pollTask(card, d.task_id);
       else render(card, d.result);   // 兼容: 后端若同步返回完整结果
     })
-    .catch(e => renderErr(card, '请求失败: ' + e.message));
+    .catch(e => renderErr(card, '网络错误: ' + e.message));
 }
 
 /* 轮询阶段 2 结果: YARA / 静态信息 / 查壳完成后整体刷新卡片 (带高亮动画) */
@@ -571,13 +595,13 @@ function fmtHex(n) {
   return '0x' + Number(n).toString(16).toUpperCase();
 }
 
-function renderErr(card, msg) {
+function renderErr(card, msg, title) {
   const v = card.querySelector('.verdict');
   v.className = 'verdict detected';
   v.textContent = 'ERROR';
   card.querySelector('.card-body').innerHTML =
     '<div class="det" style="background:rgba(255,180,84,.07);border-color:rgba(255,180,84,.3)">' +
-    '<div class="det-name" style="color:var(--amber)">扫描失败</div>' +
+    '<div class="det-name" style="color:var(--amber)">' + esc(title || '扫描失败') + '</div>' +
     '<div class="det-detail">' + esc(msg) + '</div></div>';
 }
 
@@ -589,6 +613,7 @@ function fmtSize(n) {
 }
 
 fetch('/api/stats', { headers: authHeaders() }).then(r => r.json()).then(s => {
+  MAX_UPLOAD_MB = s.max_upload_mb || 10;   // 同步服务端配置的上传上限, 用于本地预检
   document.getElementById('hashCount').textContent = s.hash_signatures;
   document.getElementById('yaraCount').textContent = s.yara_available ? s.yara_rules : 'N/A';
   const es = document.getElementById('engineState');

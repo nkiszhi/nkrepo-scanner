@@ -305,7 +305,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | `/`          | GET  | Web 界面（页面本身无需认证，数据接口受保护）                                                             |
 | `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时；**v3 起 Hash DB 仅按 sha256 点查**，md5/sha1 字段为计算展示值、不参与库比对）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
-| `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
+| `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
 
 ## 安全
 
@@ -349,7 +349,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | `/scan` 上传普通文本 → 无检测 | PASS |
 | `/scan` 上传 MZ+UPX 伪样本 → 200 + 文件类型识别 | PASS |
 | 两段式：`/api/task/<id>` 轮询至 `status=done`，`result` 合并 `static_info`（ssdeep/tlsh/packer/pe）与 `verdict` | PASS |
-| 错误路径：缺 `file` 字段返回 400；超过 `max_upload_mb=10` 返回 413 | PASS |
+| 错误路径：缺 `file` 字段返回 400；超过 `max_upload_mb=10` 返回 413，且响应为明确 JSON `{"error":"文件过大: 超过上传上限 10MB, 请压缩后重试"}`（前端本地预检同文案，不发起请求） | PASS |
 
 按项目约定**测试不使用 EICAR 文件**（本机杀软会锁定 EICAR 导致文件读写失败，且哈希不可反推文件内容）。哈希命中采用**库级直查**（直接传 sha256 字符串，不依赖构造文件内容），Web 层用普通/特征样本验证路径：
 
