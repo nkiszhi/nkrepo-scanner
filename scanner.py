@@ -24,6 +24,7 @@ import time
 from collections import OrderedDict
 
 import filetype as ft
+import staticinfo
 
 try:
     import yara
@@ -962,6 +963,11 @@ class Scanner:
         detections.extend(self.hash_db.check(None, file_size, md5, sha1, sha256))
         detections.extend(self.yara_scanner.scan_data(data))
 
+        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash/vhash + PE 元数据)
+        static_start = time.time()
+        static_info = staticinfo.compute_static_info(data)
+        static_ms = round((time.time() - static_start) * 1000, 1)
+
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
             "filename": filename,
@@ -972,6 +978,8 @@ class Scanner:
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,
+            "static_info": static_info,          # fuzzy: ssdeep/tlsh/imphash/authentihash/vhash; pe: PE 元数据
+            "static_ms": static_ms,              # 静态信息计算耗时 (ms)
             "clean": len(detections) == 0,
             "verdict": "CLEAN" if not detections else "DETECTED",
             "detections": detections,
@@ -998,6 +1006,10 @@ class Scanner:
         detections.extend(self.hash_db.check(file_path, file_size, md5, sha1, sha256))
         detections.extend(self.yara_scanner.scan(file_path))
 
+        # 大文件路径: 不计算模糊哈希/静态信息 (避免超大文件纯 Python 计算失控)
+        static_info = None
+        static_ms = 0.0
+
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
             "filename": filename or os.path.basename(file_path),
@@ -1008,6 +1020,8 @@ class Scanner:
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,
+            "static_info": static_info,          # 大文件路径不计算
+            "static_ms": static_ms,
             "clean": len(detections) == 0,
             "verdict": "CLEAN" if not detections else "DETECTED",
             "detections": detections,

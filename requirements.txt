@@ -1,2 +1,4 @@
 flask>=3.0
 yara-python>=4.3
+pefile>=2023.2.7
+ppdeep>=20200505

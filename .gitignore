@@ -23,6 +23,8 @@ uploads/
 # 调试/迁移临时文件
 _mig_*.py
 _mig_*.txt
+server_stdout.log
+*.log
 
 # Python
 __pycache__/

@@ -2,16 +2,34 @@
 
 轻量级静态恶意软件扫描平台（类 VirusTotal 极简版）：**上传文件 → 干净 / 报毒**。
 
-仅实现两类静态检测，无其它特征类型：
+仅实现三类静态检测，无其它特征类型：
 
 | 引擎      | 说明                         | 签名格式                                          |
 | ------- | -------------------------- | --------------------------------------------- |
 | Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
+| 模糊哈希  | ssdeep / TLSH / imphash / authentihash（vhash 仅标注） | 见「静态信息与模糊哈希」章节            |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
 当前签名库为 **ClamAV 官方真实病毒库**（main v63 + daily v28092，2026-08-14 快照）中的全部整文件哈希签名，共 **540,357 条**，当前按 `bloom.shards = 4` 拆为 4 个分片存储。
+
+## 静态信息与模糊哈希
+
+每次扫描（≤8MB 的文件）都会计算一组**模糊哈希 / 静态特征**，随 `/scan` 响应返回并展示在 Web 界面：
+
+| 字段          | 算法                                                             | 适用样本    | 缺失原因（Web 上悬停 `-` 可见）                |
+| ----------- | -------------------------------------------------------------- | ------- | ---------------------------------- |
+| `ssdeep`    | 上下文触发分段哈希（CTPH），SpamSum 兼容，基于 **ppdeep**（纯 Python）        | 任意类型   | 输入 <32B / 超过 8MB 上限 / 未安装 ppdeep |
+| `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 8MB 上限    |
+| `imphash`   | PE 导入表哈希（pefile）                                            | 仅 PE    | 非 PE 样本                            |
+| `authentihash` | PE Authenticode 哈希：清零 OptionalHeader.CheckSum 与 Security Directory 条目后 SHA256 全文件 | 仅 PE | 非 PE 样本 |
+| `vhash`     | VirusTotal 私有算法                                                 | -       | **本地无法复现**，仅标注字段，恒为 `null`       |
+
+- **8MB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，超大文件耗时失控，超过上限跳过（8MB 随机数据约 1s）；PE 的 imphash/authentihash 与元数据不受上限影响
+- **PE 静态元数据**（`static_info.pe`）：machine 架构、64 位标记、编译时间戳、subsystem、入口点、ImageBase、节表（名称/VirtualSize/RawSize/Flags）、导入表（每 DLL 最多列出 32 个函数）
+- 所有哈希不可用时返回 `null`，原因汇总在 `static_info.notes`
+- TLSH 纯 Python 移植已用官方 JS 实现（trendmicro/tlsh `js_ext/tlsh.js`）交叉验证：9 类用例（文本/随机/低熵/256B 边界/真实 PE）输出**完全一致**；低熵输入同样返回不可用
 
 ## 文件类型识别（ClamAV FTM 机制移植）
 
@@ -114,7 +132,7 @@ venv\Scripts\python app.py
 
 打开 <http://127.0.0.1:5000>
 
-依赖：`flask` + `yara-python`（Windows 下 pip 有预编译 wheel）。
+依赖：`flask` + `yara-python` + `pefile` + `ppdeep`（Windows 下 pip 均有预编译 wheel 或纯 Python 实现；TLSH 为项目内置纯 Python 移植 `tlsh.py`，无需额外依赖）。
 
 ### 并发与 IO 说明（P0 优化）
 
@@ -137,10 +155,12 @@ venv\Scripts\python app.py
 ```
 nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/、/scan、/api/stats）
-├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner）
+├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
+├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据）
+├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
-├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章）
+├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章 + 模糊哈希/PE 元数据）
 ├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口/上传目录）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
@@ -197,7 +217,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面                                                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`elapsed_ms` |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash/vhash；`pe`：PE 元数据；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
 
 ## 验证

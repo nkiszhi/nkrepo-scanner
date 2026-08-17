@@ -160,6 +160,58 @@ h1 { font-size: 22px; font-weight: 600; }
   border: 1px solid var(--border); border-radius: 4px; padding: 1px 8px;
 }
 
+/* ============ 静态信息 / 模糊哈希区块 ============ */
+.static-sec {
+  margin-top: 14px; padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+.static-title {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; font-weight: 600; color: var(--text-dim);
+  letter-spacing: .5px; margin-bottom: 10px;
+}
+.static-title::before {
+  content: ''; width: 3px; height: 12px; border-radius: 2px;
+  background: var(--accent);
+}
+.fuzzy {
+  display: grid; grid-template-columns: 110px 1fr; gap: 5px 12px;
+  font-family: var(--mono); font-size: 12px;
+}
+.fuzzy .k { color: var(--text-dim); }
+.fuzzy .v { color: var(--text); word-break: break-all; user-select: all; }
+.fuzzy .v.na { color: var(--text-dim); font-style: italic; cursor: help; }
+.pe-grid {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 8px 16px; margin-top: 12px; font-size: 12px;
+}
+.pe-grid .k { color: var(--text-dim); font-size: 11px; }
+.pe-grid .v { font-family: var(--mono); margin-top: 1px; color: var(--text); }
+.pe-tbl {
+  width: 100%; border-collapse: collapse; margin-top: 12px;
+  font-size: 12px; font-family: var(--mono);
+}
+.pe-tbl th, .pe-tbl td {
+  text-align: left; padding: 5px 10px; border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.pe-tbl th { color: var(--text-dim); font-weight: 500; font-size: 11px; }
+.pe-tbl td.sz { color: var(--text-dim); }
+.imports { margin-top: 12px; font-size: 12px; font-family: var(--mono); }
+.imports .imp-dll { margin-bottom: 4px; color: var(--text); word-break: break-all; }
+.imports .imp-dll b { color: var(--accent); font-weight: 600; }
+.imports .imp-fn { color: var(--text-dim); }
+.notes {
+  margin-top: 12px; font-size: 11px; color: var(--text-dim);
+  display: flex; flex-direction: column; gap: 3px;
+}
+.notes::before {
+  content: '说明'; font-weight: 600; letter-spacing: .5px;
+  font-size: 11px; margin-bottom: 2px;
+}
+.notes div { padding-left: 10px; position: relative; }
+.notes div::before { content: '·'; position: absolute; left: 2px; color: var(--text-dim); }
+
 
 
 footer { margin-top: 36px; color: var(--text-dim); font-size: 12px; text-align: center; }
@@ -273,13 +325,86 @@ function render(card, d) {
   } else {
     html += '<div class="ok-line">&#10003; 未发现已知威胁</div>';
   }
-  html += '<div class="scan-info">耗时 ' + d.elapsed_ms + ' ms · 引擎: ' +
-          d.scanners.map(esc).join(' + ') + '</div>';
+  html += '<div class="scan-info">耗时 ' + d.elapsed_ms + ' ms' +
+          (d.static_ms ? '（含静态分析 ' + d.static_ms + ' ms）' : '') +
+          ' · 引擎: ' + d.scanners.map(esc).join(' + ') + '</div>';
   html += '<div class="hashes">' +
     '<span class="k">MD5</span><span class="v">' + d.md5 + '</span>' +
     '<span class="k">SHA1</span><span class="v">' + d.sha1 + '</span>' +
     '<span class="k">SHA256</span><span class="v">' + d.sha256 + '</span></div>';
+  html += renderStatic(d);
   body.innerHTML = html;
+}
+
+/* 模糊哈希缺失原因 (tooltip) */
+const FZ_TIP = {
+  ssdeep: 'CTPH 模糊哈希；需 ≥32B，超过 8MB 上限跳过',
+  tlsh: 'Trend Micro 局部敏感哈希；需 ≥50B 且内容复杂度足够',
+  imphash: 'PE 导入表哈希；仅 PE 样本',
+  authentihash: 'PE Authenticode 哈希（清零 CheckSum+安全目录后 SHA256）；仅 PE 样本',
+  vhash: 'VirusTotal 私有算法，本地无法复现'
+};
+
+/* 静态信息 / 模糊哈希渲染: si = d.static_info (可空) */
+function renderStatic(d) {
+  const si = d.static_info;
+  if (!si) {
+    if (d.size > 8 * 1024 * 1024) {
+      return '<div class="static-sec"><div class="static-title">模糊哈希 / 静态信息</div>' +
+        '<div class="notes"><div>文件超过 8MB 上限，跳过 ssdeep/TLSH 计算</div></div></div>';
+    }
+    return '';
+  }
+  const fz = si.fuzzy || {};
+  const keys = ['ssdeep', 'tlsh', 'imphash', 'authentihash', 'vhash'];
+  let html = '<div class="static-sec"><div class="static-title">模糊哈希 / 静态信息</div>';
+  html += '<div class="fuzzy">' + keys.map(k => {
+    const v = fz[k];
+    if (v) return '<span class="k">' + k + '</span><span class="v">' + esc(v) + '</span>';
+    return '<span class="k">' + k + '</span><span class="v na" title="' +
+           esc(FZ_TIP[k] || '不可用') + '">-</span>';
+  }).join('') + '</div>';
+
+  const pe = si.pe;
+  if (pe) {
+    html += '<div class="pe-grid">' +
+      '<div><div class="k">Machine</div><div class="v">' + esc(pe.machine) + '</div></div>' +
+      '<div><div class="k">架构</div><div class="v">' + (pe.is_64bit ? '64-bit' : '32-bit') + '</div></div>' +
+      '<div><div class="k">编译时间</div><div class="v">' + esc(pe.timestamp || '-') + '</div></div>' +
+      '<div><div class="k">Subsystem</div><div class="v">' + esc(pe.subsystem) + '</div></div>' +
+      '<div><div class="k">入口点</div><div class="v">' + esc(pe.entry_point) + '</div></div>' +
+      '<div><div class="k">ImageBase</div><div class="v">' + esc(pe.image_base) + '</div></div>' +
+      '</div>';
+
+    if (pe.sections && pe.sections.length) {
+      html += '<table class="pe-tbl"><tr><th>节区</th><th>VirtualSize</th><th>RawSize</th><th>Flags</th></tr>' +
+        pe.sections.map(s =>
+          '<tr><td>' + esc(s.name) + '</td>' +
+          '<td class="sz">' + fmtHex(s.vsize) + '</td>' +
+          '<td class="sz">' + fmtHex(s.rsize) + '</td>' +
+          '<td>' + esc(s.flags) + '</td></tr>').join('') +
+        '</table>';
+    }
+    if (pe.imports && pe.imports.length) {
+      html += '<div class="imports">' + pe.imports.map(i => {
+        const shown = i.funcs.slice(0, 8);
+        const more = i.funcs.length > 8 ? ' … 等 ' + i.funcs.length + ' 个' : '';
+        return '<div class="imp-dll"><b>' + esc(i.dll) + '</b> ' +
+          '<span class="imp-fn">' + shown.map(esc).join(', ') + more + '</span></div>';
+      }).join('') + '</div>';
+    }
+  }
+  if (si.notes && si.notes.length) {
+    html += '<div class="notes">' + si.notes.map(n =>
+      '<div>' + esc(n) + '</div>').join('') + '</div>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function fmtHex(n) {
+  if (n === null || n === undefined) return '-';
+  return '0x' + Number(n).toString(16).toUpperCase();
 }
 
 function renderErr(card, msg) {
