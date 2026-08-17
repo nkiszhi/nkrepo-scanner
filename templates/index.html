@@ -341,8 +341,7 @@ const FZ_TIP = {
   ssdeep: 'CTPH 模糊哈希；需 ≥32B，超过 8MB 上限跳过',
   tlsh: 'Trend Micro 局部敏感哈希；需 ≥50B 且内容复杂度足够',
   imphash: 'PE 导入表哈希；仅 PE 样本',
-  authentihash: 'PE Authenticode 哈希（清零 CheckSum+安全目录后 SHA256）；仅 PE 样本',
-  vhash: 'VirusTotal 私有算法，本地无法复现'
+  authentihash: 'PE Authenticode 哈希（清零 CheckSum+安全目录后 SHA256）；仅 PE 样本'
 };
 
 /* 静态信息 / 模糊哈希渲染: si = d.static_info (可空) */
@@ -356,7 +355,7 @@ function renderStatic(d) {
     return '';
   }
   const fz = si.fuzzy || {};
-  const keys = ['ssdeep', 'tlsh', 'imphash', 'authentihash', 'vhash'];
+  const keys = ['ssdeep', 'tlsh', 'imphash', 'authentihash'];
   let html = '<div class="static-sec"><div class="static-title">模糊哈希 / 静态信息</div>';
   html += '<div class="fuzzy">' + keys.map(k => {
     const v = fz[k];

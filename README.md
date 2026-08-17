@@ -8,7 +8,7 @@
 | ------- | -------------------------- | --------------------------------------------- |
 | Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
-| 模糊哈希  | ssdeep / TLSH / imphash / authentihash（vhash 仅标注） | 见「静态信息与模糊哈希」章节            |
+| 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
@@ -24,7 +24,6 @@
 | `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 8MB 上限    |
 | `imphash`   | PE 导入表哈希（pefile）                                            | 仅 PE    | 非 PE 样本                            |
 | `authentihash` | PE Authenticode 哈希：清零 OptionalHeader.CheckSum 与 Security Directory 条目后 SHA256 全文件 | 仅 PE | 非 PE 样本 |
-| `vhash`     | VirusTotal 私有算法                                                 | -       | **本地无法复现**，仅标注字段，恒为 `null`       |
 
 - **8MB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，超大文件耗时失控，超过上限跳过（8MB 随机数据约 1s）；PE 的 imphash/authentihash 与元数据不受上限影响
 - **PE 静态元数据**（`static_info.pe`）：machine 架构、64 位标记、编译时间戳、subsystem、入口点、ImageBase、节表（名称/VirtualSize/RawSize/Flags）、导入表（每 DLL 最多列出 32 个函数）
@@ -217,7 +216,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面                                                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash/vhash；`pe`：PE 元数据；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制），返回 JSON：`verdict`（CLEAN/DETECTED）、`detections`（引擎+病毒名+哈希明细）、`file_type_info`（类型名/CL_TYPE 码/分类/判定方法）、`md5/sha1/sha256`、`static_info`（`fuzzy`：ssdeep/tlsh/imphash/authentihash；`pe`：PE 元数据；`notes`：缺失原因，≤8MB 文件计算）、`static_ms`（静态分析耗时）、`elapsed_ms` |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
 
 ## 验证

@@ -6,7 +6,6 @@ staticinfo.py - 样本静态信息与模糊哈希提取
   - tlsh         : Trend Micro 局部敏感哈希, 基于本地 tlsh.py (纯 Python, 官方算法移植)
   - imphash      : PE 导入表哈希 (pefile), 仅 PE 样本
   - authentihash : PE Authenticode 哈希 (清零 CheckSum + Security Directory 后 SHA256), 仅 PE
-  - vhash        : VirusTotal 私有算法, 本地无法复现, 仅标注
 
 适用类型: 所有样本计算 ssdeep/tlsh (超 FUZZY_MAX_BYTES 跳过); PE 样本额外计算
 imphash/authentihash 与 PE 静态元数据 (节表 / 导入 DLL / 编译时间等)。
@@ -179,7 +178,7 @@ def compute_static_info(data):
     """计算样本静态信息; 返回结构化 dict
 
     结构:
-      fuzzy:  {ssdeep, tlsh, imphash, authentihash, vhash}
+      fuzzy:  {ssdeep, tlsh, imphash, authentihash}
       pe:     PE 元数据 (仅 PE 样本, 否则 None)
       notes:  说明列表 (不可用的原因)
     """
@@ -189,7 +188,6 @@ def compute_static_info(data):
         "tlsh": None,
         "imphash": None,
         "authentihash": None,
-        "vhash": None,
     }
 
     if len(data) > FUZZY_MAX_BYTES:
@@ -207,9 +205,6 @@ def compute_static_info(data):
         fuzzy["authentihash"] = compute_authentihash(data)
         if not PEFILE_AVAILABLE:
             notes.append("imphash/authentihash 不可用: 未安装 pefile")
-
-    fuzzy["vhash"] = None  # VirusTotal 私有算法, 本地不可复现
-    notes.append("vhash 仅由 VirusTotal 私有算法生成, 本地无法计算")
 
     return {
         "fuzzy": fuzzy,

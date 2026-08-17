@@ -963,7 +963,7 @@ class Scanner:
         detections.extend(self.hash_db.check(None, file_size, md5, sha1, sha256))
         detections.extend(self.yara_scanner.scan_data(data))
 
-        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash/vhash + PE 元数据)
+        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash + PE 元数据)
         static_start = time.time()
         static_info = staticinfo.compute_static_info(data)
         static_ms = round((time.time() - static_start) * 1000, 1)
@@ -978,7 +978,7 @@ class Scanner:
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,
-            "static_info": static_info,          # fuzzy: ssdeep/tlsh/imphash/authentihash/vhash; pe: PE 元数据
+            "static_info": static_info,          # fuzzy: ssdeep/tlsh/imphash/authentihash; pe: PE 元数据
             "static_ms": static_ms,              # 静态信息计算耗时 (ms)
             "clean": len(detections) == 0,
             "verdict": "CLEAN" if not detections else "DETECTED",
