@@ -6,14 +6,16 @@
 
 | 引擎      | 说明                         | 签名格式                                          |
 | ------- | -------------------------- | --------------------------------------------- |
-| Hash DB | 整文件 **SHA256** 比对（v3 起库内仅存 SHA256 签名，MD5/SHA1 参数仅接口兼容） | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname`；v3 起导入**仅接受 64hex（SHA256）行**，32hex（md5）/ 40hex（sha1）行计数跳过 |
+| Hash DB | 整文件 **SHA256** 比对（当前 62,587,049 条，v3 起库内仅存 SHA256 签名，MD5/SHA1 参数仅接口兼容） | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname`；导入**仅接受 64hex（SHA256）行**，32hex（md5）/ 40hex（sha1）行计数跳过 |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
 | 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库 + 外部 YARA 扩展规则） | 精确特征（magic/EP 字节/节名/外部规则）+ 启发特征（节熵/导入/RWX/EP 位置） |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
-当前签名库源自 **ClamAV 官方真实病毒库**（main v63 + daily v28092，2026-08-14 快照）整文件哈希签名。v3 迁移后库内仅保留其中的 **SHA256 签名 186 条**（原 540,357 条中 md5/sha1 签名因无法推算 sha256 而按用户决策移除，备份见 `000X.db.pre_multi_hash.bak` 与 `000X.db.pre_sha256_pk.bak`），当前按 `bloom.shards = 4` 拆为 4 个分片存储。
+当前签名库：**62,587,049 条 SHA256 整文件哈希签名**，源自 ClamAV 官方病毒库整文件哈希（`signatures/hdb/` 下 256 个分桶 `.hdb` 文件，共 62,586,907 行且全部为 64hex sha256 签名，2026-08-17 全量导入），按 `bloom.shards = 4` 拆为 4 个分片存储（单分片约 1,560 万条，分片库合计约 4.4GB）。
+
+> 历史背景：v3 迁移曾将旧库 540,357 条 md5/sha1 签名按用户决策移除、仅保留 186 条 sha256（备份见 `000X.db.pre_multi_hash.bak` / `000X.db.pre_sha256_pk.bak`）；随后全量导入官方 sha256 分桶库，检测能力恢复并超越至 6200 万+ 条。
 
 ## 静态信息与模糊哈希
 
@@ -125,7 +127,7 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
                     懒加载 + LRU 缓存，上限 max_open_shards），BLOB 主键点查
 ```
 
-- 分片目录 `signatures/signatures.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰
+- 分片目录 `signatures/signatures.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰。当前（2026-08-17 全量导入后）4 分片实际计数：`15,637,579 / 15,650,214 / 15,650,005 / 15,649,251`，与 `_meta.db` 的 `shard_counts` 一致
 - `sigs` 表为 **SHA256 主键结构**（v3，`_meta.db` 中 `schema_version=3` / `primary_key=sha256` 标记）：
   `sha256 BLOB PRIMARY KEY`（库内仅存 SHA256 签名，32B）、`size`、`name`，
   另有预留列 `md5` / `sha1`（同文件其它标准哈希，暂无数据源为 NULL）
@@ -133,7 +135,7 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
   查询走 `sha256` 主键点查；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`，切主键前备份为 `000X.db.pre_sha256_pk.bak`
 - **v3 起仅接受 SHA256 签名**：导入 `.hdb/.hsb` 时 64hex 行入库，32hex（md5）/ 40hex（sha1）行计数跳过并提示；查询只对 sha256 摘要做一次 Bloom 排除 + 主键点查（见「并发与 IO 说明」）；冷启动 0 分片加载，随查询按需打开
 - Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/signatures.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
-- `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` 下的新文件（`imported_files` 表去重，幂等）
+- `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` **顶层**的新文件（`imported_files` 表去重，幂等）；`signatures/hdb/` 分桶子目录**不自动导入**，需按「签名库更新」章节的批量命令手动导入
 - 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `signatures.db.shards.legacy`
 - 兼容迁移：旧版单一 `signatures.db` 自动按前缀拆入分片（原文件保留为 `signatures.db.migrated`）；旧版单文件 Bloom（`signatures.db.bloom`）自动备份为 `signatures.db.bloom.legacy`
 
@@ -231,7 +233,8 @@ nkrepo-scanner/
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
 ├── bench.py                      # 性能基准（延迟 / 内存 / 磁盘）
 ├── signatures/
-│   ├── hashes.hdb                # 本地哈希签名（含 EICAR 三种哈希行；v3 起仅 SHA256 行生效）
+│   ├── hashes.hdb                # 本地哈希签名（含 EICAR 三种哈希行；仅 SHA256 行生效）
+│   ├── hdb/                      # ClamAV 官方整文件哈希分桶（00.hdb~ff.hdb 共 256 文件，全部 64hex sha256，约 5.5GB，62,586,907 行）
 │   ├── rules.yar                 # YARA 规则集
 │   ├── signatures.db.shards/     # 动态分片 SQLite（0000.db~{N-1}.db + _meta.db，运行时生成）
 │   ├── signatures.db.bloom/      # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
@@ -256,20 +259,30 @@ python extract_cvd.py cvd/main.cvd cvd/daily.cvd
 
 # 3. 导入 SQLite（增量、幂等; 分片数默认取 config 的 bloom.shards=4,
 #    如需覆盖可传 shard_count=N; 注意: v3 起仅接受 64hex(SHA256) 行,
-#    官方 main/daily 库中绝大多数 32hex(md5)/40hex(sha1) 行会被跳过,
-#    打印 "跳过 N 条非 SHA256 签名" 提示, 仅 SHA256 签名实际入库)
+#    官方 main/daily 库中 32hex(md5)/40hex(sha1) 行会被跳过, 仅 SHA256 实际入库)
 python -c "from scanner import HashSignatureDB; db = HashSignatureDB('signatures/signatures.db'); \
 [db.import_hdb(f) for f in ['extracted/main.main.hdb','extracted/main.main.hsb', \
 'extracted/daily.daily.hdb','extracted/daily.daily.hsb']]; db.finalize(); db.close()"
 
-# 4. 重启服务生效
+# 4. 批量导入官方 sha256 分桶库（signatures/hdb/ 下 00.hdb~ff.hdb, 全为 64hex;
+#    实测 62,586,907 行: 导入约 41min + Bloom 重建约 7min, 幂等可重复续导)
+python -c "
+import glob
+from scanner import HashSignatureDB
+db = HashSignatureDB('signatures/signatures.db')
+for f in sorted(glob.glob('signatures/hdb/*.hdb')):
+    n = db.import_hdb(f)
+    print(f, '+', n)
+db.finalize(); db.close()"
+
+# 5. 重启服务生效
 ```
 
 CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺带提取 `.mdb/.ndb/.ldb` 等其它类型签名（留在 `extracted/`，约 280MB），本平台暂不使用，可作为日后扩展字节级检测的数据源。
 
 ### 日常扩充
 
-- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**v3 起仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中 EICAR 的 MD5/SHA1 两行即为此类，仅 SHA256 行生效）
+- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中 EICAR 的 MD5/SHA1 两行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
 - **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
@@ -327,6 +340,17 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 ## 验证
 
+### 系统功能测试（2026-08-17，全量导入 6200 万条后实测 12/12 PASS）
+
+| 检查项 | 结果 |
+| ------ | ---- |
+| `GET /` 首页 / `GET /api/stats`（hash_signatures=62,587,049） | PASS |
+| `/scan` 上传 EICAR（68B）→ phase=hash、sha256 正确、命中 Hash DB `EICAR-Test-File` | PASS |
+| `/scan` 上传普通文本 → 无检测 | PASS |
+| `/scan` 上传 MZ+UPX 伪样本 → 200 + 文件类型识别 | PASS |
+| 两段式：`/api/task/<id>` 轮询至 `status=done`，`result` 合并 `static_info`（ssdeep/tlsh/packer/pe）与 `verdict` | PASS |
+| 错误路径：缺 `file` 字段返回 400；超过 `max_upload_mb=10` 返回 413 | PASS |
+
 生成 EICAR 测试文件上传（应报 `EICAR-Test-File`，同时命中 YARA `EICAR_Test_String`）：
 
 ```bash
@@ -334,6 +358,8 @@ python -c "open('eicar.com','wb').write(b'X5O!P%@AP[4\\\\PZX54(P^)7CC)7}\$EICAR-
 ```
 
 `uploads/` 下现有测试样本：`marker.txt`（YARA 报毒）、`clean.txt`（放行）；`eicar.com` 因安全工具会拦截其文件读写、不入库，用上面命令在 `uploads/` 下生成即可（其余 `tmp*` 为上传残留，自动忽略）。
+
+> 注意：本机杀软会锁定 EICAR 文件导致无法读取，验证时建议**内存构造字节直接上传**（系统本身即"全程内存不落盘"），勿依赖磁盘文件。
 
 ## 设计参考
 
