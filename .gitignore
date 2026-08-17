@@ -7,6 +7,8 @@ signatures/*.db-journal
 signatures/*.db-shm
 signatures/*.db-wal
 signatures/*.db.migrated
+signatures/*.db.migrated-shm
+signatures/*.db.migrated-wal
 signatures/*.db.shards/
 signatures/*.db.shards.legacy/
 
@@ -14,6 +16,7 @@ signatures/*.db.shards.legacy/
 cvd/
 extracted/
 *.cvd
+signatures/hdb/
 
 # 上传样本目录（运行时生成，程序启动时自动创建，整个目录不入库）
 # 注: eicar.com 为 EICAR 测试样本, 因安全工具会拦截其文件读写, 不入库;
