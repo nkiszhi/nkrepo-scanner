@@ -50,6 +50,13 @@ except ImportError:  # pragma: no cover
 # 外部 YARA 扩展壳库默认目录 (相对本文件)
 DEFAULT_RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "packer_rules")
 
+# ================================================================ 资源上限 (安全加固)
+# 恶意 PE 可将节 PointerToRawData=0 / SizeOfRawData=0xFFFFFFFF, 使熵计算切片覆盖整个文件,
+# 纯 Python 逐字节循环对 45MB 样本实测耗时 ~10s → 节熵计算改为采样, 统计量不受影响
+ENTROPY_SAMPLE_BYTES = 4 * 1024 * 1024  # 单节熵计算采样上限 (4MB 已足够表征熵)
+# 全文件小写化 (data.lower() 产生整文件副本) 的 magic 搜索上限; 超大文件仅搜索 overlay
+MAGIC_FILE_SEARCH_BYTES = 32 * 1024 * 1024
+
 # ================================================================ 精确特征库
 
 # PEiD 经典 EP 字节模式 (hex, ?? = 任意字节), 从入口点起始前缀匹配
@@ -159,8 +166,10 @@ def _match_hex_prefix(buf, pat):
 
 
 def _section_entropy(data, sec):
-    """计算单节 Shannon 熵 (基于 raw data)"""
+    """计算单节 Shannon 熵 (基于 raw data, 采样上限 ENTROPY_SAMPLE_BYTES 防 CPU 放大)"""
     off, size = sec.PointerToRawData, sec.SizeOfRawData
+    if size > ENTROPY_SAMPLE_BYTES:
+        size = ENTROPY_SAMPLE_BYTES  # 采样: 超大节只算前 4MB, 熵统计量不受影响
     chunk = data[off:off + size]
     if not chunk:
         return 0.0
@@ -336,15 +345,16 @@ def detect_packer(data):
 
     # ---- 3) magic 字符串 (精确, DIE 风格; overlay 优先) ----
     # 注意: 短 magic (<5 字节, 如 MEW/FSG!) 仅接受 overlay 命中, 避免全文件随机误报
+    # 注意: 超大文件 (>MAGIC_FILE_SEARCH_BYTES) 跳过全文件小写化, 避免整文件副本内存/CPU 放大
     overlay = _get_overlay(data, pe)
     overlay_low = overlay.lower() if overlay else b""
-    file_low = data.lower()
+    file_low = data.lower() if len(data) <= MAGIC_FILE_SEARCH_BYTES else None
     for family, magic in MAGIC_STRINGS:
         lm = magic.lower()
         if overlay_low and lm in overlay_low:
             exact.append({"family": family, "kind": "magic",
                           "desc": f"overlay magic '{magic.decode('latin-1')}'", "weight": 3})
-        elif len(magic) >= 5 and lm in file_low:
+        elif file_low is not None and len(magic) >= 5 and lm in file_low:
             exact.append({"family": family, "kind": "magic",
                           "desc": f"文件内 magic '{magic.decode('latin-1')}'", "weight": 1})
 

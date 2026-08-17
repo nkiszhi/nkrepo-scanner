@@ -164,7 +164,11 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
     "host": "127.0.0.1",
     "port": 5000,
     "max_upload_mb": 50,    // /scan 上传大小上限 (MB)
-    "uploads_dir": "uploads" // 上传测试样本目录: 相对路径基于项目根目录解析, 也支持绝对路径; 启动时目录不存在会自动创建
+    "uploads_dir": "uploads", // 上传测试样本目录: 相对路径基于项目根目录解析, 也支持绝对路径; 启动时目录不存在会自动创建
+    "api_token": "",        // API 认证: 留空 = 匿名本地模式; 配置后 /scan /api/task /api/stats 需带 Authorization: Bearer <token> 或 ?token=<token>
+    "scan_rate_limit": 30,  // 每 IP 每分钟最多 /scan 次数 (0 = 不限), 防恶意刷扫描耗尽 CPU
+    "phase2_max_mb": 32,    // 阶段2 深度分析(模糊哈希/PE元数据/查壳)的样本大小上限; 超过仅执行 YARA 并返回 phase2_note
+    "phase2_concurrency": 4 // 阶段2 后台线程并发上限 (信号量, 超限排队), 控制 CPU 峰值
   },
   "packer": {
     "rules_dir": "packer_rules",   // 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径); 目录下所有 .yar/.yara 自动加载
@@ -271,12 +275,43 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 ## API
 
+> **认证（可选）**：`config.json` 配置 `server.api_token` 后，以下全部接口需携带
+> `Authorization: Bearer <token>` 或 `?token=<token>`，否则返回 `401`；留空则匿名放行（默认本地模式）。
+> **限流**：`/scan` 每 IP 每分钟超过 `server.scan_rate_limit`（默认 30）次返回 `429`。
+> 前端页面首次以 `http://host:port/?token=<token>` 访问会自动记住 token（localStorage），后续请求自动带认证头。
+
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
-| `/`          | GET  | Web 界面                                                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行 |
-| `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
+| `/`          | GET  | Web 界面（页面本身无需认证，数据接口受保护）                                                             |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
+| `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
+
+## 安全
+
+静态安全审查（OWASP 类别逐项）+ 动态恶意输入验证后落地的加固项：
+
+- **认证（M1）**：`server.api_token` 非空时，`/scan`、`/api/task/<id>`、`/api/stats` 全部要求
+  `Authorization: Bearer <token>` 或 `?token=<token>`（`401`）；默认留空 = 匿名本地模式，方便本机使用
+- **限流（M1）**：`/scan` 每 IP 每分钟滑动窗口计数（`scan_rate_limit`，默认 30），超限 `429`，
+  防未认证部署下被恶意刷扫描耗尽 CPU
+- **阶段 2 资源上限（M3）**：超过 `phase2_max_mb`（默认 32MB）的样本跳过模糊哈希 / PE 元数据 / 查壳，
+  仅执行 YARA（10s 超时）并返回 `phase2_note` —— 避免超大文件纯 Python 逐字节分析打满 CPU / 内存
+- **CPU 放大封堵（M2）**：单节熵计算采样上限 4MB（`packer.ENTROPY_SAMPLE_BYTES`），全文件 magic
+  搜索上限 32MB（`packer.MAGIC_FILE_SEARCH_BYTES`）—— 恶意 PE 把节 `PointerToRawData=0` /
+  `SizeOfRawData=0xFFFFFFFF` 使熵切片覆盖全文件的放大向量实测 45MB 样本阶段 2 耗时
+  **10.0s → 0.29s**（约 34 倍），且不再产生整文件 `lower()` 副本
+- **阶段 2 并发控制（M3）**：后台线程信号量 `phase2_concurrency`（默认 4），超限排队，防止 CPU 峰值打满
+- **任务内存上限**：内存中任务保留 `TASKS_MAX=100` / `TASK_TTL=600s`，惰性清理防无限增长
+- **前端 XSS 防护**：所有动态内容经 `esc()`（DOM textContent 级转义）后插入；上传大小受
+  `server.max_upload_mb` 限制（413 超限拒绝）
+
+> 已知低风险项（未修复，按需处理）：无安全响应头（`X-Frame-Options` 等，可前置 Nginx）、
+> 无 CSRF 令牌（服务为无状态 API + Bearer 认证，CSRF 风险低）、`requirements.txt` 未锁定精确版本、
+> 任务结果驻留内存（TTL 已限制）。
+>
+> 生产部署建议：`host` 保持 `127.0.0.1` 或置于内网 + 反代（Nginx）后暴露；如需公网访问务必配置
+> `api_token` 并启用 HTTPS。
 
 ## 验证
 

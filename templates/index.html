@@ -294,6 +294,19 @@ const dz = document.getElementById('dz');
 const fi = document.getElementById('fi');
 const results = document.getElementById('results');
 
+// API 认证 (安全加固): URL 带 ?token=xxx 访问时自动记住到 localStorage;
+// 服务端配置了 api_token 后, 所有 API 请求自动携带 Authorization: Bearer 头
+const API_TOKEN = (() => {
+  const t = new URLSearchParams(location.search).get('token');
+  if (t) localStorage.setItem('nk_api_token', t);
+  return localStorage.getItem('nk_api_token') || '';
+})();
+function authHeaders(extra) {
+  const h = Object.assign({}, extra || {});
+  if (API_TOKEN) h['Authorization'] = 'Bearer ' + API_TOKEN;
+  return h;
+}
+
 // 文件类型分类图标 (配合 ftype-row 徽章)
 const ftCatIcons = {
   executable: '\u2699', document: '\u{1F4C4}', archive: '\u{1F4E6}',
@@ -316,7 +329,7 @@ function upload(file) {
   results.prepend(card);
   const fd = new FormData();
   fd.append('file', file);
-  fetch('/scan', { method: 'POST', body: fd })
+  fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
     .then(r => r.json())
     .then(d => {
       if (d.error) { renderErr(card, d.error); return; }
@@ -330,7 +343,7 @@ function upload(file) {
 
 /* 轮询阶段 2 结果: YARA / 静态信息 / 查壳完成后整体刷新卡片 (带高亮动画) */
 function pollTask(card, taskId) {
-  fetch('/api/task/' + taskId)
+  fetch('/api/task/' + taskId, { headers: authHeaders() })
     .then(r => r.json())
     .then(d => {
       if (d.error) { finalizePhase1(card, d.error); }
@@ -461,10 +474,14 @@ const FZ_TIP = {
   authentihash: 'PE Authenticode 哈希（清零 CheckSum+安全目录后 SHA256）；仅 PE 样本'
 };
 
-/* 静态信息 / 模糊哈希渲染: si = d.static_info (可空) */
+/* 静态信息 / 模糊哈希渲染: si = d.static_info (可空; 超过阶段2上限时 d.phase2_note 提供原因) */
 function renderStatic(d) {
   const si = d.static_info;
   if (!si) {
+    if (d.phase2_note) {
+      return '<div class="static-sec"><div class="static-title">模糊哈希 / 静态信息</div>' +
+        '<div class="notes"><div>&#9888; ' + esc(d.phase2_note) + '</div></div></div>';
+    }
     if (d.size > 8 * 1024 * 1024) {
       return '<div class="static-sec"><div class="static-title">模糊哈希 / 静态信息</div>' +
         '<div class="notes"><div>文件超过 8MB 上限，跳过 ssdeep/TLSH 计算</div></div></div>';
@@ -571,7 +588,7 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(1) + ' MB';
 }
 
-fetch('/api/stats').then(r => r.json()).then(s => {
+fetch('/api/stats', { headers: authHeaders() }).then(r => r.json()).then(s => {
   document.getElementById('hashCount').textContent = s.hash_signatures;
   document.getElementById('yaraCount').textContent = s.yara_available ? s.yara_rules : 'N/A';
   const es = document.getElementById('engineState');

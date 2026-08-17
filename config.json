@@ -15,7 +15,15 @@
     "port": 5000,
     "max_upload_mb": 50,
     "_comment_uploads_dir": "上传测试样本目录: 相对路径基于项目根目录解析 (如 uploads), 也支持绝对路径 (如 D:/scanner_uploads); 启动时若目录不存在会自动创建",
-    "uploads_dir": "uploads"
+    "uploads_dir": "uploads",
+    "_comment_api_token": "API 认证 (安全加固): 留空 = 匿名本地模式; 配置任意字符串后, /scan /api/task /api/stats 需带 Authorization: Bearer <token> 或 ?token=<token>; 前端页面首次带 ?token=<token> 访问即自动记住 (localStorage)",
+    "api_token": "",
+    "_comment_scan_rate_limit": "每 IP 每分钟最多 /scan 次数 (0 = 不限); 防恶意刷扫描耗尽 CPU (内存滑动窗口)",
+    "scan_rate_limit": 30,
+    "_comment_phase2_max_mb": "阶段2 深度分析(模糊哈希/PE元数据/查壳)的样本大小上限; 超过仅执行 YARA (10s 超时), 防超大文件纯 Python 逐字节分析打满 CPU",
+    "phase2_max_mb": 32,
+    "_comment_phase2_concurrency": "阶段2 后台线程并发上限 (信号量, 超限排队); 控制 CPU 峰值",
+    "phase2_concurrency": 4
   },
   "packer": {
     "_comment_rules_dir": "外部 YARA 扩展壳库目录: 相对路径基于项目根目录解析 (如 packer_rules), 也支持绝对路径; 目录下所有 .yar/.yara 规则自动加载, 命中即作为精确特征进入壳识别 (规则约定见 packer_rules/README.md)",
