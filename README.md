@@ -163,7 +163,7 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
   "server": {
     "host": "127.0.0.1",
     "port": 5000,
-    "max_upload_mb": 50,    // /scan 上传大小上限 (MB)
+    "max_upload_mb": 10,    // /scan 上传大小上限 (MB)
     "uploads_dir": "uploads", // 上传测试样本目录: 相对路径基于项目根目录解析, 也支持绝对路径; 启动时目录不存在会自动创建
     "api_token": "",        // API 认证: 留空 = 匿名本地模式; 配置后 /scan /api/task /api/stats 需带 Authorization: Bearer <token> 或 ?token=<token>
     "scan_rate_limit": 30,  // 每 IP 每分钟最多 /scan 次数 (0 = 不限), 防恶意刷扫描耗尽 CPU
@@ -205,7 +205,7 @@ venv\Scripts\python app.py
   重复样本直接复用位置数组，省去重复哈希与求模
 - **内存扫描阈值**：`Scanner.INLINE_LIMIT = 64MB` —— ≤64MB 的文件一次性读入内存，
   哈希 / 类型识别 / YARA 复用同一份缓冲；更大文件自动退回分块 + 路径扫描（`_scan_large`），
-  防止大文件占满内存；Web 端 `/scan` 另有 `server.max_upload_mb`（默认 50MB）上限
+  防止大文件占满内存；Web 端 `/scan` 另有 `server.max_upload_mb`（默认 10MB）上限
 - 生产环境建议用 `waitress` / `gunicorn` 多 worker 替代内置服务器
 
 ## 目录结构

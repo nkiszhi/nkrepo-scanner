@@ -30,7 +30,7 @@ DEFAULT_CONFIG = {
     "server": {
         "host": "127.0.0.1",
         "port": 5000,
-        "max_upload_mb": 50,
+        "max_upload_mb": 10,
         "uploads_dir": "uploads",  # 上传测试样本目录 (相对项目根目录或绝对路径), 启动时自动创建
         # 安全加固: 认证 / 限流 / 深度分析资源上限 (以下均为中危 DoS 缓解, 见 README「安全」章节)
         "api_token": "",            # 留空 = 匿名本地模式; 配置任意字符串后, /scan /api/task /api/stats

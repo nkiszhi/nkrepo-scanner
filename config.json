@@ -13,7 +13,7 @@
     "_comment_host": "监听地址 (0.0.0.0 表示所有网卡)",
     "host": "127.0.0.1",
     "port": 5000,
-    "max_upload_mb": 50,
+    "max_upload_mb": 10,
     "_comment_uploads_dir": "上传测试样本目录: 相对路径基于项目根目录解析 (如 uploads), 也支持绝对路径 (如 D:/scanner_uploads); 启动时若目录不存在会自动创建",
     "uploads_dir": "uploads",
     "_comment_api_token": "API 认证 (安全加固): 留空 = 匿名本地模式; 配置任意字符串后, /scan /api/task /api/stats 需带 Authorization: Bearer <token> 或 ?token=<token>; 前端页面首次带 ?token=<token> 访问即自动记住 (localStorage)",
