@@ -126,6 +126,12 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 ```
 
 - 分片目录 `signatures/signatures.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰
+- `sigs` 表为**多哈希列结构**（v2，`_meta.db` 中 `schema_version=2` 标记）：
+  `h BLOB PRIMARY KEY`（条目自身哈希原值，MD5 16B / SHA1 20B / SHA256 32B 混合，兼容旧查询与 Bloom）、
+  `hash_type`（md5 / sha1 / sha256）、`size`、`name`，
+  另有标准哈希列 `sha256` / `md5` / `sha1`（与 h 同源、按 hash_type 填充，其余为 NULL）
+  及 fuzzy 列 `ssdeep` / `tlsh` / `sdhash` / `mvhash`（预留：需原始样本源接入后回填）。
+  查询仍走 `h` 原值点查，Bloom 位图与既有逻辑不受影响；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`
 - MD5 / SHA1 / SHA256 签名按**各自哈希**的摘要路由，查询顺序 sha256 → sha1 → md5、命中即短路（见「并发与 IO 说明」），最坏情况打开 3 个分片、通常只需 1 个；冷启动 0 分片加载，随查询按需打开
 - Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/signatures.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
 - `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` 下的新文件（`imported_files` 表去重，幂等）

@@ -37,6 +37,38 @@ CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
 VALID_HASH_LENGTHS = {32: "md5", 40: "sha1", 64: "sha256"}
 HASH_ALGO_BY_BYTES = {16: "MD5", 20: "SHA1", 32: "SHA256"}
 
+# sigs 表多哈希列结构 (v2):
+#   h BLOB PRIMARY KEY       条目自身哈希 (16/20/32B 原值, 兼容旧查询与 Bloom)
+#   hash_type TEXT           该条目的哈希类型: md5 | sha1 | sha256
+#   sha256/md5/sha1 BLOB     三种标准哈希列 (能填则填, 与 h 同源)
+#   ssdeep/tlsh/sdhash/mvhash TEXT  4 个 fuzzy hash 列 (暂无数据源, 预留)
+SIGS_COLS = "h,hash_type,size,name,sha256,md5,sha1,ssdeep,tlsh,sdhash,mvhash"
+SIGS_DDL = (
+    "CREATE TABLE IF NOT EXISTS sigs("
+    " h BLOB PRIMARY KEY, hash_type TEXT NOT NULL,"
+    " size INTEGER, name TEXT,"
+    " sha256 BLOB, md5 BLOB, sha1 BLOB,"
+    " ssdeep TEXT, tlsh TEXT, sdhash TEXT, mvhash TEXT) WITHOUT ROWID"
+)
+SIGS_INSERT = (
+    "INSERT OR IGNORE INTO sigs(" + SIGS_COLS + ")"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
+)
+
+# 字节长度 -> (hash_type, 应填充的哈希列名); fuzzy 列恒 NULL
+def _sigs_row(h, size, name):
+    """把 (h,size,name) 映射为 11 列新结构行 (h 长度决定 hash_type 与填充列)"""
+    n = len(h)
+    try:
+        htype = HASH_ALGO_BY_BYTES[n].lower()
+    except KeyError:
+        raise ValueError(f"未知哈希长度: {n}")
+    return (h, htype, size, name,
+            h if n == 32 else None,  # sha256
+            h if n == 16 else None,  # md5
+            h if n == 20 else None,  # sha1
+            None, None, None, None)  # ssdeep/tlsh/sdhash/mvhash
+
 
 def compute_hashes(file_path):
     """一次性分块计算文件的 MD5 / SHA1 / SHA256"""
@@ -305,26 +337,24 @@ class HashSignatureDB:
                 continue
             pending = {}
             try:
-                cur = src_conn.execute("SELECT h,size,name FROM sigs")
+                cur = src_conn.execute(
+                    "SELECT h,hash_type,size,name,sha256,md5,sha1,"
+                    "ssdeep,tlsh,sdhash,mvhash FROM sigs")
                 while True:
                     rows = cur.fetchmany(50_000)
                     if not rows:
                         break
-                    for h, size, name in rows:
-                        sid = self._route(h, self.shard_count)
-                        pending.setdefault(sid, []).append((h, size, name))
+                    for row in rows:  # 11 列整行透传 (结构已在迁移时统一为 v2)
+                        sid = self._route(row[0], self.shard_count)
+                        pending.setdefault(sid, []).append(row)
             except sqlite3.Error:
                 pass
             src_conn.close()
             for sid, rows in pending.items():
                 shard = self._open_rw(
                     os.path.join(new_dir, self._shard_name(sid) + ".db"))
-                shard.execute(
-                    "CREATE TABLE IF NOT EXISTS sigs("
-                    " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
-                )
-                shard.executemany(
-                    "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)", rows)
+                shard.execute(SIGS_DDL)
+                shard.executemany(SIGS_INSERT, rows)
                 shard.commit()
                 shard.close()
                 total += len(rows)
@@ -475,14 +505,15 @@ class HashSignatureDB:
                 return
             t0 = time.time()
             pending = {}
-            cur = legacy.execute("SELECT h,size,name FROM sigs")
+            cur = legacy.execute("SELECT h,size,name FROM sigs")  # 旧库为 v1 三列
             while True:
                 rows = cur.fetchmany(100_000)
                 if not rows:
                     break
                 for h, size, name in rows:
                     sid = self._route(h, self.shard_count)
-                    pending.setdefault(sid, []).append((h, size, name))
+                    pending.setdefault(sid, []).append(
+                        _sigs_row(h, size, name))  # 映射为 v2 11 列
             # 迁移导入记录
             try:
                 names = [r[0] for r in legacy.execute("SELECT name FROM imported_files")]
@@ -493,16 +524,10 @@ class HashSignatureDB:
             count_updates = []
             for sid, rows in pending.items():
                 shard = self._open_rw(self._shard_path(sid))
-                shard.execute(
-                    "CREATE TABLE IF NOT EXISTS sigs("
-                    " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
-                )
+                shard.execute(SIGS_DDL)
                 before = shard.total_changes
                 for i in range(0, len(rows), 50_000):
-                    shard.executemany(
-                        "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)",
-                        rows[i:i + 50_000],
-                    )
+                    shard.executemany(SIGS_INSERT, rows[i:i + 50_000])
                 shard.commit()
                 inserted = shard.total_changes - before
                 cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
@@ -530,6 +555,8 @@ class HashSignatureDB:
                 self.meta.execute(
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                     (str(self.shard_count),))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','2')")
             os.replace(legacy_path, legacy_path + ".migrated")
             for suffix in ("-wal", "-shm"):
                 try:
@@ -628,24 +655,19 @@ class HashSignatureDB:
                     size_field = parts[1].strip()
                     size = None if size_field == "*" else int(size_field)
                     name = parts[2].strip()
+                    # 按哈希长度分派 hash_type 与填充列 (32hex=md5 / 40hex=sha1 / 64hex=sha256)
                     pending.setdefault(
                         self._route(digest, self.shard_count), []
-                    ).append((digest, size, name))
+                    ).append(_sigs_row(digest, size, name))
             inserted = 0
             count_updates = []
             dirty = set()
             for sid, rows in pending.items():
                 shard = self._open_rw(self._shard_path(sid))
-                shard.execute(
-                    "CREATE TABLE IF NOT EXISTS sigs("
-                    " h BLOB PRIMARY KEY, size INTEGER, name TEXT) WITHOUT ROWID"
-                )
+                shard.execute(SIGS_DDL)
                 before = shard.total_changes
                 for i in range(0, len(rows), batch):
-                    shard.executemany(
-                        "INSERT OR IGNORE INTO sigs(h,size,name) VALUES(?,?,?)",
-                        rows[i:i + batch],
-                    )
+                    shard.executemany(SIGS_INSERT, rows[i:i + batch])
                 shard.commit()
                 delta = shard.total_changes - before
                 cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
