@@ -945,10 +945,37 @@ class Scanner:
         """直接扫描内存数据 (Web 上传路径: 全程不落盘, 零额外磁盘 IO)"""
         return self._scan_common(data, filename or "unnamed", len(data))
 
+    def scan_phase1(self, data, filename=None):
+        """两段式扫描·阶段1 (Web 上传): 哈希 + 文件类型 + 哈希签名库命中, 毫秒级立即返回"""
+        return self._phase1(data, filename or "unnamed")
+
+    def scan_phase2(self, data, filename=None):
+        """两段式扫描·阶段2 (Web 上传, 后台线程): YARA 规则 + 静态信息/模糊哈希 + 查壳"""
+        return self._phase2(data, filename or "unnamed")
+
+    def merge_phases(self, p1, p2):
+        """两段式扫描·合并: 阶段1 + 阶段2 → 完整扫描结果 (供轮询接口拼装)"""
+        return self._merge_phases(p1, p2)
+
     def _scan_common(self, data, filename, file_size):
-        """内存复用核心: 哈希 → 类型识别 → Bloom/SQLite → YARA, 文件只读一遍"""
+        """内存复用核心 (同步完整扫描): 哈希 → 类型识别 → 签名库 → YARA → 静态信息
+
+        供 scan_file / scan_bytes 兼容使用, 等价于 _phase1 + _phase2 顺序合并;
+        Web 上传路径改用 scanner.scan_phase1 / scan_phase2 两段式 (哈希先返回, 深度分析动态更新)。
+        """
+        p1 = self._phase1(data, filename)
+        p2 = self._phase2(data, filename)
+        return self._merge_phases(p1, p2)
+
+    def _phase1(self, data, filename):
+        """阶段 1 (快速, 同步返回): 哈希 → 文件类型 → 哈希签名库命中
+
+        只做 O(1) 哈希计算 + Bloom/SQLite 点查, 毫秒级返回;
+        返回结构带 phase="hash" 标记, detections 仅含 Hash DB 命中。
+        """
         start = time.time()
         md5, sha1, sha256 = compute_hashes_bytes(data)
+        file_size = len(data)
 
         # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
         ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
@@ -959,18 +986,10 @@ class Scanner:
         except Exception:
             pass
 
-        detections = []
-        detections.extend(self.hash_db.check(None, file_size, md5, sha1, sha256))
-        detections.extend(self.yara_scanner.scan_data(data))
-
-        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测)
-        static_start = time.time()
-        static_info = staticinfo.compute_static_info(data)
-        static_ms = round((time.time() - static_start) * 1000, 1)
-
+        detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
-            "filename": filename,
+            "filename": filename or "unnamed",
             "size": file_size,
             "size_human": _human_size(file_size),
             "file_type": ftype["name"],          # 显示名 (向后兼容)
@@ -978,14 +997,59 @@ class Scanner:
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,
-            "static_info": static_info,          # fuzzy: ssdeep/tlsh/imphash/authentihash; pe: PE 元数据; packer: 壳检测
-            "static_ms": static_ms,              # 静态信息计算耗时 (ms)
+            "detections": detections,            # 仅 Hash DB 命中
+            "clean": len(detections) == 0,
+            "verdict": "CLEAN" if not detections else "DETECTED",
+            "scanners": ["Hash DB (md5/sha1/sha256)"],
+            "elapsed_ms": elapsed_ms,            # 阶段1耗时
+            "static_info": None,
+            "static_ms": 0.0,
+            "phase": "hash",
+        }
+
+    def _phase2(self, data, filename):
+        """阶段 2 (深度, 后台执行): YARA 规则匹配 + 静态信息/模糊哈希 + 查壳
+
+        返回合并阶段 1 所需的补充字段: detections(YARA) / static_info / static_ms / elapsed_ms / scanners。
+        """
+        start = time.time()
+        detections = list(self.yara_scanner.scan_data(data))
+
+        # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测)
+        static_start = time.time()
+        static_info = staticinfo.compute_static_info(data)
+        static_ms = round((time.time() - static_start) * 1000, 1)
+
+        elapsed_ms = round((time.time() - start) * 1000, 1)
+        scanners = (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else [])
+        return {
+            "detections": detections,            # 仅 YARA 命中
+            "static_info": static_info,
+            "static_ms": static_ms,
+            "elapsed_ms": elapsed_ms,            # 阶段2耗时
+            "scanners": scanners,
+        }
+
+    def _merge_phases(self, p1, p2):
+        """合并阶段 1/2 结果 → 完整扫描结果 (返回结构与原 _scan_common 一致)"""
+        detections = p1["detections"] + p2["detections"]
+        return {
+            "filename": p1["filename"],
+            "size": p1["size"],
+            "size_human": p1["size_human"],
+            "file_type": p1["file_type"],        # 显示名 (向后兼容)
+            "file_type_info": p1["file_type_info"],
+            "md5": p1["md5"],
+            "sha1": p1["sha1"],
+            "sha256": p1["sha256"],
+            "static_info": p2["static_info"],     # fuzzy: ssdeep/tlsh/imphash/authentihash; pe: PE 元数据; packer: 壳检测
+            "static_ms": p2["static_ms"],
             "clean": len(detections) == 0,
             "verdict": "CLEAN" if not detections else "DETECTED",
             "detections": detections,
-            "elapsed_ms": elapsed_ms,
-            "scanners": ["Hash DB (md5/sha1/sha256)"]
-                         + (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else []),
+            "elapsed_ms": round(p1["elapsed_ms"] + p2["elapsed_ms"], 1),
+            "scanners": p1["scanners"] + p2["scanners"],
+            "phase": "done",
         }
 
     def _scan_large(self, file_path, filename=None):

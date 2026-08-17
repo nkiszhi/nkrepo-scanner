@@ -126,6 +126,20 @@ h1 { font-size: 22px; font-weight: 600; }
 .ok-line { color: var(--green); font-size: 13px; }
 .scan-info { color: var(--text-dim); font-size: 12px; margin-top: 10px; }
 
+/* 两段式扫描: 阶段1 哈希先显示, 阶段2 深度分析进行中占位 */
+.pending {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 14px; padding: 10px 14px;
+  color: var(--text-dim); font-size: 12px;
+  border: 1px dashed var(--border); border-radius: 8px;
+  background: rgba(74,158,255,.04);
+}
+.card.updated { animation: flashUpdate .8s ease; }
+@keyframes flashUpdate {
+  0% { box-shadow: 0 0 0 3px rgba(74,158,255,.35); }
+  100% { box-shadow: 0 0 0 3px rgba(74,158,255,0); }
+}
+
 /* 文件类型徽章 (ClamAV FTM 风格) */
 .ftype-row {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
@@ -304,8 +318,79 @@ function upload(file) {
   fd.append('file', file);
   fetch('/scan', { method: 'POST', body: fd })
     .then(r => r.json())
-    .then(d => { if (d.error) { renderErr(card, d.error); } else { render(card, d); } })
+    .then(d => {
+      if (d.error) { renderErr(card, d.error); return; }
+      // 两段式: 先渲染哈希查询结果 (阶段1, 毫秒级返回), 深度分析后台执行后动态更新
+      renderPhase1(card, d.result);
+      if (d.status === 'phase2' && d.task_id) pollTask(card, d.task_id);
+      else render(card, d.result);   // 兼容: 后端若同步返回完整结果
+    })
     .catch(e => renderErr(card, '请求失败: ' + e.message));
+}
+
+/* 轮询阶段 2 结果: YARA / 静态信息 / 查壳完成后整体刷新卡片 (带高亮动画) */
+function pollTask(card, taskId) {
+  fetch('/api/task/' + taskId)
+    .then(r => r.json())
+    .then(d => {
+      if (d.error) { finalizePhase1(card, d.error); }
+      else if (d.status === 'done') { render(card, d.result); }
+      else if (d.status === 'error') { renderErr(card, '深度分析失败: ' + d.error); }
+      else { setTimeout(() => pollTask(card, taskId), 600); }
+    })
+    .catch(() => setTimeout(() => pollTask(card, taskId), 1200));
+}
+
+/* 阶段1渲染: 哈希查询结果 (MD5/SHA1/SHA256 + 哈希签名库命中 + 文件类型) 立即展示 */
+function renderPhase1(card, d) {
+  const head = card.querySelector('.card-head');
+  const body = card.querySelector('.card-body');
+  const v = head.querySelector('.verdict');
+  // 哈希签名库命中 → 立即 DETECTED; 未命中保持 SCANNING (深度分析未完成)
+  if (d.detections && d.detections.length) {
+    v.className = 'verdict detected';
+    v.textContent = 'DETECTED';
+  } else {
+    v.className = 'verdict scanning';
+    v.textContent = 'SCANNING';
+  }
+  head.querySelector('.fmeta').textContent = d.size_human + ' · ' + d.file_type;
+
+  const fti = d.file_type_info || {};
+  const cat = fti.category || 'other';
+  const methodName = { 'magic': '魔数匹配', 'magic+ooxml': '魔数+OOXML解析', 'pattern': '模式搜索',
+    'tail-magic': '尾部魔数', 'text-detect': '文本检测', 'fallback': '兜底判定',
+    'empty': '空文件', 'n/a': '不可用' }[fti.method] || fti.method;
+
+  let html = '';
+  html += '<div class="ftype-row">' +
+    '<span class="ft-icon">' + (ftCatIcons[cat] || ftCatIcons.other) + '</span>' +
+    '<span class="ft-name">' + esc(fti.name || d.file_type) + '</span>' +
+    '<span class="ft-cat ' + cat + '">' + esc(cat) + '</span>' +
+    (fti.cl_type && fti.cl_type !== 'CL_TYPE_ANY' ?
+      '<span class="ft-code">' + esc(fti.cl_type) + '</span>' : '') +
+    '<span class="ft-method">' + methodName + '</span>' +
+    '</div>';
+  if (d.detections && d.detections.length) {
+    html += '<div class="dets">' + d.detections.map(x =>
+      '<div class="det">' +
+        '<span class="det-engine">' + esc(x.engine) + '</span>' +
+        '<div class="det-name">' + esc(x.name) + '</div>' +
+        '<div class="det-detail">' + esc(x.detail || '') + '</div>' +
+      '</div>').join('') + '</div>';
+  }
+  html += '<div class="hashes">' +
+    '<span class="k">MD5</span><span class="v">' + d.md5 + '</span>' +
+    '<span class="k">SHA1</span><span class="v">' + d.sha1 + '</span>' +
+    '<span class="k">SHA256</span><span class="v">' + d.sha256 + '</span></div>';
+  html += '<div class="pending"><span class="spinner"></span>YARA 规则匹配 · 模糊哈希 · 查壳分析进行中…</div>';
+  body.innerHTML = html;
+}
+
+/* 任务过期兜底: 深度分析结果不可用, 保留已展示的哈希结果 */
+function finalizePhase1(card, msg) {
+  const p = card.querySelector('.pending');
+  if (p) p.innerHTML = '&#9888; 深度分析结果不可用: ' + esc(msg);
 }
 
 function mkScanCard(file) {
@@ -322,6 +407,9 @@ function mkScanCard(file) {
 }
 
 function render(card, d) {
+  card.classList.remove('updated');
+  void card.offsetWidth;   // 强制 reflow, 让动态更新高亮动画重新触发
+  card.classList.add('updated');
   const head = card.querySelector('.card-head');
   const body = card.querySelector('.card-body');
   const v = head.querySelector('.verdict');

@@ -4,6 +4,10 @@ NKREPO Scanner - Web 服务入口
 """
 import json
 import os
+import threading
+import time
+import uuid
+from collections import OrderedDict
 
 from flask import Flask, jsonify, render_template, request
 
@@ -105,6 +109,26 @@ for f, err in pk_engine.errors[:5]:
 
 scanner = Scanner(hash_db, yara_scanner)
 
+# ---------- 两段式扫描任务管理 ----------
+# Web 上传先返回阶段 1 (哈希/类型/签名库命中, 毫秒级), 阶段 2 (YARA/静态信息/查壳)
+# 由后台线程执行, 前端轮询 /api/task/<id> 动态更新 → 类似 VirusTotal 的渐进式结果展示
+TASKS_MAX = 100    # 内存中保留的任务上限 (超限淘汰最老)
+TASK_TTL = 600     # 任务结果保留秒数 (惰性清理, 轮询过期返回 404)
+
+_tasks = OrderedDict()
+_tasks_lock = threading.Lock()
+
+
+def _task_cleanup():
+    """惰性清理过期任务 + 超限淘汰最老任务 (仅 /scan 创建任务时调用)"""
+    now = time.time()
+    with _tasks_lock:
+        expired = [tid for tid, t in _tasks.items() if now - t["ts"] > TASK_TTL]
+        for tid in expired:
+            _tasks.pop(tid, None)
+        while len(_tasks) > TASKS_MAX:
+            _tasks.popitem(last=False)
+
 
 @app.route("/")
 def index():
@@ -135,10 +159,51 @@ def scan():
     if not f.filename:
         return jsonify({"error": "空文件名"}), 400
 
-    # 直接内存读取扫描 (受 MAX_CONTENT_LENGTH 限制), 哈希/类型/YARA 复用同一缓冲, 全程不落盘
+    # 直接内存读取扫描 (受 MAX_CONTENT_LENGTH 限制), 全程不落盘
     data = f.read()
-    result = scanner.scan_bytes(data, filename=f.filename)
-    return jsonify(result)
+    _task_cleanup()
+    task_id = uuid.uuid4().hex[:12]
+
+    # 阶段 1: 哈希 + 文件类型 + 哈希签名库命中 → 立即返回 (毫秒级)
+    phase1 = scanner.scan_phase1(data, filename=f.filename)
+    task = {
+        "id": task_id,
+        "ts": time.time(),
+        "phase1": phase1,
+        "phase2": None,
+        "status": "phase2",   # 阶段 2 后台执行中
+        "error": None,
+    }
+    with _tasks_lock:
+        _tasks[task_id] = task
+
+    # 阶段 2: YARA 规则 + 静态信息/模糊哈希 + 查壳 → 后台线程, 不阻塞上传响应
+    # (闭包持有的 data 在线程结束后自动释放, 任务记录中不保留大缓冲)
+    def _run_phase2():
+        try:
+            task["phase2"] = scanner.scan_phase2(data, filename=f.filename)
+            task["status"] = "done"
+        except Exception as e:  # noqa: BLE001 - 后台异常记录到任务, 由轮询端呈现
+            task["error"] = str(e)
+            task["status"] = "error"
+
+    threading.Thread(target=_run_phase2, daemon=True).start()
+    return jsonify({"task_id": task_id, "status": "phase2", "result": phase1})
+
+
+@app.route("/api/task/<task_id>")
+def task_status(task_id):
+    """轮询接口: 阶段 2 完成后返回合并的完整扫描结果 (哈希 + YARA + 静态信息 + 查壳)"""
+    with _tasks_lock:
+        task = _tasks.get(task_id)
+    if task is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    if task["status"] == "phase2":
+        return jsonify({"task_id": task_id, "status": "phase2"})
+    if task["status"] == "error":
+        return jsonify({"task_id": task_id, "status": "error", "error": task["error"]})
+    result = scanner.merge_phases(task["phase1"], task["phase2"])
+    return jsonify({"task_id": task_id, "status": "done", "result": result})
 
 
 if __name__ == "__main__":
