@@ -6,7 +6,7 @@
 
 | 引擎      | 说明                         | 签名格式                                          |
 | ------- | -------------------------- | --------------------------------------------- |
-| Hash DB | 整文件 MD5 / SHA1 / SHA256 比对 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname` |
+| Hash DB | 整文件 **SHA256** 比对（v3 起库内仅存 SHA256 签名，MD5/SHA1 参数仅接口兼容） | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname`；v3 起导入**仅接受 64hex（SHA256）行**，32hex（md5）/ 40hex（sha1）行计数跳过 |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
 | 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库 + 外部 YARA 扩展规则） | 精确特征（magic/EP 字节/节名/外部规则）+ 启发特征（节熵/导入/RWX/EP 位置） |
@@ -17,7 +17,7 @@
 
 ## 静态信息与模糊哈希
 
-Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 + 哈希签名库命中 + 文件类型，毫秒级），随后在后台计算一组**模糊哈希 / 静态特征**（≤8MB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
+Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；其中**库比对仅 sha256 生效**，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤8MB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
 
 | 字段          | 算法                                                             | 适用样本    | 缺失原因（Web 上悬停 `-` 可见）                |
 | ----------- | -------------------------------------------------------------- | ------- | ---------------------------------- |
@@ -231,7 +231,7 @@ nkrepo-scanner/
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
 ├── bench.py                      # 性能基准（延迟 / 内存 / 磁盘）
 ├── signatures/
-│   ├── hashes.hdb                # 本地哈希签名（含 EICAR）
+│   ├── hashes.hdb                # 本地哈希签名（含 EICAR 三种哈希行；v3 起仅 SHA256 行生效）
 │   ├── rules.yar                 # YARA 规则集
 │   ├── signatures.db.shards/     # 动态分片 SQLite（0000.db~{N-1}.db + _meta.db，运行时生成）
 │   ├── signatures.db.bloom/      # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
@@ -255,7 +255,9 @@ curl -A "ClamAV/freshclam/1.4.2" -O https://database.clamav.net/daily.cvd
 python extract_cvd.py cvd/main.cvd cvd/daily.cvd
 
 # 3. 导入 SQLite（增量、幂等; 分片数默认取 config 的 bloom.shards=4,
-#    如需覆盖可传 shard_count=N）
+#    如需覆盖可传 shard_count=N; 注意: v3 起仅接受 64hex(SHA256) 行,
+#    官方 main/daily 库中绝大多数 32hex(md5)/40hex(sha1) 行会被跳过,
+#    打印 "跳过 N 条非 SHA256 签名" 提示, 仅 SHA256 签名实际入库)
 python -c "from scanner import HashSignatureDB; db = HashSignatureDB('signatures/signatures.db'); \
 [db.import_hdb(f) for f in ['extracted/main.main.hdb','extracted/main.main.hsb', \
 'extracted/daily.daily.hdb','extracted/daily.daily.hsb']]; db.finalize(); db.close()"
@@ -267,7 +269,7 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 
 ### 日常扩充
 
-- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入
+- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**v3 起仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中 EICAR 的 MD5/SHA1 两行即为此类，仅 SHA256 行生效）
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
 - **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
@@ -288,7 +290,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面（页面本身无需认证，数据接口受保护）                                                             |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时；**v3 起 Hash DB 仅按 sha256 点查**，md5/sha1 字段为计算展示值、不参与库比对）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下） |
 
