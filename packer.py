@@ -56,6 +56,10 @@ DEFAULT_RULES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pa
 ENTROPY_SAMPLE_BYTES = 4 * 1024 * 1024  # 单节熵计算采样上限 (4MB 已足够表征熵)
 # 全文件小写化 (data.lower() 产生整文件副本) 的 magic 搜索上限; 超大文件仅搜索 overlay
 MAGIC_FILE_SEARCH_BYTES = 32 * 1024 * 1024
+# 所有节熵计算的总采样字节预算: 恶意 PE 可声明大量节 (最多 65535 个) 且让每节
+# PointerToRawData=0 / SizeOfRawData>=4MB, 使切片+逐字节计数放大 CPU (实测 100 节->24s);
+# 累计预算耗尽后剩余节不再计算熵 (熵启发仅需少量节即可表征, 见 detect_packer)
+ENTROPY_TOTAL_BUDGET = 16 * 1024 * 1024
 
 # ================================================================ 精确特征库
 
@@ -165,11 +169,17 @@ def _match_hex_prefix(buf, pat):
     return True
 
 
-def _section_entropy(data, sec):
-    """计算单节 Shannon 熵 (基于 raw data, 采样上限 ENTROPY_SAMPLE_BYTES 防 CPU 放大)"""
-    off, size = sec.PointerToRawData, sec.SizeOfRawData
-    if size > ENTROPY_SAMPLE_BYTES:
-        size = ENTROPY_SAMPLE_BYTES  # 采样: 超大节只算前 4MB, 熵统计量不受影响
+def _section_entropy(data, sec, size=None):
+    """计算单节 Shannon 熵 (基于 raw data)
+
+    size 由调用方传入 (已按 ENTROPY_SAMPLE_BYTES 采样截断并受总预算 ENTROPY_TOTAL_BUDGET 约束),
+    未传时回退到内部截断, 便于独立调用。
+    """
+    off = sec.PointerToRawData
+    if size is None:
+        size = sec.SizeOfRawData
+        if size > ENTROPY_SAMPLE_BYTES:
+            size = ENTROPY_SAMPLE_BYTES  # 采样: 超大节只算前 4MB, 熵统计量不受影响
     chunk = data[off:off + size]
     if not chunk:
         return 0.0
@@ -367,17 +377,26 @@ def detect_packer(data):
                           "desc": f"{hit['desc']} ({tag})", "weight": hit["weight"]})
 
     # ---- 4) 启发特征 ----
-    # 4.1 节熵
+    # 4.1 节熵 (总采样字节预算 ENTROPY_TOTAL_BUDGET 防大量节 CPU 放大: 恶意 PE 可声明数千节,
+    #     每节 4MB 切片+逐字节计数; 预算耗尽后跳过剩余节, 熵启发仅需少量节即可表征)
     if pe.sections:
-        ent = [(sec_names[i], _section_entropy(data, s)) for i, s in enumerate(pe.sections)]
-        top_name, top_e = max(ent, key=lambda x: x[1])
-        if top_e >= 7.0:
-            heuristics.append({"key": "high_entropy",
-                               "label": f"最高节熵 {top_name or '(无名)'} {top_e:.2f} (>=7.0 疑似压缩/加密)",
-                               "weight": 10})
-        if sum(1 for _, e in ent if e >= 6.5) >= 2:
-            heuristics.append({"key": "multi_high_entropy",
-                               "label": "多个高熵节 (疑似整体加密/压缩)", "weight": 10})
+        ent = []
+        _budget = ENTROPY_TOTAL_BUDGET
+        for i, s in enumerate(pe.sections):
+            _sz = min(s.SizeOfRawData, ENTROPY_SAMPLE_BYTES)
+            if _budget <= 0 or _sz <= 0:
+                break
+            ent.append((sec_names[i], _section_entropy(data, s, _sz)))
+            _budget -= _sz
+        if ent:
+            top_name, top_e = max(ent, key=lambda x: x[1])
+            if top_e >= 7.0:
+                heuristics.append({"key": "high_entropy",
+                                   "label": f"最高节熵 {top_name or '(无名)'} {top_e:.2f} (>=7.0 疑似压缩/加密)",
+                                   "weight": 10})
+            if sum(1 for _, e in ent if e >= 6.5) >= 2:
+                heuristics.append({"key": "multi_high_entropy",
+                                   "label": "多个高熵节 (疑似整体加密/压缩)", "weight": 10})
     # 4.2 导入表条目数
     imp_count = 0
     if hasattr(pe, "DIRECTORY_ENTRY_IMPORT"):

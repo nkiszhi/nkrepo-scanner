@@ -301,6 +301,11 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
   搜索上限 32MB（`packer.MAGIC_FILE_SEARCH_BYTES`）—— 恶意 PE 把节 `PointerToRawData=0` /
   `SizeOfRawData=0xFFFFFFFF` 使熵切片覆盖全文件的放大向量实测 45MB 样本阶段 2 耗时
   **10.0s → 0.29s**（约 34 倍），且不再产生整文件 `lower()` 副本
+- **CPU 放大封堵·节数维度（M2b，2026-08 复检发现）**：恶意 PE 可声明**大量节**（`NumberOfSections`
+  最多 65535）且每节 `PointerToRawData=0` / `SizeOfRawData≥4MB`，使「切片 + 逐字节计数」按节数线性放大
+  —— 实测 8MB 样本 100 节阶段 2 查壳耗时 **24.2s**。已增加节熵**总采样字节预算**
+  `ENTROPY_TOTAL_BUDGET`（16MB，累计耗尽后跳过剩余节）：同一样本 100 / 1000 / 65535 节分别降至
+  **0.93s / 0.93s / 1.05s**（pefile 自带 `MAX_SECTIONS=2048` 兜底），正常 PE 熵启发无回归
 - **阶段 2 并发控制（M3）**：后台线程信号量 `phase2_concurrency`（默认 4），超限排队，防止 CPU 峰值打满
 - **任务内存上限**：内存中任务保留 `TASKS_MAX=100` / `TASK_TTL=600s`，惰性清理防无限增长
 - **前端 XSS 防护**：所有动态内容经 `esc()`（DOM textContent 级转义）后插入；上传大小受
