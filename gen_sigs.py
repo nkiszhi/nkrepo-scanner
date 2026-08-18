@@ -1,6 +1,6 @@
 """
 NKAMG Scanner - 千万级合成签名生成器
-用确定性随机摘要快速填充 signatures.db, 用于大规模压测。
+用确定性随机摘要快速填充 sha256.db, 用于大规模压测。
 
 用法:
   python gen_sigs.py --n 10000000            # 生成 1000 万条 (全部 SHA256, 与库 v3 主键一致)
@@ -13,7 +13,7 @@ import sqlite3
 import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "signatures", "signatures.db")
+DB_PATH = os.path.join(BASE_DIR, "signatures", "sha256.db")
 
 
 def gen_digests(n, seed):

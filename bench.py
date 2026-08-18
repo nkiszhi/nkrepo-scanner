@@ -3,7 +3,7 @@ NKAMG Scanner - 千万级签名库基准测试
 测量: 启动耗时 / 磁盘与内存占用 / 命中与未命中查询延迟 / 端到端扫描耗时
 
 用法:
-  python bench.py                      # 使用现有 signatures.db
+  python bench.py                      # 使用现有 sha256.db
   python bench.py --miss 2000 --hits 200
 """
 import argparse
@@ -14,7 +14,7 @@ import time
 from scanner import HashSignatureDB, Scanner, compute_hashes
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "signatures", "signatures.db")
+DB_PATH = os.path.join(BASE_DIR, "signatures", "sha256.db")
 BLOOM_PATH = DB_PATH + ".bloom"
 
 

@@ -123,15 +123,14 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 ② 动态分片定位 ──── 取摘要前 4 字节 int.from_bytes(..., 'big') % N，映射 N 个分片之一
    │
    ▼
-③ 分片点查 ─────── 只打开该分片对应的 signatures.db.shards/XXXX.db（只读连接，
+③ 分片点查 ─────── 只打开该分片对应的 sha256.db.shards/XXXX.db（只读连接，
                     懒加载 + LRU 缓存，上限 max_open_shards），BLOB 主键点查
 ```
 
-- 分片目录 `signatures/signatures.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰。当前（2026-08-17 全量导入后）4 分片实际计数：`15,637,579 / 15,650,214 / 15,650,005 / 15,649,251`，与 `_meta.db` 的 `shard_counts` 一致
-- `sigs` 表为 **SHA256 主键结构**（v3，`_meta.db` 中 `schema_version=3` / `primary_key=sha256` 标记）：
-  `sha256 BLOB PRIMARY KEY`（库内仅存 SHA256 签名，32B）、`size`、`name`，
-  另有预留列 `md5` / `sha1`（同文件其它标准哈希，暂无数据源为 NULL）
-  及 fuzzy 列 `ssdeep` / `tlsh` / `sdhash` / `mvhash`（预留：需原始样本源接入后回填）。
+- 分片目录 `signatures/sha256.db.shards/`：`0000.db` ~ `{N-1:04d}.db` 共 N 个小库 + `_meta.db`（导入记录、分片计数与布局标记）；单分片体量仅为全库 1/N，点查与增量导入互不干扰。当前（2026-08-17 全量导入后）4 分片实际计数：`15,637,579 / 15,650,214 / 15,650,005 / 15,649,251`，与 `_meta.db` 的 `shard_counts` 一致
+- `sigs` 表为 **SHA256 主键结构**（v3，`_meta.db` 中 `schema_version=3` / `primary_key=sha256` 标记），**精简四列**（2026-08-18）：
+  `sha256 BLOB PRIMARY KEY`（库内仅存 SHA256 签名，32B）、`size`、`name`、
+  及 `md5` 列（同文件 MD5 哈希，无数据源时为 NULL；原 `sha1` 与 fuzzy 预留列已删除）。
   查询走 `sha256` 主键点查；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`，切主键前备份为 `000X.db.pre_sha256_pk.bak`
 - **v3 起 SHA256 库仅接受 SHA256 签名**：导入 `.hdb/.hsb` 时 64hex 行入库，32hex（md5）/ 40hex（sha1）行计数跳过并提示；查询只对 sha256 摘要做一次 Bloom 排除 + 主键点查（见「并发与 IO 说明」）；冷启动 0 分片加载，随查询按需打开
 
@@ -144,10 +143,10 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 - 文件扫描：`Scanner` 同时持有 `hash_db`（SHA256）与 `md5_db`（MD5），阶段 1 对样本 MD5 调 `md5_db.check_hash(md5_hex)`、对 SHA256 调 `hash_db.check(...)`，两者命中合并进 `detections`（`engine` 均为 `Hash DB`，`detail` 标注 `MD5 命中:` / `SHA256 命中:`）
 - Web 哈希查询：`/api/hash/<h>` 按长度路由——32hex→MD5 库，64hex→SHA256 库，非法长度返回 400；前端搜索框与结果卡均按哈希类型动态显示 `MD5`/`SHA256` 标签
 - `app.py` 启动时检测 `signatures/md5.db.shards/` 是否存在：存在则只读实例化 `md5_db`，否则降级为 `None`（SHA256 功能不受影响）；`/api/stats` 额外返回 `md5_signatures` / `md5_available` / `md5_sources` / `md5_storage`
-- Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/signatures.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
+- Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/sha256.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
 - `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` **顶层**的新文件（`imported_files` 表去重，幂等）；`signatures/hdb/` 分桶子目录**不自动导入**，需按「签名库更新」章节的批量命令手动导入
-- 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `signatures.db.shards.legacy`
-- 兼容迁移：旧版单一 `signatures.db` 自动按前缀拆入分片（原文件保留为 `signatures.db.migrated`）；旧版单文件 Bloom（`signatures.db.bloom`）自动备份为 `signatures.db.bloom.legacy`
+- 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `sha256.db.shards.legacy`
+- 兼容迁移：旧版单一 `sha256.db` 自动按前缀拆入分片（原文件保留为 `sha256.db.migrated`）；旧版单文件 Bloom（`sha256.db.bloom`）自动备份为 `sha256.db.bloom.legacy`
 
 ### 千万级实测数据（1000 万条合成签名）
 
@@ -253,8 +252,8 @@ nkrepo-scanner/
 │   ├── hashes.hdb                # 本地哈希签名（含 EICAR 三种哈希行；仅 SHA256 行生效）
 │   ├── hdb/                      # ClamAV 官方整文件哈希分桶（00.hdb~ff.hdb 共 256 文件，全部 64hex sha256，约 5.5GB，62,586,907 行）
 │   ├── rules.yar                 # YARA 规则集
-│   ├── signatures.db.shards/     # 动态分片 SQLite（0000.db~{N-1}.db + _meta.db，运行时生成）
-│   ├── signatures.db.bloom/      # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
+│   ├── sha256.db.shards/        # 动态分片 SQLite（0000.db~{N-1}.db + _meta.db，运行时生成）
+│   ├── sha256.db.bloom/         # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
 │   ├── md5.db.shards/            # 并列 MD5 哈希库分片（build_md5_db.py 生成，运行时加载）
 │   ├── md5.db.bloom/             # 并列 MD5 库分片 Bloom 位图
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
@@ -279,7 +278,7 @@ python extract_cvd.py cvd/main.cvd cvd/daily.cvd
 # 3. 导入 SQLite（增量、幂等; 分片数默认取 config 的 bloom.shards=4,
 #    如需覆盖可传 shard_count=N; 注意: v3 起 SHA256 库仅接受 64hex(SHA256) 行,
 #    官方 main/daily 库中 32hex(md5)/40hex(sha1) 行会被跳过, 仅 SHA256 实际入库)
-python -c "from scanner import HashSignatureDB; db = HashSignatureDB('signatures/signatures.db'); \
+python -c "from scanner import HashSignatureDB; db = HashSignatureDB('signatures/sha256.db'); \
 [db.import_hdb(f) for f in ['extracted/main.main.hdb','extracted/main.main.hsb', \
 'extracted/daily.daily.hdb','extracted/daily.daily.hsb']]; db.finalize(); db.close()"
 
@@ -292,7 +291,7 @@ python build_md5_db.py
 python -c "
 import glob
 from scanner import HashSignatureDB
-db = HashSignatureDB('signatures/signatures.db')
+db = HashSignatureDB('signatures/sha256.db')
 for f in sorted(glob.glob('signatures/hdb/*.hdb')):
     n = db.import_hdb(f)
     print(f, '+', n)
@@ -395,8 +394,8 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 python -c "
 import sqlite3
 from scanner import HashSignatureDB
-db = HashSignatureDB('signatures/signatures.db')
-conn = sqlite3.connect('file:signatures/signatures.db.shards/0000.db?mode=ro', uri=True)
+db = HashSignatureDB('signatures/sha256.db')
+conn = sqlite3.connect('file:signatures/sha256.db.shards/0000.db?mode=ro', uri=True)
 h, size, name = conn.execute('SELECT hex(sha256), size, name FROM sigs LIMIT 1').fetchone()
 hits = db.check('', size, '0'*32, '0'*40, h)
 assert any(x['name'] == name for x in hits), f'应命中 {name}'

@@ -239,7 +239,7 @@ class HashSignatureDB:
         self._retired = []                   # LRU 淘汰的连接, 延迟到 close() 统一关闭
         self.source_files = []
 
-        # 旧版单一 Bloom 文件 (signatures.db.bloom) 与新版 bloom 目录同名,
+        # 旧版单一 Bloom 文件 (sha256.db.bloom 单文件) 与新版 bloom 目录同名,
         # 存在时先备份为 .bloom.legacy, 避免 makedirs 冲突
         if os.path.isfile(db_path + ".bloom") and not os.path.isdir(self.bloom_dir):
             try:
@@ -525,7 +525,7 @@ class HashSignatureDB:
 
     # ---------- 旧单库迁移 ----------
     def _migrate_legacy(self, legacy_path):
-        """把旧版单一 signatures.db 的签名按当前路由规则拆入分片"""
+        """把旧版单一 sha256.db 的签名按当前路由规则拆入分片"""
         try:
             legacy = sqlite3.connect(legacy_path)  # rw 打开以恢复可能存在的 WAL
             tables = {

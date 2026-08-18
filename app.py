@@ -80,10 +80,10 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 
 # ---------- 初始化扫描引擎 ----------
-# 哈希签名持久化在动态分片 SQLite (signatures/signatures.db.shards/),
+# 哈希签名持久化在动态分片 SQLite (signatures/sha256.db.shards/),
 # 分片数 = config 中 bloom.shards, Bloom 位图按同样分片数懒加载
 hash_db = HashSignatureDB(
-    os.path.join(SIG_DIR, "signatures.db"),
+    os.path.join(SIG_DIR, "sha256.db"),
     shard_count=int(bcfg["shards"]),
     bloom_fp_rate=float(bcfg["fp_rate"]),
     max_open_shards=int(hcfg["max_open_shards"]),
