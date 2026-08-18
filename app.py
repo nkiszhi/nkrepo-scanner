@@ -184,6 +184,12 @@ def index():
     return render_template("index.html")
 
 
+@app.route("/scan", methods=["GET"])
+def scan_page():
+    """VirusTotal 风格独立扫描页 (GET /scan); 同名 POST 为上传扫描接口"""
+    return render_template("scan.html")
+
+
 @app.route("/api/stats")
 def stats():
     auth_err = _require_auth()

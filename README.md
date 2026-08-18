@@ -219,7 +219,7 @@ venv\Scripts\python app.py
 
 ```
 nkrepo-scanner/
-├── app.py                        # Flask Web 服务（/、/scan 两段式、/api/task/<id> 轮询、/api/stats、/api/hash/<sha256> 哈希查询）
+├── app.py                        # Flask Web 服务（/ 搜索首页、GET /scan 扫描页、POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<sha256> 哈希查询）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
 ├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
@@ -227,7 +227,12 @@ nkrepo-scanner/
 ├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
-├── templates/index.html          # Web 界面（拖拽上传 + 结果展示 + 类型徽章 + 模糊哈希/PE 元数据/壳识别）
+├── static/
+│   ├── app.css                   # 共享暗色主题样式（index / scan 两页共用，VirusTotal 风格）
+│   └── app.js                    # 共享渲染库（扫描结果卡 / 检测环 / 哈希查询 / 统计加载；upload 带 onDone 回调）
+├── templates/
+│   ├── index.html                # 搜索首页（VT 风格大搜索框哈希查询 + 拖拽上传 + 统计卡 + 结果展示）
+│   └── scan.html                 # 扫描页（GET /scan，VT 风格：FILE/URL/搜索选项条 + 大上传区 + 最近扫描历史 localStorage + 结果展示）
 ├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口/上传目录）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── gen_sigs.py                   # 合成签名生成器（压测用）
@@ -302,7 +307,8 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
-| `/`          | GET  | Web 界面（页面本身无需认证，数据接口受保护）                                                             |
+| `/`          | GET  | Web 界面（搜索首页：SHA256 哈希查询 + 拖拽上传 + 统计；页面本身无需认证，数据接口受保护）                             |
+| `/scan`      | GET  | Web 界面（VirusTotal 风格扫描页：FILE/URL/搜索选项条 + 大上传区 + 最近扫描历史，结果渲染与首页共用 `static/app.js`） |
 | `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时；**v3 起 Hash DB 仅按 sha256 点查**，md5/sha1 字段为计算展示值、不参与库比对）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
