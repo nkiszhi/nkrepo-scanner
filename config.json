@@ -5,6 +5,18 @@
     "_comment_fp_rate": "Bloom 过滤器误判率 (0.01 = 1%), 越小内存越大",
     "fp_rate": 0.01
   },
+  "sha256": {
+    "_comment_layout": "SHA256 库分片布局: 'hex' = 按 SHA256 前两字符分 256 片 (00-ff, 固定); 'modulo' = 按摘要取模分 bloom.shards 片",
+    "layout": "hex",
+    "_comment_max_open_shards": "256 片时建议增大 LRU 缓存上限, 减少频繁换页; 4 足够基本查询, 16-32 更适合高并发",
+    "max_open_shards": 16
+  },
+  "md5": {
+    "_comment_layout": "MD5 库分片布局: 'hex' = 按 MD5 前两字符分 256 片 (00-ff, 固定); 'modulo' = 按摘要取模分 bloom.shards 片",
+    "layout": "hex",
+    "_comment_max_open_shards": "256 片时建议增大 LRU 缓存上限, 减少频繁换页; 4 足够基本查询, 16-32 更适合高并发",
+    "max_open_shards": 16
+  },
   "hash_db": {
     "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图的懒加载 LRU 缓存上限",
     "max_open_shards": 4

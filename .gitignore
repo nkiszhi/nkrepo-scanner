@@ -26,6 +26,11 @@ uploads/
 # 调试/迁移临时文件
 _mig_*.py
 _mig_*.txt
+_tmp_*.py
+_tmp_*.py.bak
+_tmp_*.json
+_reshard_*.log
+_reshard_*.log.bak
 server_stdout.log
 *.log
 
@@ -33,12 +38,22 @@ server_stdout.log
 __pycache__/
 *.pyc
 venv/
+venv313/
 
 # 编辑器/系统
 .vscode/
 .idea/
 Thumbs.db
 .DS_Store
+*.un~
+*~
+
+# WorkBuddy 项目记忆
+.workbuddy/
 
 # 第三方 YARA 规则仓库 (git clone 收集, 不入库; 见 README「YARA 规则库」)
 yara_sources/
+
+# 签名库分片临时目录
+signatures/*.db.shards.resharding/
+signatures/*.db.shards.resharding.done/

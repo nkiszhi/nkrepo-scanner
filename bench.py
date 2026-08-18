@@ -7,6 +7,7 @@ NKAMG Scanner - 千万级签名库基准测试
   python bench.py --miss 2000 --hits 200
 """
 import argparse
+import json
 import os
 import random
 import time
@@ -16,6 +17,19 @@ from scanner import HashSignatureDB, Scanner, compute_hashes
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "signatures", "sha256.db")
 BLOOM_PATH = DB_PATH + ".bloom"
+CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
+
+
+def _load_sha256_layout():
+    """从 config.json 读取 sha256 库布局参数"""
+    layout = "modulo"
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        layout = str(cfg.get("sha256", {}).get("layout", "modulo")).strip()
+    except (OSError, json.JSONDecodeError):
+        pass
+    return layout
 
 
 def pct(sorted_ms, p):
@@ -36,7 +50,7 @@ def main():
 
     # ---------- 启动 (含 Bloom 加载/重建) ----------
     t0 = time.time()
-    db = HashSignatureDB(DB_PATH)
+    db = HashSignatureDB(DB_PATH, layout=_load_sha256_layout())
     init_s = time.time() - t0
     # 无 Bloom 文件或与签名数不匹配时, 构建并持久化 (一次性开销)
     build_status = db.finalize()
@@ -75,14 +89,13 @@ def main():
 
     # ---------- 命中延迟 (报毒文件路径: Bloom 通过 + 分片点查) ----------
     # 从随机分片中采样真实签名
-    shard_files = [
-        f for f in os.listdir(db.shard_dir)
-        if len(f) == 7 and f.endswith(".db") and f[:-3].isdigit()
-    ]
+    shard_files = db._layout_shard_files()
     sample_rows = []
     random.shuffle(shard_files)
     for sf in shard_files:
-        conn = db._ro_conn(int(sf[:-3]))
+        sid_str = sf[:-3]
+        sid = int(sid_str, 16) if db.layout == "hex" else int(sid_str)
+        conn = db._ro_conn(sid)
         if conn is None:
             continue
         sample_rows.extend(conn.execute(

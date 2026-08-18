@@ -4,8 +4,8 @@
 数据源: extracted/ 下 ClamAV CVD 解包的整文件哈希文件 (.hdb/.hsb)。
   - main.main.hdb / main.main.hsb    (main 库, 周级更新)
   - daily.daily.hdb / daily.daily.hsb (daily 库, 日级更新, 由 extract_cvd.py 解包)
-仅提取 32hex (MD5) 行, 经参数化 HashSignatureDB(hash_algo="md5")
-幂等导入 signatures/md5.db 分片 (shard_count=4) + 重建 bloom。
+仅提取 32hex (MD5) 行, 经参数化 HashSignatureDB(hash_algo="md5", layout="hex")
+幂等导入 signatures/md5.db 分片 (256 片, 按 MD5 前两字符路由) + 重建 bloom。
 
 增量更新: 下载最新 daily.cvd 并解包后重跑本脚本, 仅新增行入库 (INSERT OR IGNORE)。
 用法: python build_md5_db.py
@@ -25,7 +25,7 @@ SOURCES = [
 
 
 def main():
-    db = HashSignatureDB(DB, shard_count=4, hash_algo="md5")
+    db = HashSignatureDB(DB, shard_count=4, hash_algo="md5", layout="hex")
     added_total = 0
     for src in SOURCES:
         p = os.path.join(HERE, src)

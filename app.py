@@ -25,6 +25,14 @@ DEFAULT_CONFIG = {
         "shards": 4,               # Bloom Filter 分片数, 同时驱动 SQLite 动态分片数 (任意正整数)
         "fp_rate": 0.01,           # Bloom 误判率
     },
+    "sha256": {
+        "layout": "hex",           # SHA256 库分片布局: "hex" = 按前两字符分 256 片; "modulo" = 取模分 N 片
+        "max_open_shards": 16,     # 256 片时建议增大 LRU 缓存上限, 减少频繁换页
+    },
+    "md5": {
+        "layout": "hex",           # MD5 库分片布局: "hex" = 按前两字符分 256 片; "modulo" = 取模分 N 片
+        "max_open_shards": 16,     # 256 片时建议增大 LRU 缓存上限, 减少频繁换页
+    },
     "hash_db": {
         "max_open_shards": 4,      # 分片 SQLite 连接 / Bloom 位图懒加载 LRU 上限
     },
@@ -68,9 +76,17 @@ def load_config(path=CONFIG_PATH):
 
 cfg = load_config()
 bcfg = cfg["bloom"]
+sha256cfg = cfg.get("sha256", {})
 hcfg = cfg["hash_db"]
 scfg = cfg["server"]
 pkcfg = cfg["packer"]
+
+_sha256_layout = str(sha256cfg.get("layout", "modulo")).strip()
+_sha256_max_open = int(sha256cfg.get("max_open_shards", hcfg["max_open_shards"]))
+
+md5cfg = cfg.get("md5", {})
+_md5_layout = str(md5cfg.get("layout", "modulo")).strip()
+_md5_max_open = int(md5cfg.get("max_open_shards", hcfg["max_open_shards"]))
 
 # 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建; 仅用于放置测试样本, /scan 不落盘
 _uploads_cfg = str(scfg.get("uploads_dir", "uploads")).strip()
@@ -81,14 +97,17 @@ app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 
 # ---------- 初始化扫描引擎 ----------
 # 哈希签名持久化在动态分片 SQLite (signatures/sha256.db.shards/),
-# 分片数 = config 中 bloom.shards, Bloom 位图按同样分片数懒加载
+# layout=hex 时按 SHA256 前两字符分 256 片 (00~ff), layout=modulo 时按取模分 N 片
+# Bloom 位图按同样分片数懒加载
 hash_db = HashSignatureDB(
     os.path.join(SIG_DIR, "sha256.db"),
     shard_count=int(bcfg["shards"]),
     bloom_fp_rate=float(bcfg["fp_rate"]),
-    max_open_shards=int(hcfg["max_open_shards"]),
+    max_open_shards=_sha256_max_open,
+    layout=_sha256_layout,
 )
 # 独立 MD5 分片库 (与 SHA256 库并列): 由 build_md5_db.py 构建 (signatures/md5.db.shards/),
+# layout=hex 时按 MD5 前两字符分 256 片 (00~ff), layout=modulo 时按取模分 N 片
 # 这里只读实例化; 若分片未构建则降级为 None, 不影响 sha256 功能
 md5_db = None
 _md5_base = os.path.join(SIG_DIR, "md5.db")
@@ -97,8 +116,9 @@ if os.path.isdir(_md5_base + ".shards"):
         _md5_base,
         shard_count=int(bcfg["shards"]),
         bloom_fp_rate=float(bcfg["fp_rate"]),
-        max_open_shards=int(hcfg["max_open_shards"]),
+        max_open_shards=_md5_max_open,
         hash_algo="md5",
+        layout=_md5_layout,
     )
     print(f"[NKAMG] MD5 库就绪: {md5_db.count:,} 条")
 else:

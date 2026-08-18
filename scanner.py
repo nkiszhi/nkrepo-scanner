@@ -188,14 +188,13 @@ class BloomFilter:
 class HashSignatureDB:
     """千万级哈希签名库 (动态分片)
 
-    - 分片数 N 由 config 中 bloom.shards 决定, 任意正整数:
-      路由规则 = int.from_bytes(digest[:4], 'big') % N → 均匀分布到 0000.db ~ (N-1).db
-      v3 起库内仅存 SHA256 签名, 按 sha256 摘要路由并点查对应分片
-    - Bloom 按同样的 N 分片: {db_path}.bloom/{shard_id:04d}.bloom, 与 SQLite 分片
+    - 分片路由由 layout 参数决定:
+      modulo (默认): int.from_bytes(digest[:4], 'big') % N → 0000.db ~ (N-1).db
+      hex:           digest[0] → 00.db ~ ff.db (固定 256 片, 按 SHA256 前两字符直查)
+    - Bloom 按同样的分片数: {db_path}.bloom/{shard_id}.bloom, 与 SQLite 分片
       一一对应, 懒加载 + LRU 缓存, 冷启动零加载, 内存随查询按需增长
     - 查询: 路由 → 分片 Bloom 排除 (干净文件短路, 零 SQL) → 分片 SQLite 只读点查
-    - 布局: meta 记录 layout/shard_count; 旧 hex 前缀布局 (16/256/4096) 或 N 变更
-      时自动重分片, 旧数据备份到 .shards.legacy/
+    - 布局: meta 记录 layout/shard_count; 布局或 N 变更时自动重分片, 旧数据备份到 .shards.legacy/
     """
 
     LAYOUT_MODULO = "modulo"
@@ -204,9 +203,15 @@ class HashSignatureDB:
 
     def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
                  max_open_shards=4, hash_algo="sha256",
-                 ddl=None, insert_sql=None, row_cols=None):
+                 ddl=None, insert_sql=None, row_cols=None,
+                 layout=LAYOUT_MODULO):
         """hash_algo 决定主键列 (sha256/md5); ddl/insert_sql/row_cols 可覆盖默认表结构
-        (FuzzySignatureDB 用它定制 8 列模糊哈希结构; 默认 None = 按 hash_algo 的标准结构)"""
+        (FuzzySignatureDB 用它定制 8 列模糊哈希结构; 默认 None = 按 hash_algo 的标准结构)
+
+        layout 决定分片路由与命名:
+          modulo: 摘要前4字节 % N → 4位十进制分片名 (0000~N-1), 任意 N 均匀分布
+          hex:    摘要首字节 → 2位十六进制分片名 (00~ff), 固定 256 片, 按 SHA256 前缀直查
+        """
         if hash_algo not in HASH_SPECS:
             raise ValueError(f"不支持的哈希算法: {hash_algo} (可选: {list(HASH_SPECS)})")
         self.hash_algo = hash_algo
@@ -215,7 +220,11 @@ class HashSignatureDB:
         self.pk_hex_len = _spec["hex_len"]  # 主键十六进制长度 (32 / 64)
         self.pk_bytes = _spec["bytes"]      # 主键摘要字节数 (16 / 32)
         self.hash_label = _spec["label"]    # 显示名 (MD5 / SHA256)
-        self.shard_count = max(1, int(shard_count))
+        self.layout = layout
+        if layout == self.LAYOUT_HEX:
+            self.shard_count = 256           # hex 布局固定 256 片 (2 字符前缀)
+        else:
+            self.shard_count = max(1, int(shard_count))
         self.db_path = db_path
         self.shard_dir = db_path + ".shards"
         self.meta_path = os.path.join(self.shard_dir, "_meta.db")
@@ -291,17 +300,20 @@ class HashSignatureDB:
         return (digest, size, name)              # 3 列独立结构
 
     # ---------- 路由与命名 ----------
-    @staticmethod
-    def _route(digest, shard_count):
-        """路由: 取摘要前 4 字节对 N 取模 → 分片序号 (任意 N 均匀分布)"""
-        return int.from_bytes(digest[:4], "big") % shard_count
+    def _route(self, digest, shard_count=None):
+        """路由: hex 布局取首字节 (0-255, 对应 00~ff 前缀); modulo 布局取前4字节对N取模"""
+        if self.layout == self.LAYOUT_HEX:
+            return digest[0]
+        n = shard_count or self.shard_count
+        return int.from_bytes(digest[:4], "big") % n
 
     def _shard_id(self, digest):
-        return self._route(digest, self.shard_count)
+        return self._route(digest)
 
-    @staticmethod
-    def _shard_name(shard_id):
-        return "%04d" % shard_id  # 十进制 4 位定长: 0000 ~ N-1 (N <= 9999)
+    def _shard_name(self, shard_id):
+        if self.layout == self.LAYOUT_HEX:
+            return "%02x" % shard_id   # 2 位十六进制: 00 ~ ff
+        return "%04d" % shard_id       # 十进制 4 位定长: 0000 ~ N-1
 
     def _shard_path(self, shard_id):
         return os.path.join(self.shard_dir, self._shard_name(shard_id) + ".db")
@@ -311,12 +323,17 @@ class HashSignatureDB:
 
     # ---------- 分片布局检测与同步 ----------
     def _layout_shard_files(self):
-        """当前布局下的分片文件名列表 (modulo: 4 位十进制, 排除 _meta.db)"""
-        return [
-            f for f in os.listdir(self.shard_dir)
-            if f.endswith(".db") and f != "_meta.db"
-            and len(f) == 7 and f[:-3].isdigit()
-        ]
+        """当前目录下的分片文件名列表 (modulo: 4位十进制, hex: 2位十六进制; 排除 _meta.db)"""
+        result = []
+        for f in os.listdir(self.shard_dir):
+            if not f.endswith(".db") or f == "_meta.db":
+                continue
+            stem = f[:-3]
+            if len(stem) == 4 and stem.isdigit():
+                result.append(f)        # modulo 布局: 0000~9999
+            elif len(stem) == 2 and all(c in "0123456789abcdef" for c in stem):
+                result.append(f)        # hex 布局: 00~ff
+        return result
 
     def _count_modulo_files(self):
         return len(self._layout_shard_files())
@@ -359,7 +376,7 @@ class HashSignatureDB:
             layout = row[0]
             old_count = int(crow[0]) if crow else self.shard_count
 
-        if layout != self.LAYOUT_MODULO or old_count != self.shard_count:
+        if layout != self.layout or old_count != self.shard_count:
             self._reshard(layout, old_count)
 
     def _reshard(self, old_layout, old_count):
@@ -430,12 +447,12 @@ class HashSignatureDB:
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','0')")
             self.meta.execute(
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('layout',?)",
-                (self.LAYOUT_MODULO,))
+                (self.layout,))
             self.meta.execute(
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                 (str(self.shard_count),))
         print(f"[NKAMG] 分片重排: {old_layout}({old_count}) → "
-              f"modulo({self.shard_count}), {total:,} 条, "
+              f"{self.layout}({self.shard_count}), {total:,} 条, "
               f"耗时 {time.time() - t0:.1f}s (旧布局备份: {backup_dir})")
 
     # ---------- 连接管理 ----------
@@ -599,7 +616,7 @@ class HashSignatureDB:
                 )
                 self.meta.execute(
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('layout',?)",
-                    (self.LAYOUT_MODULO,))
+                    (self.layout,))
                 self.meta.execute(
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                     (str(self.shard_count),))
@@ -644,7 +661,10 @@ class HashSignatureDB:
             rows = []
         for prefix, cnt in rows:
             try:
-                sid = int(prefix)
+                if self.layout == self.LAYOUT_HEX:
+                    sid = int(prefix, 16)   # hex 前缀: "0a" → 10
+                else:
+                    sid = int(prefix)       # modulo 前缀: "0001" → 1
             except ValueError:
                 continue
             path = self._bloom_path(sid)
@@ -975,10 +995,12 @@ class FuzzySignatureDB(HashSignatureDB):
     主键路由/Bloom 与 sha256 库同构 (digest[:4] % N), 可按 sha256 反查增强信息。
     """
 
-    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01, max_open_shards=4):
+    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
+                 max_open_shards=4, layout="modulo"):
         super().__init__(db_path, shard_count=shard_count, bloom_fp_rate=bloom_fp_rate,
                          max_open_shards=max_open_shards, hash_algo="sha256",
-                         ddl=FUZZY_DDL, insert_sql=FUZZY_INSERT, row_cols=FUZZY_COLS)
+                         ddl=FUZZY_DDL, insert_sql=FUZZY_INSERT, row_cols=FUZZY_COLS,
+                         layout=layout)
 
     # ---------- 行映射 (8 列) ----------
     def _row_for_insert(self, sha256_digest, size, name, ssdeep=None,
