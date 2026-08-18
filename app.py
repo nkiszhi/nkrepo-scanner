@@ -114,6 +114,30 @@ for fname in sorted(os.listdir(SIG_DIR)):
     elif fname.endswith((".yar", ".yara")):
         yara_scanner.load_rules(path)
 
+# 收集目录: 从第三方仓库 (Neo23x0/signature-base, Yara-Rules/rules,
+# InQuest/yara-rules-vt, advanced-threat-research/Yara-Rules 等, 见 README
+# 「YARA 规则库」) 递归加载全部 .yar/.yara。每个文件独立编译为一个规则集,
+# 全部累积生效 (见 YaraScanner)。
+_YARA_SRC = os.path.join(BASE_DIR, "yara_sources")
+if os.path.isdir(_YARA_SRC):
+    _collected = 0
+    for _root, _dirs, _files in os.walk(_YARA_SRC):
+        _dirs[:] = [d for d in _dirs if d != ".git"]   # 跳过仓库元数据
+        for _fn in sorted(_files):
+            if _fn.endswith((".yar", ".yara")):
+                yara_scanner.load_rules(os.path.join(_root, _fn))
+                _collected += 1
+    if _collected:
+        print(f"[NKAMG] 已收集第三方 YARA 规则文件: {_collected} 个 (yara_sources/)")
+
+if yara_scanner.rule_count:
+    print(f"[NKAMG] YARA 规则: {yara_scanner.rule_count:,} 条 "
+          f"({len(yara_scanner.source_files)} 文件"
+          + (f", {len(yara_scanner.errors)} 个文件编译失败" if yara_scanner.errors else "")
+          + ")")
+for _f, _e in yara_scanner.errors[:5]:
+    print(f"[NKAMG] YARA 编译警告 [{_f}]: {_e}")
+
 finalize_status = hash_db.finalize()
 if finalize_status:
     print(f"[NKAMG] 签名库整理: {finalize_status}")

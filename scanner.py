@@ -937,25 +937,41 @@ class HashSignatureDB:
 # YARA 扫描器 (不变)
 # ============================================================
 class YaraScanner:
-    """YARA 规则扫描器"""
+    """YARA 规则扫描器
+
+    支持加载**多个** .yar 规则文件: 每个文件独立编译为一个规则集 (Rules 对象),
+    全部累积到 self.rulesets。匹配时遍历所有规则集, 因此从不同仓库收集的大量
+    规则文件可同时生效 (旧实现每次 load_rules 会覆盖上一个文件, 仅最后一个生效)。
+    """
 
     def __init__(self):
-        self.rules = None
-        self.rule_count = 0
-        self.source_files = []
+        self.rulesets = []           # 已编译的规则集列表 (每个 .yar 文件一个)
+        self.rule_count = 0          # 累计规则条数
+        self.source_files = []       # 成功加载的文件名列表
+        self.errors = []             # [(文件名, 错误), ...] 编译失败的文件
         self.error = None if YARA_AVAILABLE else "yara-python 未安装, YARA 引擎不可用"
 
+    @property
+    def rules(self):
+        """向后兼容: 返回首个规则集 (无则 None)。真正扫描会遍历全部 rulesets。"""
+        return self.rulesets[0] if self.rulesets else None
+
     def load_rules(self, filepath):
-        """编译并加载 .yar 规则文件"""
+        """编译并加载单个 .yar/.yara 文件, 累积到 rulesets
+        (失败仅记录到 errors, 不影响其它文件加载)"""
         if not YARA_AVAILABLE:
             return 0
         try:
-            self.rules = yara.compile(filepath=filepath)
+            r = yara.compile(filepath=filepath)
         except yara.Error as e:
-            self.error = f"YARA 规则编译失败: {e}"
+            self.errors.append((os.path.basename(filepath), str(e)))
+            return 0
+        except (MemoryError, OSError) as e:
+            self.errors.append((os.path.basename(filepath), f"编译资源不足: {e}"))
             return 0
         count = self._count_rules(filepath)
-        self.rule_count = count
+        self.rulesets.append(r)
+        self.rule_count += count
         self.source_files.append(os.path.basename(filepath))
         return count
 
@@ -972,28 +988,35 @@ class YaraScanner:
 
     def scan(self, file_path):
         """扫描文件, 返回命中列表 (路径版本: YARA 自行读盘)"""
-        if not self.rules:
+        if not self.rulesets:
             return []
-        try:
-            matches = self.rules.match(file_path, timeout=10)
-        except yara.TimeoutError:
-            return self._timeout_hit()
-        except yara.Error as e:
-            return self._error_hit(e)
-        return self._format_matches(matches)
+        hits = []
+        for r in self.rulesets:
+            try:
+                matches = r.match(file_path, timeout=10)
+            except yara.TimeoutError:
+                return self._timeout_hit()
+            except yara.Error:
+                # 单规则集匹配异常 (如样本触发模块 bug) 跳过该集, 不阻断其余
+                continue
+            hits.extend(self._format_matches(matches))
+        return hits
 
     def scan_data(self, data):
         """扫描内存缓冲, 返回命中列表 (与 scan 等价, 但复用调用方已读入的数据,
         避免哈希/类型识别后 YARA 再次读盘 → 文件只读一遍)"""
-        if not self.rules:
+        if not self.rulesets:
             return []
-        try:
-            matches = self.rules.match(data=data, timeout=10)
-        except yara.TimeoutError:
-            return self._timeout_hit()
-        except yara.Error as e:
-            return self._error_hit(e)
-        return self._format_matches(matches)
+        hits = []
+        for r in self.rulesets:
+            try:
+                matches = r.match(data=data, timeout=10)
+            except yara.TimeoutError:
+                return self._timeout_hit()
+            except yara.Error:
+                continue
+            hits.extend(self._format_matches(matches))
+        return hits
 
     @staticmethod
     def _timeout_hit():

@@ -39,3 +39,6 @@ venv/
 .idea/
 Thumbs.db
 .DS_Store
+
+# 第三方 YARA 规则仓库 (git clone 收集, 不入库; 见 README「YARA 规则库」)
+yara_sources/

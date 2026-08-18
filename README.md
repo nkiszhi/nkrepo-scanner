@@ -234,6 +234,8 @@ nkrepo-scanner/
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
 ├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
 ├── packer_rules/                 # 外部 YARA 扩展壳库（.yar 规则 + README.md 编写约定）
+├── yara_sources/                 # 第三方 YARA 规则库（Neo23x0/signature-base, Yara-Rules/rules, ATR, InQuest；.gitignore 忽略，fetch_yara.py 拉取）
+├── fetch_yara.py                 # 第三方 YARA 规则库下载脚本（GitHub tarball → yara_sources/）
 ├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 魔数机制移植）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类样本）
@@ -306,6 +308,16 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 - **SHA256 哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中非 64hex 行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
 - **MD5 哈希（并列库）**：MD5 库不通过启动自动导入构建，而是运行 `python build_md5_db.py`（从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名，仅 MD5 行入库）；构建后重启即自动加载 `signatures/md5.db.shards/`
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
+- **第三方 YARA 规则库**（`yara_sources/`，2026-08-18 新增）：从 GitHub 开源社区收集的 YARA 规则，启动时递归加载 `yara_sources/` 下全部 `.yar/.yara` 文件（每个文件独立编译为规则集，累积生效；编译失败的单个文件跳过不影响其它）。当前来源：
+
+  | 目录 | 仓库 | 规则文件数 | 说明 |
+  | ---- | ---- | --------- | ---- |
+  | `yara_sources/Neo23x0_signature-base/` | [Neo23x0/signature-base](https://github.com/Neo23x0/signature-base) | 751 | THOR / ATiM 扫描器配套规则，含 APT / 漏洞利用 / webshell / hacktools 等 |
+  | `yara_sources/Yara-Rules_rules/` | [Yara-Rules/rules](https://github.com/Yara-Rules/rules) | 566 | 社区维护的 YARA 规则库，含 APT / malware / packers / webshells |
+  | `yara_sources/ATR_Yara-Rules/` | [advanced-threat-research/Yara-Rules](https://github.com/advanced-threat-research/Yara-Rules) | 125 | Trellix (McAfee) ATR 团队规则，含 APT / ransomware / stealer / miners |
+  | `yara_sources/InQuest_yara-rules-vt/` | [InQuest/yara-rules-vt](https://github.com/InQuest/yara-rules-vt) | 38 | VirusTotal 专用规则集 |
+
+  加载后 YARA 规则总量：**18,346 条**（1,409 文件成功编译，72 文件因依赖不可用模块如 `filepath`/`filename`/`file_type` 而跳过）。`yara_sources/` 已加入 `.gitignore`，需用 `fetch_yara.py` 重新拉取。
 - **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
 ### 压测
