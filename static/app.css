@@ -313,6 +313,7 @@ a { color: var(--accent); text-decoration: none; }
 .engine-cell .e-icon.h { background: var(--accent-soft); color: var(--accent); }
 .engine-cell .e-icon.y { background: rgba(167,139,250,.14); color: var(--purple); }
 .engine-cell .e-icon.p { background: rgba(52,209,123,.13); color: var(--green); }
+.engine-cell .e-icon.f { background: var(--amber-soft); color: var(--amber); }
 .det-row.hit { background: var(--red-soft); }
 .det-row.hit td { border-bottom-color: rgba(242,85,93,.14); }
 .det-name { font-family: var(--mono); font-size: 12.5px; color: var(--red); font-weight: 600; word-break: break-all; }

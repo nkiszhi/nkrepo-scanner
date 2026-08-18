@@ -203,7 +203,10 @@ class HashSignatureDB:
     HEX_COUNTS = {1: 16, 2: 256, 3: 4096}  # hex 前缀长度 → 分片数 (旧布局)
 
     def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
-                 max_open_shards=4, hash_algo="sha256"):
+                 max_open_shards=4, hash_algo="sha256",
+                 ddl=None, insert_sql=None, row_cols=None):
+        """hash_algo 决定主键列 (sha256/md5); ddl/insert_sql/row_cols 可覆盖默认表结构
+        (FuzzySignatureDB 用它定制 8 列模糊哈希结构; 默认 None = 按 hash_algo 的标准结构)"""
         if hash_algo not in HASH_SPECS:
             raise ValueError(f"不支持的哈希算法: {hash_algo} (可选: {list(HASH_SPECS)})")
         self.hash_algo = hash_algo
@@ -219,21 +222,30 @@ class HashSignatureDB:
         self.bloom_dir = db_path + ".bloom"   # 分片 Bloom 位图目录
         self.bloom_fp_rate = bloom_fp_rate
         self.max_open_shards = max(4, max_open_shards)
-        # 主键结构: sha256 库用四列精简结构 (sha256 主键 + size/name + 预留 md5);
-        # 与 md5 独立并列库 (md5/size/name 三列) 互不干扰;
-        # sha1/ssdeep/tlsh/sdhash/mvhash 等预留 fuzzy 列已废弃移除
-        if hash_algo == "sha256":
+        # 表结构: sha256 库四列 (sha256 主键 + size/name + 预留 md5), md5 库三列;
+        # 亦可通过构造参数 ddl/insert_sql/row_cols 定制 (FuzzySignatureDB 8 列模糊哈希结构)。
+        # row_cols 供 _reshard 整行透传 SELECT 用, 须与 insert_sql 列数一致。
+        if ddl is not None:
+            self._ddl = ddl
+        elif hash_algo == "sha256":
             self._ddl = SIGS_DDL
-            self._insert_sql = SIGS_INSERT
         else:
             self._ddl = (
                 f"CREATE TABLE IF NOT EXISTS sigs({self.pk_col} BLOB PRIMARY KEY,"
                 " size INTEGER, name TEXT) WITHOUT ROWID"
             )
+        if insert_sql is not None:
+            self._insert_sql = insert_sql
+        elif hash_algo == "sha256":
+            self._insert_sql = SIGS_INSERT
+        else:
             self._insert_sql = (
                 f"INSERT OR IGNORE INTO sigs({self.pk_col},size,name)"
                 " VALUES(?,?,?)"
             )
+        self._row_cols = row_cols or (
+            "sha256,size,name,md5" if hash_algo == "sha256" else f"{self.pk_col},size,name"
+        )
         self._lock = threading.RLock()       # 写路径互斥 (import_hdb / finalize / close)
         self._cache_lock = threading.Lock()  # _conns/_blooms 字典 LRU 操作的细粒度锁
         self._retired = []                   # LRU 淘汰的连接, 延迟到 close() 统一关闭
@@ -370,15 +382,12 @@ class HashSignatureDB:
             pending = {}
             try:
                 cur = src_conn.execute(
-                    "SELECT " + ("sha256,size,name,md5"
-                                 if self.hash_algo == "sha256"
-                                 else f"{self.pk_col},size,name")
-                    + " FROM sigs")
+                    f"SELECT {self._row_cols} FROM sigs")
                 while True:
                     rows = cur.fetchmany(50_000)
                     if not rows:
                         break
-                    for row in rows:  # 4 列整行透传 (sha256: sha256,size,name,md5)
+                    for row in rows:  # 整行透传 (列数 = _row_cols, 与 _insert_sql 一致)
                         sid = self._route(row[0], self.shard_count)
                         pending.setdefault(sid, []).append(row)
             except sqlite3.Error:
@@ -931,6 +940,178 @@ class HashSignatureDB:
 
 
 # ============================================================
+# 模糊哈希签名库 (FuzzySignatureDB): 与 sha256/md5 库并列的第三库
+# 数据源 ClamAV 8 字段 hdb 行: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+# ============================================================
+FUZZY_COLS = "sha256,size,name,ssdeep,vhash,authentihash,imphash,rich_header_hash"
+FUZZY_DDL = (
+    "CREATE TABLE IF NOT EXISTS sigs("
+    " sha256 BLOB PRIMARY KEY,"
+    " size INTEGER, name TEXT,"
+    " ssdeep TEXT,"
+    " vhash BLOB, authentihash BLOB, imphash BLOB, rich_header_hash BLOB)"
+    " WITHOUT ROWID"
+)
+FUZZY_INSERT = "INSERT OR IGNORE INTO sigs(" + FUZZY_COLS + ") VALUES(?,?,?,?,?,?,?,?)"
+
+
+def _hex_to_blob(s):
+    """hex 字符串 → BLOB 字节 (偶数长度纯 hex); 空/非法/奇数长度返回 None"""
+    if not s:
+        return None
+    s = s.strip().lower()
+    if len(s) % 2 or not all(c in "0123456789abcdef" for c in s):
+        return None
+    return bytes.fromhex(s)
+
+
+class FuzzySignatureDB(HashSignatureDB):
+    """ClamAV 8 字段 hdb 的模糊哈希增强库 (与 sha256/md5 库并列的第三库)。
+
+    表结构参考 sha256 库 (sha256 BLOB 主键 + size/name), 扩展 5 个模糊哈希列:
+      ssdeep TEXT                    变长模糊哈希 (非 hex, 直存文本)
+      vhash/authentihash/imphash/rich_header_hash BLOB  (hex → 字节, 非法为 NULL)
+    只存**至少一个模糊字段非空**的行 (无 fuzzy 信息的行仅存在于 sha256 库即可)。
+    主键路由/Bloom 与 sha256 库同构 (digest[:4] % N), 可按 sha256 反查增强信息。
+    """
+
+    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01, max_open_shards=4):
+        super().__init__(db_path, shard_count=shard_count, bloom_fp_rate=bloom_fp_rate,
+                         max_open_shards=max_open_shards, hash_algo="sha256",
+                         ddl=FUZZY_DDL, insert_sql=FUZZY_INSERT, row_cols=FUZZY_COLS)
+
+    # ---------- 行映射 (8 列) ----------
+    def _row_for_insert(self, sha256_digest, size, name, ssdeep=None,
+                        vhash=None, authentihash=None, imphash=None,
+                        rich_header_hash=None):
+        """把 8 字段 hdb 行映射为表行; 模糊字段 hex → BLOB, 空/非法 → NULL"""
+        if len(sha256_digest) != 32:
+            raise ValueError(f"仅支持 SHA256 主键 (32B), 收到 {len(sha256_digest)}B")
+        return (sha256_digest, size, name,
+                ssdeep or None,
+                _hex_to_blob(vhash), _hex_to_blob(authentihash),
+                _hex_to_blob(imphash), _hex_to_blob(rich_header_hash))
+
+    # ---------- 导入 ----------
+    def import_hdb(self, filepath, batch=50_000):
+        """导入 ClamAV 8 字段 hdb 文件 (增量, 幂等), 返回新插入条数。
+
+        行格式: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+        仅收 64hex sha256 主键行; 至少一个模糊字段非空才入库 (INSERT OR IGNORE 去重)。
+        """
+        basename = os.path.basename(filepath)
+        pending = {}  # shard_id -> [8 列行]
+        start = time.time()
+        with self._lock:
+            with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split(":")
+                    if len(parts) < 8:
+                        continue
+                    h = parts[0].strip().lower()
+                    if len(h) != 64:  # 仅收 SHA256 主键行
+                        continue
+                    try:
+                        digest = bytes.fromhex(h)
+                    except ValueError:
+                        continue
+                    size_field = parts[1].strip()
+                    try:
+                        size = None if size_field == "*" else int(size_field)
+                    except ValueError:
+                        size = None
+                    name = parts[2].strip()
+                    ssdeep = parts[3].strip() or None
+                    fz = [_hex_to_blob(p) for p in (parts[4], parts[5], parts[6], parts[7])]
+                    if ssdeep is None and not any(fz):
+                        continue  # 无模糊哈希信息, 不入库
+                    pending.setdefault(
+                        self._route(digest, self.shard_count), []
+                    ).append((digest, size, name, ssdeep, *fz))
+            inserted = 0
+            count_updates = []
+            dirty = set()
+            for sid, rows in pending.items():
+                shard = self._open_rw(self._shard_path(sid))
+                shard.execute(self._ddl)
+                before = shard.total_changes
+                for i in range(0, len(rows), batch):
+                    shard.executemany(self._insert_sql, rows[i:i + batch])
+                shard.commit()
+                delta = shard.total_changes - before
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                shard.close()
+                inserted += delta
+                count_updates.append((self._shard_name(sid), cnt))
+                dirty.add(sid)
+            with self.meta:
+                self.meta.executemany(
+                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                    count_updates,
+                )
+                self.meta.execute(
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,)
+                )
+            self._count += inserted
+            self._bloom_dirty |= dirty  # 新增签名的分片 bloom 失效, 待 finalize 重建
+        if basename not in self.source_files:
+            self.source_files.append(basename)
+        return inserted
+
+    # ---------- 查询 ----------
+    def check_hash(self, sha256_hex, file_size=None):
+        """按 sha256 反查模糊哈希增强信息 (命中返回含 5 个 fuzzy 字段的完整数据)。
+
+        与 sha256/md5 库 check_hash 同构: Bloom 排除短路 + 单分片 SQLite 点查;
+        仅收 64hex 主键; file_size 提供时做大小碰撞防护。
+        """
+        hits = []
+        if not sha256_hex or len(sha256_hex) != 64:
+            return hits
+        try:
+            digest = bytes.fromhex(sha256_hex)
+        except ValueError:
+            return hits
+        shard_id = self._route(digest, self.shard_count)
+        bf = self._load_bloom_shard(shard_id)
+        if bf is not None and digest not in bf:
+            return hits
+        row = self._query_shard(
+            shard_id,
+            "SELECT size,name,ssdeep,vhash,authentihash,imphash,rich_header_hash"
+            " FROM sigs WHERE sha256=?",
+            (digest,),
+        )
+        if row is None:
+            return hits
+        sig_size, name, ssdeep, vhash, auth, imp, rich = row
+        if file_size is not None and sig_size is not None and sig_size != file_size:
+            return hits
+        hits.append({
+            "engine": "Fuzzy Hash DB",
+            "type": "hash",
+            "name": name,
+            "size": sig_size,
+            "detail": f"Fuzzy 命中: {sha256_hex}",
+            "fuzzy": {
+                "ssdeep": ssdeep,
+                "vhash": vhash.hex() if vhash else None,
+                "authentihash": auth.hex() if auth else None,
+                "imphash": imp.hex() if imp else None,
+                "rich_header_hash": rich.hex() if rich else None,
+            },
+        })
+        return hits
+
+    # 文件扫描兼容接口: 本库主键即 sha256, 语义与 sha256 库 check 相同
+    def check(self, file_path, file_size, md5, sha1, sha256):
+        return self.check_hash(sha256, file_size)
+
+
+# ============================================================
 # YARA 扫描器 (不变)
 # ============================================================
 class YaraScanner:
@@ -1061,10 +1242,11 @@ class Scanner:
     # 一次性读入内存的上限: 超过则退回分块+路径扫描, 防大文件占满内存
     INLINE_LIMIT = 64 * 1024 * 1024
 
-    def __init__(self, hash_db, yara_scanner, md5_db=None):
+    def __init__(self, hash_db, yara_scanner, md5_db=None, fuzzy_db=None):
         self.hash_db = hash_db
         self.yara_scanner = yara_scanner
         self.md5_db = md5_db  # 独立 MD5 分片库 (可选); 命中并入 detections
+        self.fuzzy_db = fuzzy_db  # 模糊哈希增强库 (可选); sha256 命中时附加 ssdeep/vhash 等信息
 
     def scan_file(self, file_path, filename=None):
         """扫描单个文件 (兼容接口)。
@@ -1129,6 +1311,9 @@ class Scanner:
         detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
         if self.md5_db is not None:
             detections.extend(self.md5_db.check_hash(md5, file_size))
+        if self.fuzzy_db is not None:
+            # 模糊哈希增强库: sha256 命中时附加 ssdeep/vhash/authentihash/imphash/rich_header_hash
+            detections.extend(self.fuzzy_db.check_hash(sha256, file_size))
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
             "filename": filename or "unnamed",

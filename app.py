@@ -12,7 +12,7 @@ from collections import OrderedDict, defaultdict, deque
 from flask import Flask, jsonify, render_template, request
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from scanner import HashSignatureDB, Scanner, YaraScanner
+from scanner import FuzzySignatureDB, HashSignatureDB, Scanner, YaraScanner
 import packer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -103,6 +103,21 @@ if os.path.isdir(_md5_base + ".shards"):
     print(f"[NKAMG] MD5 库就绪: {md5_db.count:,} 条")
 else:
     print("[NKAMG] 未检测到 MD5 分片库, 跳过 (运行 build_md5_db.py 可构建)")
+# 模糊哈希增强库 (与 SHA256/MD5 库并列的第三库): 由 build_fuzzy_db.py 从 hdb/
+# 8 字段行 (sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash)
+# 提取 5 个模糊哈希字段构建 (signatures/fuzzy.db.shards/); 未构建则降级 None
+fuzzy_db = None
+_fuzzy_base = os.path.join(SIG_DIR, "fuzzy.db")
+if os.path.isdir(_fuzzy_base + ".shards"):
+    fuzzy_db = FuzzySignatureDB(
+        _fuzzy_base,
+        shard_count=int(bcfg["shards"]),
+        bloom_fp_rate=float(bcfg["fp_rate"]),
+        max_open_shards=int(hcfg["max_open_shards"]),
+    )
+    print(f"[NKAMG] 模糊哈希库就绪: {fuzzy_db.count:,} 条")
+else:
+    print("[NKAMG] 未检测到模糊哈希分片库, 跳过 (运行 build_fuzzy_db.py 可构建)")
 yara_scanner = YaraScanner()
 
 for fname in sorted(os.listdir(SIG_DIR)):
@@ -154,7 +169,7 @@ if pk_engine.rule_count:
 for f, err in pk_engine.errors[:5]:
     print(f"[NKAMG] 壳库规则警告 [{f}]: {err}")
 
-scanner = Scanner(hash_db, yara_scanner, md5_db=md5_db)
+scanner = Scanner(hash_db, yara_scanner, md5_db=md5_db, fuzzy_db=fuzzy_db)
 
 # ---------- 安全加固: API 认证 / 限流 / 阶段2 资源上限 ----------
 # M1: api_token 非空则所有 API 需 Bearer/query token (401); 默认空 = 匿名本地模式
@@ -238,6 +253,8 @@ def stats():
         "hash_signatures": hash_db.count,
         "md5_signatures": md5_db.count if md5_db else 0,
         "md5_available": md5_db is not None,
+        "fuzzy_signatures": fuzzy_db.count if fuzzy_db else 0,
+        "fuzzy_available": fuzzy_db is not None,
         "yara_rules": yara_scanner.rule_count,
         "yara_available": yara_scanner.rules is not None,
         "yara_error": yara_scanner.error,
@@ -246,9 +263,11 @@ def stats():
         "packer_yara_error": "; ".join(f"{f}: {e}" for f, e in pk_engine.errors[:3]) or None,
         "hash_sources": hash_db.source_files,
         "md5_sources": md5_db.source_files if md5_db else [],
+        "fuzzy_sources": fuzzy_db.source_files if fuzzy_db else [],
         "yara_sources": yara_scanner.source_files,
         "storage": hash_db.stats(),
         "md5_storage": md5_db.stats() if md5_db else None,
+        "fuzzy_storage": fuzzy_db.stats() if fuzzy_db else None,
         "max_upload_mb": int(scfg["max_upload_mb"]),  # 前端据此本地预检超限, 给出明确提示
     })
 
@@ -277,6 +296,9 @@ def hash_lookup(hash):
         })
     if len(h) == 64 and valid:  # SHA256
         hits = list(hash_db.check(None, None, None, None, h))
+        if fuzzy_db is not None:
+            # 模糊哈希增强: sha256 命中时附加 ssdeep/vhash/authentihash/imphash/rich_header_hash
+            hits.extend(fuzzy_db.check_hash(h))
         return jsonify({
             "sha256": h,
             "hash_algo": "sha256",

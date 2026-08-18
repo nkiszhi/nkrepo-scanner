@@ -13,7 +13,7 @@
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
-当前签名库：**62,587,049 条 SHA256 整文件哈希签名**，源自 ClamAV 官方病毒库整文件哈希（`signatures/hdb/` 下 256 个分桶 `.hdb` 文件，共 62,586,907 行且全部为 64hex sha256 签名，2026-08-17 全量导入），按 `bloom.shards = 4` 拆为 4 个分片存储（单分片约 1,560 万条，分片库合计约 4.4GB）。另有**并列的 MD5 整文件哈希库 540,169 条**（独立分片库 `signatures/md5.db.shards/`，由 `build_md5_db.py` 从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名构建，2026-08-18 新增），文件扫描与 Web 哈希查询均按哈希长度自动路由到对应库。
+当前签名库：**62,587,049 条 SHA256 整文件哈希签名**，源自 ClamAV 官方病毒库整文件哈希（`signatures/hdb/` 下 256 个分桶 `.hdb` 文件，共 62,586,907 行且全部为 64hex sha256 签名，2026-08-17 全量导入），按 `bloom.shards = 4` 拆为 4 个分片存储（单分片约 1,560 万条，分片库合计约 4.4GB）。另有**并列的 MD5 整文件哈希库 540,169 条**（独立分片库 `signatures/md5.db.shards/`，由 `build_md5_db.py` 从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名构建，2026-08-18 新增），文件扫描与 Web 哈希查询均按哈希长度自动路由到对应库；以及**并列的模糊哈希增强库 62,331,195 条**（独立分片库 `signatures/fuzzy.db.shards/`，由 `build_fuzzy_db.py` 从 `signatures/hdb/` 8 字段行提取 ssdeep/vhash/authentihash/imphash/rich_header_hash 构建，2026-08-18 新增），SHA256 命中时自动附加 fuzzy 增强信息。
 
 > 历史背景：v3 迁移曾将旧库 540,357 条 md5/sha1 签名按用户决策移除、仅保留 186 条 sha256（备份见 `000X.db.pre_multi_hash.bak` / `000X.db.pre_sha256_pk.bak`）；随后全量导入官方 sha256 分桶库，检测能力恢复并超越至 6200 万+ 条。
 
@@ -148,6 +148,33 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
 - 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `sha256.db.shards.legacy`
 - 兼容迁移：旧版单一 `sha256.db` 自动按前缀拆入分片（原文件保留为 `sha256.db.migrated`）；旧版单文件 Bloom（`sha256.db.bloom`）自动备份为 `sha256.db.bloom.legacy`
 
+### 模糊哈希增强库（FuzzySignatureDB，2026-08-18 新增）
+
+与 SHA256/MD5 库并列的第三库，数据源为 ClamAV 官方 hdb 分桶的 **8 字段行**：
+
+```
+sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+```
+
+- 由 `build_fuzzy_db.py` 读取 `signatures/hdb/`（00.hdb~ff.hdb，256 个分桶）逐行解析，提取 **ssdeep / vhash / authentihash / imphash / rich_header_hash** 五个模糊哈希字段入库；只存**至少一个模糊字段非空**的行（无 fuzzy 信息的行仅存在于 SHA256 库即可）
+- 表结构参考 SHA256/MD5 库（主键 + size + name），扩展 5 个模糊列：
+
+  ```
+  sigs(sha256 BLOB PRIMARY KEY,        -- 32B, 与 SHA256 库同主键同路由
+       size INTEGER, name TEXT,        -- filesize / result
+       ssdeep TEXT,                    -- 变长模糊哈希 (ClamAV 以 '-' 分隔三段, 直存文本)
+       vhash BLOB,                     -- 16 hex → 8B
+       authentihash BLOB,              -- 64 hex → 32B
+       imphash BLOB,                   -- 32 hex → 16B
+       rich_header_hash BLOB)          -- 32 hex → 16B (极稀疏, 实测 967 行)
+       WITHOUT ROWID
+  ```
+
+- 分片目录 `signatures/fuzzy.db.shards/`（4 分片）+ Bloom `signatures/fuzzy.db.bloom/`（4 片 × 17.8MB，k=7 / fp=0.01，全量加载常驻约 71MB）；主键 sha256 的路由/分片/Bloom 与 SHA256 库同构（`digest[:4] % N`），可复用同一套懒加载与并发模型（继承 `HashSignatureDB`，仅覆盖表结构与行解析）。当前（2026-08-18 全量导入后）**62,331,195 条**（约占 6,258 万 sha256 总签名的 99.6%，即几乎所有签名都带至少一个模糊哈希字段），4 分片实际计数 `15,573,537 / 15,586,343 / 15,585,987 / 15,585,328`，分片库合计约 **10.7GB**（单分片约 2.7GB），构建实测：导入约 110min + Bloom 重建约 9min（幂等可续导）
+- 查询：`fuzzy_db.check_hash(sha256_hex)` → Bloom 排除 + 单分片点查，命中返回 `size/name/ssdeep/vhash/authentihash/imphash/rich_header_hash` 完整 8 列（`engine="Fuzzy Hash DB"`，`detail` 标注 `Fuzzy 命中:`）
+- 接入：文件扫描阶段 1 在 SHA256/MD5 命中之外追加 fuzzy 命中；Web 哈希查询 `/api/hash/<64hex>` 命中时同样附加 fuzzy 增强信息；前端检测表新增 `Fuzzy Hash DB` 引擎行（F 徽标 + 5 字段概要）
+- `app.py` 启动检测 `signatures/fuzzy.db.shards/`，存在则只读实例化 `fuzzy_db`，否则降级 `None`；`/api/stats` 返回 `fuzzy_signatures` / `fuzzy_available` / `fuzzy_sources` / `fuzzy_storage`
+
 ### 千万级实测数据（1000 万条合成签名）
 
 > 下表在 256 分片配置下测得；当前默认 4 分片下 Bloom 位图按需懒加载，冷启动常驻内存更低，延迟量级不变。
@@ -228,8 +255,9 @@ venv\Scripts\python app.py
 ```
 nkrepo-scanner/
 ├── app.py                        # Flask Web 服务（/ 搜索首页、GET /scan 扫描页、POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<hash> 哈希查询（32hex→MD5 库 / 64hex→SHA256 库））
-├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储[可参数化为 md5/sha256 并列库] + YaraScanner + 静态信息集成）
+├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储[可参数化为 md5/sha256 并列库] + FuzzySignatureDB 模糊哈希增强库 + YaraScanner + 静态信息集成）
 ├── build_md5_db.py               # 构建并列 MD5 哈希库（从 extracted/ 的 ClamAV .hdb/.hsb 提取 32hex MD5 签名 → signatures/md5.db.shards/）
+├── build_fuzzy_db.py             # 构建模糊哈希增强库（从 signatures/hdb/ 8 字段行提取 ssdeep/vhash/authentihash/imphash/rich_header_hash → signatures/fuzzy.db.shards/）
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
 ├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
 ├── packer_rules/                 # 外部 YARA 扩展壳库（.yar 规则 + README.md 编写约定）
@@ -256,6 +284,8 @@ nkrepo-scanner/
 │   ├── sha256.db.bloom/         # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
 │   ├── md5.db.shards/            # 并列 MD5 哈希库分片（build_md5_db.py 生成，运行时加载）
 │   ├── md5.db.bloom/             # 并列 MD5 库分片 Bloom 位图
+│   ├── fuzzy.db.shards/          # 模糊哈希增强库分片（build_fuzzy_db.py 生成，运行时加载）
+│   ├── fuzzy.db.bloom/           # 模糊哈希增强库分片 Bloom 位图
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd
@@ -297,6 +327,12 @@ for f in sorted(glob.glob('signatures/hdb/*.hdb')):
     print(f, '+', n)
 db.finalize(); db.close()"
 
+# 5b. 构建模糊哈希增强库（读取 signatures/hdb/ 下 256 个分桶的 8 字段行,
+#     提取 ssdeep/vhash/authentihash/imphash/rich_header_hash;
+#     实测 62,331,195 条: 导入约 110min + Bloom 重建约 9min, 幂等可续导;
+#     生成 signatures/fuzzy.db.shards/ + signatures/fuzzy.db.bloom/）
+python build_fuzzy_db.py
+
 # 6. 重启服务生效
 ```
 
@@ -306,6 +342,7 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 
 - **SHA256 哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中非 64hex 行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
 - **MD5 哈希（并列库）**：MD5 库不通过启动自动导入构建，而是运行 `python build_md5_db.py`（从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名，仅 MD5 行入库）；构建后重启即自动加载 `signatures/md5.db.shards/`
+- **模糊哈希（增强库）**：运行 `python build_fuzzy_db.py`（从 `signatures/hdb/` 8 字段行提取 5 个模糊哈希字段入库，见上文「模糊哈希增强库」）；构建后重启即自动加载 `signatures/fuzzy.db.shards/`
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
 - **第三方 YARA 规则库**（`yara_sources/`，2026-08-18 新增）：从 GitHub 开源社区收集的 YARA 规则，启动时递归加载 `yara_sources/` 下全部 `.yar/.yara` 文件（每个文件独立编译为规则集，累积生效；编译失败的单个文件跳过不影响其它）。当前来源：
 
@@ -339,8 +376,8 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | `/scan`      | GET  | Web 界面（VirusTotal 风格扫描页：FILE/搜索选项条 + 大上传区 + 最近扫描历史，结果渲染与首页共用 `static/app.js`） |
 | `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 含 Hash DB 命中（SHA256 库 + 并列 MD5 库均参与比对）、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
-| `/api/stats` | GET  | 签名统计：`hash_signatures`（SHA256 哈希条数）、`md5_signatures`/`md5_available`/`md5_sources`/`md5_storage`（并列 MD5 库）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
-| `/api/hash/<hash>` | GET | 哈希查询（VirusTotal 风格首页搜索框）：**32 位 hex → MD5 库，64 位 hex → SHA256 库**，命中与否均 200；返回 `{md5\|sha256, hash_algo, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情；非 32/64 位 hex 返回 400 |
+| `/api/stats` | GET  | 签名统计：`hash_signatures`（SHA256 哈希条数）、`md5_signatures`/`md5_available`/`md5_sources`/`md5_storage`（并列 MD5 库）、`fuzzy_signatures`/`fuzzy_available`/`fuzzy_sources`/`fuzzy_storage`（模糊哈希增强库）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
+| `/api/hash/<hash>` | GET | 哈希查询（VirusTotal 风格首页搜索框）：**32 位 hex → MD5 库，64 位 hex → SHA256 库**，命中与否均 200；返回 `{md5\|sha256, hash_algo, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情（SHA256 命中时若模糊哈希库也有该样本，`detections` 追加 `engine="Fuzzy Hash DB"` 项并携带 `fuzzy` 5 字段对象：`ssdeep/vhash/authentihash/imphash/rich_header_hash`）；非 32/64 位 hex 返回 400 |
 
 ## 安全
 

@@ -254,8 +254,10 @@ function engRow(iconCls, letter, label, hits, extraHtml) {
   if (hasHits) {
     cell = hits.map(x =>
       '<div style="padding:4px 0"><div class="det-name">' + esc(x.name) +
-      (x.engine === 'Hash DB' ? '<span class="badge">' + (x.detail && x.detail.startsWith('MD5') ? 'MD5' : 'SHA256') + '</span>' : '') + '</div>' +
-      (x.detail ? '<div class="det-detail">' + esc(x.detail) + '</div>' : '') + '</div>').join('');
+      (x.engine === 'Hash DB' ? '<span class="badge">' + (x.detail && x.detail.startsWith('MD5') ? 'MD5' : 'SHA256') + '</span>' :
+       x.engine === 'Fuzzy Hash DB' && x.fuzzy ? '<span class="badge">' + Object.keys(x.fuzzy).filter(k => x.fuzzy[k]).join('+') + '</span>' : '') + '</div>' +
+      (x.detail ? '<div class="det-detail">' + esc(x.detail) + '</div>' : '') +
+      (x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') + '</div>').join('');
   } else if (extraHtml) {
     cell = '<div class="det-verdict pending">' + extraHtml + '</div>';
   } else {
@@ -266,14 +268,27 @@ function engRow(iconCls, letter, label, hits, extraHtml) {
     '<div style="flex:1;min-width:0">' + cell + '</div></div>';
 }
 
+/* Fuzzy 命中的 5 字段概要 (ssdeep 截断为 40 字符, 其余完整) */
+function fuzzySummary(fz) {
+  const items = [];
+  if (fz.ssdeep) items.push('ssdeep: ' + (fz.ssdeep.length > 40 ? fz.ssdeep.slice(0, 40) + '…' : fz.ssdeep));
+  if (fz.vhash) items.push('vhash: ' + fz.vhash);
+  if (fz.authentihash) items.push('authentihash: ' + fz.authentihash);
+  if (fz.imphash) items.push('imphash: ' + fz.imphash);
+  if (fz.rich_header_hash) items.push('rich_header_hash: ' + fz.rich_header_hash);
+  return items.join(' · ');
+}
+
 function detectionsTable(d) {
   const dets = d.detections || [];
   const yaraAvailable = (d.scanners || []).some(s => /YARA/i.test(s));
   const hashHits = dets.filter(x => x.engine === 'Hash DB');
   const yaraHits = dets.filter(x => x.engine === 'YARA');
+  const fuzzyHits = dets.filter(x => x.engine === 'Fuzzy Hash DB');
 
   let html = '<div class="det-table">';
   html += engRow('h', 'H', 'Hash DB', hashHits);
+  if (fuzzyHits.length) html += engRow('f', 'F', 'Fuzzy Hash DB', fuzzyHits);
   if (yaraAvailable) html += engRow('y', 'Y', 'YARA', yaraHits);
   /* 加壳启发 (辅助信息) */
   const pk = (d.static_info || {}).packer;
@@ -486,12 +501,16 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 命中签名库';
         const t = card.querySelector('.tabs'); t.style.display = 'none';
         card.querySelector('.panel-details').innerHTML =
-          '<div class="det-table">' + d.detections.map(x =>
-            '<div class="det-row hit" style="display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(242,85,93,.14)">' +
-            '<div><div class="det-name">' + esc(x.name) + '</div>' +
-            '<div class="det-detail">' + esc(x.detail || '') + '</div></div>' +
-            '<span class="engine-cell" style="flex:none"><span class="e-icon h">H</span> Hash DB' +
-            '<span class="badge">' + label + '</span></span></div>').join('') +
+          '<div class="det-table">' + d.detections.map(x => {
+            const isFuzzy = x.engine === 'Fuzzy Hash DB';
+            return '<div class="det-row hit" style="display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(242,85,93,.14)">' +
+              '<div style="min-width:0"><div class="det-name">' + esc(x.name) +
+              (isFuzzy && x.fuzzy ? '<span class="badge">' + Object.keys(x.fuzzy).filter(k => x.fuzzy[k]).join('+') + '</span>' : '') + '</div>' +
+              '<div class="det-detail">' + esc(x.detail || '') + '</div>' +
+              (isFuzzy && x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') + '</div>' +
+              '<span class="engine-cell" style="flex:none"><span class="e-icon ' + (isFuzzy ? 'f' : 'h') + '">' + (isFuzzy ? 'F' : 'H') + '</span> ' +
+              (isFuzzy ? 'Fuzzy Hash DB' : 'Hash DB') + '<span class="badge">' + (isFuzzy ? '' : label) + '</span></span></div>';
+          }).join('') +
           '</div>';
         card.querySelector('.ring-wrap').style.display = '';
         setRing(card, d.detections.length, 1, 'detected');
@@ -521,6 +540,7 @@ function loadStats(onStats) {
   const maxMb = document.getElementById('maxMb'); if (maxMb) maxMb.textContent = MAX_UPLOAD_MB;
   const hc = document.getElementById('hashCount'); if (hc) hc.textContent = fmtNum(s.hash_signatures);
   const mc = document.getElementById('md5Count'); if (mc) mc.textContent = s.md5_available ? fmtNum(s.md5_signatures) : 'N/A';
+  const fc = document.getElementById('fuzzyCount'); if (fc) fc.textContent = s.fuzzy_available ? fmtNum(s.fuzzy_signatures) : 'N/A';
   const yc = document.getElementById('yaraCount'); if (yc) yc.textContent = s.yara_available ? fmtNum(s.yara_rules) : 'N/A';
   const pc = document.getElementById('pkCount'); if (pc) pc.textContent = s.packer_yara_available ? fmtNum(s.packer_yara_rules) : 'N/A';
     const st = s.storage || {};
