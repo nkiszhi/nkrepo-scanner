@@ -1,5 +1,5 @@
 """
-NKREPO Scanner - Web 服务入口
+NKAMG Scanner - Web 服务入口
 启动: python app.py  →  http://127.0.0.1:5000 (地址/端口可由 config.json 修改)
 """
 import json
@@ -62,7 +62,7 @@ def load_config(path=CONFIG_PATH):
                     if not key.startswith("_"):
                         cfg[section][key] = val
         except (json.JSONDecodeError, OSError) as e:
-            print(f"[NKREPO] 配置文件解析失败, 使用默认配置: {e}")
+            print(f"[NKAMG] 配置文件解析失败, 使用默认配置: {e}")
     return cfg
 
 
@@ -95,13 +95,13 @@ for fname in sorted(os.listdir(SIG_DIR)):
     if fname.endswith((".hdb", ".hsb")):
         if not hash_db.already_imported(fname):
             added = hash_db.import_hdb(path)
-            print(f"[NKREPO] 导入 {fname}: 新增 {added:,} 条")
+            print(f"[NKAMG] 导入 {fname}: 新增 {added:,} 条")
     elif fname.endswith((".yar", ".yara")):
         yara_scanner.load_rules(path)
 
 finalize_status = hash_db.finalize()
 if finalize_status:
-    print(f"[NKREPO] 签名库整理: {finalize_status}")
+    print(f"[NKAMG] 签名库整理: {finalize_status}")
 
 # 外部 YARA 扩展壳库: 读取 config.packer, 加载 packer_rules/ 下全部规则
 _pk_rules_dir = str(pkcfg.get("rules_dir", "packer_rules")).strip()
@@ -111,9 +111,9 @@ pk_engine = packer.configure(
     max_yara_bytes=int(pkcfg.get("max_yara_bytes", 16 * 1024 * 1024)),
 )
 if pk_engine.rule_count:
-    print(f"[NKREPO] 壳库 YARA 扩展规则: {pk_engine.rule_count} 条 ({len(pk_engine.source_files)} 文件, {_pk_rules_dir})")
+    print(f"[NKAMG] 壳库 YARA 扩展规则: {pk_engine.rule_count} 条 ({len(pk_engine.source_files)} 文件, {_pk_rules_dir})")
 for f, err in pk_engine.errors[:5]:
-    print(f"[NKREPO] 壳库规则警告 [{f}]: {err}")
+    print(f"[NKAMG] 壳库规则警告 [{f}]: {err}")
 
 scanner = Scanner(hash_db, yara_scanner)
 
@@ -324,9 +324,9 @@ def task_status(task_id):
 
 if __name__ == "__main__":
     st = hash_db.stats()
-    print(f"[NKREPO] 哈希签名: {hash_db.count:,} 条 (存储层: {st['tier']}, "
+    print(f"[NKAMG] 哈希签名: {hash_db.count:,} 条 (存储层: {st['tier']}, "
           f"分片: {st['shards']['configured']}, DB {st['db_size_mb']}MB) "
           f"| YARA 规则: {yara_scanner.rule_count} 条")
     if yara_scanner.error:
-        print(f"[NKREPO] YARA 警告: {yara_scanner.error}")
+        print(f"[NKAMG] YARA 警告: {yara_scanner.error}")
     app.run(host=scfg["host"], port=int(scfg["port"]), debug=False, threaded=True)

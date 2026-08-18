@@ -1,5 +1,5 @@
 """
-NKREPO Scanner - 文件类型识别模块 (移植自 ClamAV libclamav/filetypes.c)
+NKAMG Scanner - 文件类型识别模块 (移植自 ClamAV libclamav/filetypes.c)
 
 ClamAV 的判断机制:
   1. FTM (File Type Magic) 签名表 (filetypes_int.h, 镜像 daily.ftm):

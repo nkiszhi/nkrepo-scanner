@@ -1,5 +1,5 @@
 """
-NKREPO Scanner - 千万级合成签名生成器
+NKAMG Scanner - 千万级合成签名生成器
 用确定性随机摘要快速填充 signatures.db, 用于大规模压测。
 
 用法:

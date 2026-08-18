@@ -1,5 +1,5 @@
 """
-NKREPO Scanner - 轻量级静态恶意软件扫描核心引擎
+NKAMG Scanner - 轻量级静态恶意软件扫描核心引擎
 仅实现两类静态检测: 哈希签名 (兼容 ClamAV .hdb 格式) + YARA 规则
 
 哈希签名存储采用 "Bloom shard 驱动的动态分片" 架构, 支持千万级签名库:
@@ -386,7 +386,7 @@ class HashSignatureDB:
             self.meta.execute(
                 "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                 (str(self.shard_count),))
-        print(f"[NKREPO] 分片重排: {old_layout}({old_count}) → "
+        print(f"[NKAMG] 分片重排: {old_layout}({old_count}) → "
               f"modulo({self.shard_count}), {total:,} 条, "
               f"耗时 {time.time() - t0:.1f}s (旧布局备份: {backup_dir})")
 
@@ -566,10 +566,10 @@ class HashSignatureDB:
                 except OSError:
                     pass
             skip_note = f", 跳过非 sha256 {skipped:,} 条" if skipped else ""
-            print(f"[NKREPO] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条"
+            print(f"[NKAMG] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条"
                   f"{skip_note}, 耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
         except Exception as e:
-            print(f"[NKREPO] 旧库迁移失败(将按空分片库启动): {e}")
+            print(f"[NKAMG] 旧库迁移失败(将按空分片库启动): {e}")
 
     # ---------- Bloom (按分片懒加载) ----------
     @staticmethod
@@ -697,7 +697,7 @@ class HashSignatureDB:
         if basename not in self.source_files:
             self.source_files.append(basename)
         if skipped:
-            print(f"[NKREPO] 导入 {basename}: 跳过 {skipped:,} 条非 SHA256 签名"
+            print(f"[NKAMG] 导入 {basename}: 跳过 {skipped:,} 条非 SHA256 签名"
                   f" (库 v3 起仅接受 sha256 主键)")
         return inserted
 

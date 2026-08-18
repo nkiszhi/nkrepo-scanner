@@ -1,5 +1,5 @@
 /*
-    NKREPO Scanner 示例 YARA 规则集
+    NKAMG Scanner 示例 YARA 规则集
     覆盖: EICAR 测试 / 可疑脚本 / 测试标记
 */
 
@@ -57,13 +57,13 @@ rule Suspicious_Macro_AutoOpen
         1 of ($a1, $a2, $a3) and 1 of ($shell, $wscript)
 }
 
-rule NKREPO_Test_Marker
+rule NKAMG_Test_Marker
 {
     meta:
-        description = "NKREPO 测试标记文件 (用于验证 YARA 引擎)"
+        description = "NKAMG 测试标记文件 (用于验证 YARA 引擎)"
         severity = "test"
     strings:
-        $marker = "NKREPO-MALWARE-TEST-MARKER"
+        $marker = "NKAMG-MALWARE-TEST-MARKER"
     condition:
         $marker
 }

@@ -1,4 +1,4 @@
-# NKREPO Scanner
+# NKAMG Scanner
 
 轻量级静态恶意软件扫描平台（类 VirusTotal 极简版）：**上传文件 → 干净 / 报毒**。
 
@@ -376,10 +376,10 @@ print(f'Hash DB 命中: {name} ({h[:16]}...)')
 # 2) Web 层放行路径：上传普通文本 → 无检测
 python -c "import requests; r = requests.post('http://127.0.0.1:5000/scan', files={'file': ('clean.txt', b'hello')}, timeout=30); print(r.status_code, r.json()['result']['detections'])"
 
-# 3) Web 层 YARA 命中：构造含 NKREPO_Test_Marker 特征串的样本上传, 轮询至 done 应见 YARA 命中
+# 3) Web 层 YARA 命中：构造含 NKAMG_Test_Marker 特征串的样本上传, 轮询至 done 应见 YARA 命中
 python -c "
 import requests, time
-r = requests.post('http://127.0.0.1:5000/scan', files={'file': ('marker.txt', b'NKREPO-MALWARE-TEST-MARKER')}, timeout=30)
+r = requests.post('http://127.0.0.1:5000/scan', files={'file': ('marker.txt', b'NKAMG-MALWARE-TEST-MARKER')}, timeout=30)
 tid = r.json()['task_id']
 for _ in range(20):
     rr = requests.get(f'http://127.0.0.1:5000/api/task/{tid}', timeout=10).json()

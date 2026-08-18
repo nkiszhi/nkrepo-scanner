@@ -36,7 +36,7 @@ def verify(db, tag):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="nkrepo_shard_test_")
+    tmp = tempfile.mkdtemp(prefix="nkamg_shard_test_")
     db_path = os.path.join(tmp, "test.db")
     hdb = os.path.join(tmp, "in.hdb")
     write_hdb(hdb)
