@@ -3,7 +3,8 @@
 
 /* ---------- 全局状态 ---------- */
 let MAX_UPLOAD_MB = 10;   /* 上传上限 (MB), 由 /api/stats 动态同步 */
-let STATS_HASH = 0;       /* 哈希签名条数 (用于未命中提示) */
+let STATS_HASH = 0;       /* SHA256 哈希签名条数 (用于未命中提示) */
+let STATS_MD5 = 0;        /* MD5 哈希签名条数 (用于未命中提示) */
 
 /* ---------- API 认证 (与后端 api_token 联动) ---------- */
 const API_TOKEN = (() => {
@@ -253,7 +254,7 @@ function engRow(iconCls, letter, label, hits, extraHtml) {
   if (hasHits) {
     cell = hits.map(x =>
       '<div style="padding:4px 0"><div class="det-name">' + esc(x.name) +
-      (x.engine === 'Hash DB' ? '<span class="badge">SHA256</span>' : '') + '</div>' +
+      (x.engine === 'Hash DB' ? '<span class="badge">' + (x.detail && x.detail.startsWith('MD5') ? 'MD5' : 'SHA256') + '</span>' : '') + '</div>' +
       (x.detail ? '<div class="det-detail">' + esc(x.detail) + '</div>' : '') + '</div>').join('');
   } else if (extraHtml) {
     cell = '<div class="det-verdict pending">' + extraHtml + '</div>';
@@ -458,16 +459,21 @@ function pushCard(card, results, emptyHint) {
 }
 
 /* ================= 哈希查询 (VT 搜索框 / scan 最近扫描复用) ================= */
+/* 支持 32 位 hex (MD5) 与 64 位 hex (SHA256), 由后端 /api/hash/<h> 按长度路由到对应库 */
 function lookupHashCard(raw, results, emptyHint, displayName) {
   const v = (raw || '').trim().toLowerCase();
   if (!v) return;
-  if (!/^[0-9a-f]{64}$/.test(v)) {
-    pushCard(mkErrCard('无效的 SHA256', '请输入 64 位十六进制哈希（0-9 / a-f），例如：' + 'a'.repeat(64)), results, emptyHint);
+  let algo = null, label = '';
+  if (/^[0-9a-f]{32}$/.test(v)) { algo = 'md5'; label = 'MD5'; }
+  else if (/^[0-9a-f]{64}$/.test(v)) { algo = 'sha256'; label = 'SHA256'; }
+  if (!algo) {
+    pushCard(mkErrCard('无效的哈希', '请输入 32 位 (MD5) 或 64 位 (SHA256) 十六进制哈希（0-9 / a-f），例如：' +
+      'a'.repeat(32) + ' 或 ' + 'a'.repeat(64)), results, emptyHint);
     return;
   }
-  const card = mkScanCard({ name: displayName || (v + '.sha256'), size: 0 }, 'query');
+  const card = mkScanCard({ name: displayName || (v + '.' + algo), size: 0 }, 'query');
   card.querySelector('.banner-title').textContent = '正在查询签名库…';
-  card.querySelector('.banner-sub').innerHTML = 'SHA256 <b>' + v + '</b>';
+  card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b>';
   pushCard(card, results, emptyHint);
   fetch('/api/hash/' + v, { headers: authHeaders() })
     .then(r => r.json())
@@ -477,14 +483,15 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.banner').className = 'banner detected';
         card.querySelector('.banner-icon').innerHTML = ICON_X;
         card.querySelector('.banner-title').textContent = d.detections.length + ' 个引擎将此哈希标记为恶意';
-        card.querySelector('.banner-sub').innerHTML = 'SHA256 <b>' + v + '</b> · 命中签名库';
+        card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 命中签名库';
         const t = card.querySelector('.tabs'); t.style.display = 'none';
         card.querySelector('.panel-details').innerHTML =
           '<div class="det-table">' + d.detections.map(x =>
             '<div class="det-row hit" style="display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(242,85,93,.14)">' +
             '<div><div class="det-name">' + esc(x.name) + '</div>' +
             '<div class="det-detail">' + esc(x.detail || '') + '</div></div>' +
-            '<span class="engine-cell" style="flex:none"><span class="e-icon h">H</span> Hash DB</span></div>').join('') +
+            '<span class="engine-cell" style="flex:none"><span class="e-icon h">H</span> Hash DB' +
+            '<span class="badge">' + label + '</span></span></div>').join('') +
           '</div>';
         card.querySelector('.ring-wrap').style.display = '';
         setRing(card, d.detections.length, 1, 'detected');
@@ -492,11 +499,12 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.banner').className = 'banner clean';
         card.querySelector('.banner-icon').innerHTML = ICON_CHECK;
         card.querySelector('.banner-title').textContent = '未在签名库中找到此哈希';
-        card.querySelector('.banner-sub').innerHTML = 'SHA256 <b>' + v + '</b> · 该样本尚未被标记';
+        card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 该样本尚未被标记';
         const t = card.querySelector('.tabs'); t.style.display = 'none';
+        const total = label === 'MD5' ? (STATS_MD5 || 0) : (STATS_HASH || 0);
         card.querySelector('.panel-details').innerHTML =
           '<div class="det-verdict ok" style="gap:8px">' + ICON_CHECK_SM +
-          '<span>签名库（' + fmtNum(STATS_HASH || 0) + ' 条）中不存在此 SHA256，未命中任何已知恶意签名。</span></div>';
+          '<span>签名库（' + fmtNum(total) + ' 条 ' + label + '）中不存在此哈希，未命中任何已知恶意签名。</span></div>';
         card.querySelector('.ring-wrap').style.display = 'none';
       }
     })
@@ -506,13 +514,15 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
 /* ================= 统计 / 引擎状态加载 ================= */
 function loadStats(onStats) {
   fetch('/api/stats', { headers: authHeaders() }).then(r => r.json()).then(s => {
-    MAX_UPLOAD_MB = s.max_upload_mb || 10;
-    STATS_HASH = s.hash_signatures || 0;
+  MAX_UPLOAD_MB = s.max_upload_mb || 10;
+  STATS_HASH = s.hash_signatures || 0;
+  STATS_MD5 = s.md5_signatures || 0;
 
-    const maxMb = document.getElementById('maxMb'); if (maxMb) maxMb.textContent = MAX_UPLOAD_MB;
-    const hc = document.getElementById('hashCount'); if (hc) hc.textContent = fmtNum(s.hash_signatures);
-    const yc = document.getElementById('yaraCount'); if (yc) yc.textContent = s.yara_available ? fmtNum(s.yara_rules) : 'N/A';
-    const pc = document.getElementById('pkCount'); if (pc) pc.textContent = s.packer_yara_available ? fmtNum(s.packer_yara_rules) : 'N/A';
+  const maxMb = document.getElementById('maxMb'); if (maxMb) maxMb.textContent = MAX_UPLOAD_MB;
+  const hc = document.getElementById('hashCount'); if (hc) hc.textContent = fmtNum(s.hash_signatures);
+  const mc = document.getElementById('md5Count'); if (mc) mc.textContent = s.md5_available ? fmtNum(s.md5_signatures) : 'N/A';
+  const yc = document.getElementById('yaraCount'); if (yc) yc.textContent = s.yara_available ? fmtNum(s.yara_rules) : 'N/A';
+  const pc = document.getElementById('pkCount'); if (pc) pc.textContent = s.packer_yara_available ? fmtNum(s.packer_yara_rules) : 'N/A';
     const st = s.storage || {};
     const ds = document.getElementById('dbSize'); if (ds) ds.textContent = st.db_size_mb ? st.db_size_mb.toFixed(0) + ' MB' : '-';
 

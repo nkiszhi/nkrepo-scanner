@@ -88,6 +88,21 @@ hash_db = HashSignatureDB(
     bloom_fp_rate=float(bcfg["fp_rate"]),
     max_open_shards=int(hcfg["max_open_shards"]),
 )
+# 独立 MD5 分片库 (与 SHA256 库并列): 由 build_md5_db.py 构建 (signatures/md5.db.shards/),
+# 这里只读实例化; 若分片未构建则降级为 None, 不影响 sha256 功能
+md5_db = None
+_md5_base = os.path.join(SIG_DIR, "md5.db")
+if os.path.isdir(_md5_base + ".shards"):
+    md5_db = HashSignatureDB(
+        _md5_base,
+        shard_count=int(bcfg["shards"]),
+        bloom_fp_rate=float(bcfg["fp_rate"]),
+        max_open_shards=int(hcfg["max_open_shards"]),
+        hash_algo="md5",
+    )
+    print(f"[NKAMG] MD5 库就绪: {md5_db.count:,} 条")
+else:
+    print("[NKAMG] 未检测到 MD5 分片库, 跳过 (运行 build_md5_db.py 可构建)")
 yara_scanner = YaraScanner()
 
 for fname in sorted(os.listdir(SIG_DIR)):
@@ -115,7 +130,7 @@ if pk_engine.rule_count:
 for f, err in pk_engine.errors[:5]:
     print(f"[NKAMG] 壳库规则警告 [{f}]: {err}")
 
-scanner = Scanner(hash_db, yara_scanner)
+scanner = Scanner(hash_db, yara_scanner, md5_db=md5_db)
 
 # ---------- 安全加固: API 认证 / 限流 / 阶段2 资源上限 ----------
 # M1: api_token 非空则所有 API 需 Bearer/query token (401); 默认空 = 匿名本地模式
@@ -197,6 +212,8 @@ def stats():
         return auth_err
     return jsonify({
         "hash_signatures": hash_db.count,
+        "md5_signatures": md5_db.count if md5_db else 0,
+        "md5_available": md5_db is not None,
         "yara_rules": yara_scanner.rule_count,
         "yara_available": yara_scanner.rules is not None,
         "yara_error": yara_scanner.error,
@@ -204,31 +221,46 @@ def stats():
         "packer_yara_available": pk_engine.rules is not None,
         "packer_yara_error": "; ".join(f"{f}: {e}" for f, e in pk_engine.errors[:3]) or None,
         "hash_sources": hash_db.source_files,
+        "md5_sources": md5_db.source_files if md5_db else [],
         "yara_sources": yara_scanner.source_files,
         "storage": hash_db.stats(),
+        "md5_storage": md5_db.stats() if md5_db else None,
         "max_upload_mb": int(scfg["max_upload_mb"]),  # 前端据此本地预检超限, 给出明确提示
     })
 
 
-@app.route("/api/hash/<sha256>")
-def hash_lookup(sha256):
-    """SHA256 哈希查询: 校验 64 位 hex 后查询签名库, 返回是否命中及签名详情。
+@app.route("/api/hash/<hash>")
+def hash_lookup(hash):
+    """哈希查询: 32 位 hex → MD5 库, 64 位 hex → SHA256 库; 命中与否均 200, 非法 400。
 
-    VirusTotal 风格首页大搜索框的查询接口 (GET, 幂等); 命中与否均 200。
+    VirusTotal 风格首页大搜索框的查询接口 (GET, 幂等), 双库并列查询。
     """
     auth_err = _require_auth()
     if auth_err:
         return auth_err
-    h = (sha256 or "").strip().lower()
-    if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
-        return jsonify({"error": "无效的 SHA256: 需要 64 位十六进制字符串"}), 400
-    hits = list(hash_db.check(None, None, None, None, h))
-    return jsonify({
-        "sha256": h,
-        "hit": bool(hits),
-        "detections": hits,
-        "scanner": "Hash DB (sha256)",
-    })
+    h = (hash or "").strip().lower()
+    valid = all(c in "0123456789abcdef" for c in h) if h else False
+    if len(h) == 32 and valid:  # MD5
+        if md5_db is None:
+            return jsonify({"error": "MD5 库未构建: 请先运行 build_md5_db.py"}), 503
+        hits = list(md5_db.check_hash(h))
+        return jsonify({
+            "md5": h,
+            "hash_algo": "md5",
+            "hit": bool(hits),
+            "detections": hits,
+            "scanner": "Hash DB (md5)",
+        })
+    if len(h) == 64 and valid:  # SHA256
+        hits = list(hash_db.check(None, None, None, None, h))
+        return jsonify({
+            "sha256": h,
+            "hash_algo": "sha256",
+            "hit": bool(hits),
+            "detections": hits,
+            "scanner": "Hash DB (sha256)",
+        })
+    return jsonify({"error": "无效的哈希: 需要 32 位 (MD5) 或 64 位 (SHA256) 十六进制字符串"}), 400
 
 
 # 文件超过 MAX_CONTENT_LENGTH 时 Flask/Werkzeug 抛出 413 RequestEntityTooLarge,
@@ -326,7 +358,8 @@ if __name__ == "__main__":
     st = hash_db.stats()
     print(f"[NKAMG] 哈希签名: {hash_db.count:,} 条 (存储层: {st['tier']}, "
           f"分片: {st['shards']['configured']}, DB {st['db_size_mb']}MB) "
-          f"| YARA 规则: {yara_scanner.rule_count} 条")
+          f"| YARA 规则: {yara_scanner.rule_count} 条"
+          + (f" | MD5 库: {md5_db.count:,} 条" if md5_db else " | MD5 库: 未构建"))
     if yara_scanner.error:
         print(f"[NKAMG] YARA 警告: {yara_scanner.error}")
     app.run(host=scfg["host"], port=int(scfg["port"]), debug=False, threaded=True)

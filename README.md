@@ -6,20 +6,20 @@
 
 | 引擎      | 说明                         | 签名格式                                          |
 | ------- | -------------------------- | --------------------------------------------- |
-| Hash DB | 整文件 **SHA256** 比对（当前 62,587,049 条，v3 起库内仅存 SHA256 签名，MD5/SHA1 参数仅接口兼容） | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname`；导入**仅接受 64hex（SHA256）行**，32hex（md5）/ 40hex（sha1）行计数跳过 |
+| Hash DB | 整文件哈希比对，含两个**并列**库：**SHA256 库**（62,587,049 条，主键）+ **MD5 库**（540,169 条，独立并列；2026-08-18 新增）；文件扫描同时比对两者，Web 搜索框两种哈希均可查询 | 兼容 ClamAV `.hdb` / `.hsb`：`hash:size:virname`；SHA256 库导入**仅接受 64hex 行**，MD5 库（`build_md5_db.py` 构建）**仅接受 32hex 行**，其余长度计数跳过 |
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
 | 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库 + 外部 YARA 扩展规则） | 精确特征（magic/EP 字节/节名/外部规则）+ 启发特征（节熵/导入/RWX/EP 位置） |
 
 另附 **文件类型识别**（`filetype.py`，移植自 ClamAV FTM 机制），扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法。
 
-当前签名库：**62,587,049 条 SHA256 整文件哈希签名**，源自 ClamAV 官方病毒库整文件哈希（`signatures/hdb/` 下 256 个分桶 `.hdb` 文件，共 62,586,907 行且全部为 64hex sha256 签名，2026-08-17 全量导入），按 `bloom.shards = 4` 拆为 4 个分片存储（单分片约 1,560 万条，分片库合计约 4.4GB）。
+当前签名库：**62,587,049 条 SHA256 整文件哈希签名**，源自 ClamAV 官方病毒库整文件哈希（`signatures/hdb/` 下 256 个分桶 `.hdb` 文件，共 62,586,907 行且全部为 64hex sha256 签名，2026-08-17 全量导入），按 `bloom.shards = 4` 拆为 4 个分片存储（单分片约 1,560 万条，分片库合计约 4.4GB）。另有**并列的 MD5 整文件哈希库 540,169 条**（独立分片库 `signatures/md5.db.shards/`，由 `build_md5_db.py` 从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名构建，2026-08-18 新增），文件扫描与 Web 哈希查询均按哈希长度自动路由到对应库。
 
 > 历史背景：v3 迁移曾将旧库 540,357 条 md5/sha1 签名按用户决策移除、仅保留 186 条 sha256（备份见 `000X.db.pre_multi_hash.bak` / `000X.db.pre_sha256_pk.bak`）；随后全量导入官方 sha256 分桶库，检测能力恢复并超越至 6200 万+ 条。
 
 ## 静态信息与模糊哈希
 
-Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；其中**库比对仅 sha256 生效**，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤256KB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
+Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；**SHA256 比对 SHA256 库、MD5 比对并列的 MD5 库**均生效，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤256KB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
 
 | 字段          | 算法                                                             | 适用样本    | 缺失原因（Web 上悬停 `-` 可见）                |
 | ----------- | -------------------------------------------------------------- | ------- | ---------------------------------- |
@@ -133,7 +133,17 @@ ClamAV 通过 `libclamav/filetypes.c` 的 **FTM（File Type Magic）签名表**�
   另有预留列 `md5` / `sha1`（同文件其它标准哈希，暂无数据源为 NULL）
   及 fuzzy 列 `ssdeep` / `tlsh` / `sdhash` / `mvhash`（预留：需原始样本源接入后回填）。
   查询走 `sha256` 主键点查；迁移前旧库备份为 `000X.db.pre_multi_hash.bak`，切主键前备份为 `000X.db.pre_sha256_pk.bak`
-- **v3 起仅接受 SHA256 签名**：导入 `.hdb/.hsb` 时 64hex 行入库，32hex（md5）/ 40hex（sha1）行计数跳过并提示；查询只对 sha256 摘要做一次 Bloom 排除 + 主键点查（见「并发与 IO 说明」）；冷启动 0 分片加载，随查询按需打开
+- **v3 起 SHA256 库仅接受 SHA256 签名**：导入 `.hdb/.hsb` 时 64hex 行入库，32hex（md5）/ 40hex（sha1）行计数跳过并提示；查询只对 sha256 摘要做一次 Bloom 排除 + 主键点查（见「并发与 IO 说明」）；冷启动 0 分片加载，随查询按需打开
+
+### MD5 并列哈希库（2026-08-18 新增）
+
+`HashSignatureDB` 通过 `hash_algo="md5"` 参数化（规格表 `HASH_SPECS` 定义主键列/`hex_len`/`label`/`bytes`），与 SHA256 库**完全并列、独立分片 + 独立 Bloom**：
+
+- 分片目录 `signatures/md5.db.shards/`（4 分片）+ Bloom `signatures/md5.db.bloom/`，当前 **540,169 条 32hex MD5 签名**（约 30MB）
+- 由 `build_md5_db.py` 从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 `md5:size:name` 行构建（仅接受 32hex 行；与 SHA256 库不同，MD5 库导入时 64hex 行跳过）
+- 文件扫描：`Scanner` 同时持有 `hash_db`（SHA256）与 `md5_db`（MD5），阶段 1 对样本 MD5 调 `md5_db.check_hash(md5_hex)`、对 SHA256 调 `hash_db.check(...)`，两者命中合并进 `detections`（`engine` 均为 `Hash DB`，`detail` 标注 `MD5 命中:` / `SHA256 命中:`）
+- Web 哈希查询：`/api/hash/<h>` 按长度路由——32hex→MD5 库，64hex→SHA256 库，非法长度返回 400；前端搜索框与结果卡均按哈希类型动态显示 `MD5`/`SHA256` 标签
+- `app.py` 启动时检测 `signatures/md5.db.shards/` 是否存在：存在则只读实例化 `md5_db`，否则降级为 `None`（SHA256 功能不受影响）；`/api/stats` 额外返回 `md5_signatures` / `md5_available` / `md5_sources` / `md5_storage`
 - Bloom 位图与 SQLite 分片一一对应，持久化到 `signatures/signatures.db.bloom/{shard_id:04d}.bloom`，签名总数不变不重建
 - `.hdb/.hsb` 只是**导入格式**：启动时自动导入 `signatures/` **顶层**的新文件（`imported_files` 表去重，幂等）；`signatures/hdb/` 分桶子目录**不自动导入**，需按「签名库更新」章节的批量命令手动导入
 - 自动重分片：检测到旧 hex 前缀布局（16/256/4096 片）或 `bloom.shards` 变更时，启动自动按新路由重分布（实测 54 万条 hex 256 → modulo 4 迁移约 20s），旧布局备份为 `signatures.db.shards.legacy`
@@ -206,8 +216,7 @@ venv\Scripts\python app.py
 - **查询并发模型**：`HashSignatureDB.check()` 不再持全局锁 —— Bloom 位图查询期只读（无锁读），
   SQLite 分片连接用**连接级串行锁**（同一连接内串行、不同分片连接并行，并发度 = min(分片数, LRU 上限)），
   LRU 字典操作用细粒度缓存锁；被淘汰的连接延迟到 `close()` 统一关闭
-- **sha256 单次点查**：v3 起库内仅存 sha256 签名，查询只对 sha256 摘要做 1 次
-  Bloom + SQL 主键点查（md5/sha1 参数仅为接口兼容，必然未命中）
+- **sha256 / md5 单次点查**：SHA256 库只对 sha256 摘要做 1 次 Bloom + SQL 主键点查；MD5 库（参数化 `hash_algo="md5"`）对 md5 摘要做同样流程（两者并列，见上「MD5 并列哈希库」）；`scanner.check` 接口对上层透明，文件扫描自动合并两库命中
 - **Bloom 热路径**：`_positions`（blake2b 双哈希 → k 个位）带实例级 LRU 缓存（上限 4096），
   重复样本直接复用位置数组，省去重复哈希与求模
 - **内存扫描阈值**：`Scanner.INLINE_LIMIT = 64MB` —— ≤64MB 的文件一次性读入内存，
@@ -219,8 +228,9 @@ venv\Scripts\python app.py
 
 ```
 nkrepo-scanner/
-├── app.py                        # Flask Web 服务（/ 搜索首页、GET /scan 扫描页、POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<sha256> 哈希查询）
-├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
+├── app.py                        # Flask Web 服务（/ 搜索首页、GET /scan 扫描页、POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<hash> 哈希查询（32hex→MD5 库 / 64hex→SHA256 库））
+├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储[可参数化为 md5/sha256 并列库] + YaraScanner + 静态信息集成）
+├── build_md5_db.py               # 构建并列 MD5 哈希库（从 extracted/ 的 ClamAV .hdb/.hsb 提取 32hex MD5 签名 → signatures/md5.db.shards/）
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
 ├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
 ├── packer_rules/                 # 外部 YARA 扩展壳库（.yar 规则 + README.md 编写约定）
@@ -243,6 +253,8 @@ nkrepo-scanner/
 │   ├── rules.yar                 # YARA 规则集
 │   ├── signatures.db.shards/     # 动态分片 SQLite（0000.db~{N-1}.db + _meta.db，运行时生成）
 │   ├── signatures.db.bloom/      # 分片 Bloom 位图（0000.bloom~{N-1}.bloom，运行时生成）
+│   ├── md5.db.shards/            # 并列 MD5 哈希库分片（build_md5_db.py 生成，运行时加载）
+│   ├── md5.db.bloom/             # 并列 MD5 库分片 Bloom 位图
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd
@@ -263,13 +275,17 @@ curl -A "ClamAV/freshclam/1.4.2" -O https://database.clamav.net/daily.cvd
 python extract_cvd.py cvd/main.cvd cvd/daily.cvd
 
 # 3. 导入 SQLite（增量、幂等; 分片数默认取 config 的 bloom.shards=4,
-#    如需覆盖可传 shard_count=N; 注意: v3 起仅接受 64hex(SHA256) 行,
+#    如需覆盖可传 shard_count=N; 注意: v3 起 SHA256 库仅接受 64hex(SHA256) 行,
 #    官方 main/daily 库中 32hex(md5)/40hex(sha1) 行会被跳过, 仅 SHA256 实际入库)
 python -c "from scanner import HashSignatureDB; db = HashSignatureDB('signatures/signatures.db'); \
 [db.import_hdb(f) for f in ['extracted/main.main.hdb','extracted/main.main.hsb', \
 'extracted/daily.daily.hdb','extracted/daily.daily.hsb']]; db.finalize(); db.close()"
 
-# 4. 批量导入官方 sha256 分桶库（signatures/hdb/ 下 00.hdb~ff.hdb, 全为 64hex;
+# 4. 构建并列 MD5 哈希库（从 extracted/ 提取 32hex MD5 签名, 仅 MD5 行,
+#    其余长度跳过; 生成 signatures/md5.db.shards/ + signatures/md5.db.bloom/）
+python build_md5_db.py
+
+# 5. 批量导入官方 sha256 分桶库（signatures/hdb/ 下 00.hdb~ff.hdb, 全为 64hex;
 #    实测 62,586,907 行: 导入约 41min + Bloom 重建约 7min, 幂等可重复续导)
 python -c "
 import glob
@@ -280,14 +296,15 @@ for f in sorted(glob.glob('signatures/hdb/*.hdb')):
     print(f, '+', n)
 db.finalize(); db.close()"
 
-# 5. 重启服务生效
+# 6. 重启服务生效
 ```
 
 CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺带提取 `.mdb/.ndb/.ldb` 等其它类型签名（留在 `extracted/`，约 280MB），本平台暂不使用，可作为日后扩展字节级检测的数据源。
 
 ### 日常扩充
 
-- **哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中非 64hex 行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
+- **SHA256 哈希**：往 `signatures/*.hdb` 追加 `hash:size:name` 行（size 为 `*` 时通配大小），或放入任何 ClamAV 格式 `.hdb/.hsb` 文件，重启自动导入。**仅接受 64hex（SHA256）行**——32hex（md5）/ 40hex（sha1）行会被跳过并计数提示（如示例库 `hashes.hdb` 中非 64hex 行即为此类，仅 SHA256 行生效）；大规模分桶文件（如 `signatures/hdb/`）用上文批量命令导入
+- **MD5 哈希（并列库）**：MD5 库不通过启动自动导入构建，而是运行 `python build_md5_db.py`（从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名，仅 MD5 行入库）；构建后重启即自动加载 `signatures/md5.db.shards/`
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
 - **壳库（查壳扩展）**：往 `packer_rules/` 添加 `.yar` 规则（meta 声明 `packer` 壳族，约定见上文），重启生效——命中即作为查壳精确特征，**不进入报毒判定**
 
@@ -307,12 +324,12 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 | 接口           | 方法   | 说明                                                                                                 |
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
-| `/`          | GET  | Web 界面（搜索首页：SHA256 哈希查询 + 拖拽上传 + 统计；页面本身无需认证，数据接口受保护）                             |
+| `/`          | GET  | Web 界面（搜索首页：MD5/SHA256 哈希查询 + 拖拽上传 + 统计；页面本身无需认证，数据接口受保护）                             |
 | `/scan`      | GET  | Web 界面（VirusTotal 风格扫描页：FILE/URL/搜索选项条 + 大上传区 + 最近扫描历史，结果渲染与首页共用 `static/app.js`） |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时；**v3 起 Hash DB 仅按 sha256 点查**，md5/sha1 字段为计算展示值、不参与库比对）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 含 Hash DB 命中（SHA256 库 + 并列 MD5 库均参与比对）、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
-| `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
-| `/api/hash/<sha256>` | GET | SHA256 哈希查询（VirusTotal 风格首页搜索框）：校验 64 位 hex，命中与否均 200；返回 `{sha256, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情；非 64 位 hex 返回 400 |
+| `/api/stats` | GET  | 签名统计：`hash_signatures`（SHA256 哈希条数）、`md5_signatures`/`md5_available`/`md5_sources`/`md5_storage`（并列 MD5 库）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
+| `/api/hash/<hash>` | GET | 哈希查询（VirusTotal 风格首页搜索框）：**32 位 hex → MD5 库，64 位 hex → SHA256 库**，命中与否均 200；返回 `{md5\|sha256, hash_algo, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情；非 32/64 位 hex 返回 400 |
 
 ## 安全
 
@@ -351,8 +368,9 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 | 检查项 | 结果 |
 | ------ | ---- |
-| `GET /` 首页 / `GET /api/stats`（hash_signatures=62,587,049） | PASS |
-| 库级 Hash DB 命中：从分片库读真实签名 → `db.check(sha256)` 命中（测试约定：**不使用 EICAR 文件**） | PASS |
+| `GET /` 首页 / `GET /api/stats`（hash_signatures=62,587,049，md5_signatures=540,169） | PASS |
+| 库级 Hash DB 命中：从分片库读真实签名 → `db.check(sha256)` / `md5_db.check_hash(md5)` 命中（测试约定：**不使用 EICAR 文件**） | PASS |
+| `/api/hash/<h>` 双库路由：32hex→MD5 库命中（库内真实 MD5 签名）/ 未命中均 200；64hex→SHA256 库命中 200；非 32/64hex 返回 400 | PASS（2026-08-18 实测） |
 | `/scan` 上传普通文本 → 无检测 | PASS |
 | `/scan` 上传 MZ+UPX 伪样本 → 200 + 文件类型识别 | PASS |
 | 两段式：`/api/task/<id>` 轮询至 `status=done`，`result` 合并 `static_info`（ssdeep/tlsh/packer/pe）与 `verdict` | PASS |
@@ -371,6 +389,18 @@ h, size, name = conn.execute('SELECT hex(sha256), size, name FROM sigs LIMIT 1')
 hits = db.check('', size, '0'*32, '0'*40, h)
 assert any(x['name'] == name for x in hits), f'应命中 {name}'
 print(f'Hash DB 命中: {name} ({h[:16]}...)')
+"
+
+# 1b) 并列 MD5 库命中：从 md5.db 分片读取一条真实 32hex MD5 签名并断言命中
+python -c "
+import sqlite3
+from scanner import HashSignatureDB
+md5_db = HashSignatureDB('signatures/md5.db', hash_algo='md5')
+conn = sqlite3.connect('file:signatures/md5.db.shards/0000.db?mode=ro', uri=True)
+m, size, name = conn.execute('SELECT hex(md5), size, name FROM sigs LIMIT 1').fetchone()
+hits = md5_db.check_hash(m)
+assert any(x['name'] == name for x in hits), f'应命中 {name}'
+print(f'MD5 库命中: {name} ({m[:16]}...)')
 "
 
 # 2) Web 层放行路径：上传普通文本 → 无检测

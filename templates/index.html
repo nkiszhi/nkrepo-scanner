@@ -37,7 +37,7 @@
   <!-- ================= Hero: 搜索 + 上传 ================= -->
   <section class="hero" id="scan">
     <h1>扫描文件以检测<span class="grad">恶意软件</span></h1>
-    <div class="hero-sub">本地静态扫描 · 哈希签名库（ClamAV HDB）+ YARA 规则 + PE 静态分析</div>
+    <div class="hero-sub">本地静态扫描 · 哈希签名库（ClamAV HDB·MD5/SHA256 并列）+ YARA 规则 + PE 静态分析</div>
 
     <div class="search-box">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#8a94a6" stroke-width="2" stroke-linecap="round">
@@ -45,10 +45,10 @@
         <line x1="16.5" y1="16.5" x2="21" y2="21"/>
       </svg>
       <input id="hashInput" type="text" spellcheck="false"
-             placeholder="输入 SHA256 哈希查询签名库（64 位十六进制），或下方拖拽文件扫描…">
+             placeholder="输入哈希查询签名库（MD5 32 位 / SHA256 64 位十六进制），或下方拖拽文件扫描…">
       <button id="lookupBtn">查询</button>
     </div>
-    <div class="search-hint">支持粘贴 VirusTotal / ClamAV 等场景的 SHA256 哈希，快速判断该样本是否已在签名库中</div>
+    <div class="search-hint">支持粘贴 VirusTotal / ClamAV 等场景的 MD5 或 SHA256 哈希，快速判断该样本是否已在签名库中</div>
 
     <div class="upload-wrap">
       <div class="dropzone" id="dz">
@@ -67,7 +67,8 @@
 
   <!-- ================= 统计 ================= -->
   <section class="stats" id="stats">
-    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名（SHA256 主键）</div></div>
+    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名（SHA256）</div></div>
+    <div class="stat"><div class="num" id="md5Count">-</div><div class="lbl">哈希签名（MD5）</div></div>
     <div class="stat"><div class="num" id="yaraCount">-</div><div class="lbl">YARA 规则</div></div>
     <div class="stat"><div class="num" id="pkCount">-</div><div class="lbl">壳库扩展规则</div></div>
     <div class="stat"><div class="num" id="dbSize">-</div><div class="lbl">签名库存储</div></div>

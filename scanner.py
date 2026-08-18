@@ -37,6 +37,14 @@ CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
 VALID_HASH_LENGTHS = {32: "md5", 40: "sha1", 64: "sha256"}
 HASH_ALGO_BY_BYTES = {16: "MD5", 20: "SHA1", 32: "SHA256"}
 
+# 哈希算法规格表: HashSignatureDB 按 hash_algo 参数化 (md5/sha256 两个独立并列库)
+#   hex_len  = 十六进制长度, bytes = 摘要字节数, col = 主键列名, label = 显示名
+HASH_SPECS = {
+    "md5":    {"hex_len": 32, "bytes": 16, "col": "md5",    "label": "MD5"},
+    "sha1":   {"hex_len": 40, "bytes": 20, "col": "sha1",   "label": "SHA1"},
+    "sha256": {"hex_len": 64, "bytes": 32, "col": "sha256", "label": "SHA256"},
+}
+
 # sigs 表 sha256 主键结构 (v3):
 #   sha256 BLOB PRIMARY KEY       唯一主键, 库内仅存 SHA256 签名 (32B)
 #   size/name TEXT                签名元数据
@@ -199,7 +207,15 @@ class HashSignatureDB:
     HEX_COUNTS = {1: 16, 2: 256, 3: 4096}  # hex 前缀长度 → 分片数 (旧布局)
 
     def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
-                 max_open_shards=4):
+                 max_open_shards=4, hash_algo="sha256"):
+        if hash_algo not in HASH_SPECS:
+            raise ValueError(f"不支持的哈希算法: {hash_algo} (可选: {list(HASH_SPECS)})")
+        self.hash_algo = hash_algo
+        _spec = HASH_SPECS[hash_algo]
+        self.pk_col = _spec["col"]          # 主键列名 (md5 / sha256)
+        self.pk_hex_len = _spec["hex_len"]  # 主键十六进制长度 (32 / 64)
+        self.pk_bytes = _spec["bytes"]      # 主键摘要字节数 (16 / 32)
+        self.hash_label = _spec["label"]    # 显示名 (MD5 / SHA256)
         self.shard_count = max(1, int(shard_count))
         self.db_path = db_path
         self.shard_dir = db_path + ".shards"
@@ -207,6 +223,20 @@ class HashSignatureDB:
         self.bloom_dir = db_path + ".bloom"   # 分片 Bloom 位图目录
         self.bloom_fp_rate = bloom_fp_rate
         self.max_open_shards = max(4, max_open_shards)
+        # 主键结构: sha256 库保留 v3 九列 (含预留 md5/sha1/fuzzy 列, 历史结构不破坏);
+        # md5 独立并列库用三列精简结构 (主键即 md5, 与 SHA256 库互不干扰)
+        if hash_algo == "sha256":
+            self._ddl = SIGS_DDL
+            self._insert_sql = SIGS_INSERT
+        else:
+            self._ddl = (
+                f"CREATE TABLE IF NOT EXISTS sigs({self.pk_col} BLOB PRIMARY KEY,"
+                " size INTEGER, name TEXT) WITHOUT ROWID"
+            )
+            self._insert_sql = (
+                f"INSERT OR IGNORE INTO sigs({self.pk_col},size,name)"
+                " VALUES(?,?,?)"
+            )
         self._lock = threading.RLock()       # 写路径互斥 (import_hdb / finalize / close)
         self._cache_lock = threading.Lock()  # _conns/_blooms 字典 LRU 操作的细粒度锁
         self._retired = []                   # LRU 淘汰的连接, 延迟到 close() 统一关闭
@@ -240,6 +270,16 @@ class HashSignatureDB:
             r[0] for r in self.meta.execute("SELECT name FROM imported_files")
         ]
         self._scan_bloom()
+
+    # ---------- 行映射 (按 hash_algo) ----------
+    def _row_for_insert(self, digest, size, name):
+        """把 (digest,size,name) 映射为本库插入行; sha256 库为 v3 九列, md5 库为三列"""
+        if self.hash_algo == "sha256":
+            return _sigs_row(digest, size, name)  # 9 列 (含预留列)
+        if len(digest) != self.pk_bytes:
+            raise ValueError(
+                f"仅支持 {self.hash_label} 签名 ({self.pk_bytes}B), 收到 {len(digest)}B")
+        return (digest, size, name)              # 3 列独立结构
 
     # ---------- 路由与命名 ----------
     @staticmethod
@@ -333,8 +373,10 @@ class HashSignatureDB:
             pending = {}
             try:
                 cur = src_conn.execute(
-                    "SELECT sha256,size,name,md5,sha1,"
-                    "ssdeep,tlsh,sdhash,mvhash FROM sigs")
+                    "SELECT " + ("sha256,size,name,md5,sha1,"
+                                 "ssdeep,tlsh,sdhash,mvhash" if self.hash_algo == "sha256"
+                                 else f"{self.pk_col},size,name")
+                    + " FROM sigs")
                 while True:
                     rows = cur.fetchmany(50_000)
                     if not rows:
@@ -348,8 +390,8 @@ class HashSignatureDB:
             for sid, rows in pending.items():
                 shard = self._open_rw(
                     os.path.join(new_dir, self._shard_name(sid) + ".db"))
-                shard.execute(SIGS_DDL)
-                shard.executemany(SIGS_INSERT, rows)
+                shard.execute(self._ddl)
+                shard.executemany(self._insert_sql, rows)
                 shard.commit()
                 shard.close()
                 total += len(rows)
@@ -508,7 +550,7 @@ class HashSignatureDB:
                     break
                 for h, size, name in rows:
                     try:
-                        row9 = _sigs_row(h, size, name)  # 映射为 v3 9 列 (仅 sha256)
+                        row9 = self._row_for_insert(h, size, name)  # 按本库主键映射
                     except ValueError:
                         skipped += 1
                         continue
@@ -524,10 +566,10 @@ class HashSignatureDB:
             count_updates = []
             for sid, rows in pending.items():
                 shard = self._open_rw(self._shard_path(sid))
-                shard.execute(SIGS_DDL)
+                shard.execute(self._ddl)
                 before = shard.total_changes
                 for i in range(0, len(rows), 50_000):
-                    shard.executemany(SIGS_INSERT, rows[i:i + 50_000])
+                    shard.executemany(self._insert_sql, rows[i:i + 50_000])
                 shard.commit()
                 inserted = shard.total_changes - before
                 cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
@@ -556,16 +598,18 @@ class HashSignatureDB:
                     "INSERT OR REPLACE INTO meta(k,v) VALUES('shard_count',?)",
                     (str(self.shard_count),))
                 self.meta.execute(
-                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version','3')")
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version',?)",
+                    ("3" if self.hash_algo == "sha256" else "1",))
                 self.meta.execute(
-                    "INSERT OR REPLACE INTO meta(k,v) VALUES('primary_key','sha256')")
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('primary_key',?)",
+                    (self.pk_col,))
             os.replace(legacy_path, legacy_path + ".migrated")
             for suffix in ("-wal", "-shm"):
                 try:
                     os.remove(legacy_path + suffix)
                 except OSError:
                     pass
-            skip_note = f", 跳过非 sha256 {skipped:,} 条" if skipped else ""
+            skip_note = (f", 跳过非 {self.hash_label} {skipped:,} 条" if skipped else "")
             print(f"[NKAMG] 旧单库已迁移至 {self.shard_count} 分片: {total:,} 条"
                   f"{skip_note}, 耗时 {time.time() - t0:.1f}s (备份: {legacy_path}.migrated)")
         except Exception as e:
@@ -635,10 +679,14 @@ class HashSignatureDB:
 
     # ---------- 导入 ----------
     def import_hdb(self, filepath, batch=50_000):
-        """导入 .hdb/.hsb 明文签名文件 (增量, 幂等), 返回新插入条数"""
+        """导入 .hdb/.hsb 明文签名文件 (增量, 幂等), 返回新插入条数
+
+        仅接受与本库主键等长的哈希行 (sha256 库收 64hex, md5 库收 32hex),
+        其它合法长度 (32/40/64hex) 计数跳过。
+        """
         basename = os.path.basename(filepath)
         pending = {}  # shard_id -> [(digest, size, name)]
-        skipped = 0   # 非 sha256 的合法哈希行 (库 v3 起仅接受 sha256 主键)
+        skipped = 0   # 非本库长度的合法哈希行
         start = time.time()
         with self._lock:
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
@@ -650,9 +698,9 @@ class HashSignatureDB:
                     if len(parts) < 3:
                         continue
                     h = parts[0].strip().lower()
-                    if len(h) == 64:
+                    if len(h) == self.pk_hex_len:
                         pass
-                    elif len(h) in VALID_HASH_LENGTHS:  # 32=md5 / 40=sha1: 计数跳过
+                    elif len(h) in VALID_HASH_LENGTHS:  # 其它长度 (md5/sha1/sha256): 计数跳过
                         skipped += 1
                         continue
                     else:
@@ -664,19 +712,19 @@ class HashSignatureDB:
                     size_field = parts[1].strip()
                     size = None if size_field == "*" else int(size_field)
                     name = parts[2].strip()
-                    # 仅 sha256 签名入库 (v3 主键), 按摘要前缀路由分片
+                    # 仅本库主键长度的签名入库, 按摘要前缀路由分片
                     pending.setdefault(
                         self._route(digest, self.shard_count), []
-                    ).append(_sigs_row(digest, size, name))
+                    ).append(self._row_for_insert(digest, size, name))
             inserted = 0
             count_updates = []
             dirty = set()
             for sid, rows in pending.items():
                 shard = self._open_rw(self._shard_path(sid))
-                shard.execute(SIGS_DDL)
+                shard.execute(self._ddl)
                 before = shard.total_changes
                 for i in range(0, len(rows), batch):
-                    shard.executemany(SIGS_INSERT, rows[i:i + batch])
+                    shard.executemany(self._insert_sql, rows[i:i + batch])
                 shard.commit()
                 delta = shard.total_changes - before
                 cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
@@ -697,8 +745,8 @@ class HashSignatureDB:
         if basename not in self.source_files:
             self.source_files.append(basename)
         if skipped:
-            print(f"[NKAMG] 导入 {basename}: 跳过 {skipped:,} 条非 SHA256 签名"
-                  f" (库 v3 起仅接受 sha256 主键)")
+            print(f"[NKAMG] 导入 {basename}: 跳过 {skipped:,} 条非 {self.hash_label} 签名"
+                  f" (本库主键为 {self.hash_label})")
         return inserted
 
     # 旧接口兼容
@@ -728,7 +776,8 @@ class HashSignatureDB:
                         if cnt == 0:
                             continue
                         bf = BloomFilter(cnt, self.bloom_fp_rate)
-                        cur = conn.execute("SELECT sha256 FROM sigs")
+                        cur = conn.execute(
+                            f"SELECT {self.pk_col} FROM sigs")
                         while True:
                             rows = cur.fetchmany(100_000)
                             if not rows:
@@ -748,6 +797,40 @@ class HashSignatureDB:
     @property
     def count(self):
         return self._count
+
+    def check_hash(self, hash_hex, file_size=None):
+        """按本库主键哈希十六进制查询 (md5 库收 32hex, sha256 库收 64hex)。
+
+        Bloom 排除短路 + 单分片 SQLite 点查; file_size=None 时跳过大小校验
+        (哈希查询场景调用方只有哈希没有文件)。返回命中列表, 结构与 check 一致。
+        """
+        hits = []
+        if not hash_hex or len(hash_hex) != self.pk_hex_len:
+            return hits
+        try:
+            digest = bytes.fromhex(hash_hex)
+        except ValueError:
+            return hits
+        shard_id = self._route(digest, self.shard_count)
+        bf = self._load_bloom_shard(shard_id)
+        if bf is not None and digest not in bf:
+            return hits
+        row = self._query_shard(
+            shard_id, f"SELECT size, name FROM sigs WHERE {self.pk_col}=?", (digest,)
+        )
+        if row is None:
+            return hits
+        sig_size, name = row
+        if file_size is not None and sig_size is not None and sig_size != file_size:
+            return hits
+        hits.append({
+            "engine": "Hash DB",
+            "type": "hash",
+            "name": name,
+            "size": sig_size,
+            "detail": f"{self.hash_label} 命中: {hash_hex}",
+        })
+        return hits
 
     def check(self, file_path, file_size, md5, sha1, sha256):
         """检查文件哈希是否命中签名, 返回命中列表 (接口与旧版一致)
@@ -958,9 +1041,10 @@ class Scanner:
     # 一次性读入内存的上限: 超过则退回分块+路径扫描, 防大文件占满内存
     INLINE_LIMIT = 64 * 1024 * 1024
 
-    def __init__(self, hash_db, yara_scanner):
+    def __init__(self, hash_db, yara_scanner, md5_db=None):
         self.hash_db = hash_db
         self.yara_scanner = yara_scanner
+        self.md5_db = md5_db  # 独立 MD5 分片库 (可选); 命中并入 detections
 
     def scan_file(self, file_path, filename=None):
         """扫描单个文件 (兼容接口)。
@@ -1023,6 +1107,8 @@ class Scanner:
             pass
 
         detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
+        if self.md5_db is not None:
+            detections.extend(self.md5_db.check_hash(md5, file_size))
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
             "filename": filename or "unnamed",
@@ -1104,6 +1190,8 @@ class Scanner:
 
         detections = []
         detections.extend(self.hash_db.check(file_path, file_size, md5, sha1, sha256))
+        if self.md5_db is not None:
+            detections.extend(self.md5_db.check_hash(md5, file_size))
         detections.extend(self.yara_scanner.scan(file_path))
 
         # 大文件路径: 不计算模糊哈希/静态信息 (避免超大文件纯 Python 计算失控)
