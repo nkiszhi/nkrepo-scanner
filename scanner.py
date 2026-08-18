@@ -47,30 +47,26 @@ HASH_SPECS = {
 
 # sigs 表 sha256 主键结构 (v3):
 #   sha256 BLOB PRIMARY KEY       唯一主键, 库内仅存 SHA256 签名 (32B)
-#   size/name TEXT                签名元数据
-#   md5/sha1 BLOB                 同文件其它标准哈希列 (无数据源时 NULL, 预留)
-#   ssdeep/tlsh/sdhash/mvhash TEXT  4 个 fuzzy hash 列 (暂无数据源, 预留)
-SIGS_COLS = "sha256,size,name,md5,sha1,ssdeep,tlsh,sdhash,mvhash"
+#   size/name                    签名元数据
+#   md5 BLOB                     同文件 MD5 (无数据源时 NULL, 预留; 保留以兼容查询)
+SIGS_COLS = "sha256,size,name,md5"
 SIGS_DDL = (
     "CREATE TABLE IF NOT EXISTS sigs("
     " sha256 BLOB PRIMARY KEY,"
     " size INTEGER, name TEXT,"
-    " md5 BLOB, sha1 BLOB,"
-    " ssdeep TEXT, tlsh TEXT, sdhash TEXT, mvhash TEXT) WITHOUT ROWID"
+    " md5 BLOB) WITHOUT ROWID"
 )
 SIGS_INSERT = (
     "INSERT OR IGNORE INTO sigs(" + SIGS_COLS + ")"
-    " VALUES(?,?,?,?,?,?,?,?,?)"
+    " VALUES(?,?,?,?)"
 )
 
 # 字节长度 -> 哈希类型; v3 起库内仅接受 SHA256 (32B)
 def _sigs_row(sha256_digest, size, name):
-    """把 (sha256_digest,size,name) 映射为 9 列新结构行; 非 32B 抛 ValueError"""
+    """把 (sha256_digest,size,name) 映射为 4 列新结构行; 非 32B 抛 ValueError"""
     if len(sha256_digest) != 32:
         raise ValueError(f"仅支持 SHA256 签名 (32B), 收到 {len(sha256_digest)}B")
-    return (sha256_digest, size, name,
-            None, None,        # md5 / sha1 (预留)
-            None, None, None, None)  # ssdeep/tlsh/sdhash/mvhash (预留)
+    return (sha256_digest, size, name, None)  # md5 (预留, NULL)
 
 
 def compute_hashes(file_path):
@@ -223,8 +219,9 @@ class HashSignatureDB:
         self.bloom_dir = db_path + ".bloom"   # 分片 Bloom 位图目录
         self.bloom_fp_rate = bloom_fp_rate
         self.max_open_shards = max(4, max_open_shards)
-        # 主键结构: sha256 库保留 v3 九列 (含预留 md5/sha1/fuzzy 列, 历史结构不破坏);
-        # md5 独立并列库用三列精简结构 (主键即 md5, 与 SHA256 库互不干扰)
+        # 主键结构: sha256 库用四列精简结构 (sha256 主键 + size/name + 预留 md5);
+        # 与 md5 独立并列库 (md5/size/name 三列) 互不干扰;
+        # sha1/ssdeep/tlsh/sdhash/mvhash 等预留 fuzzy 列已废弃移除
         if hash_algo == "sha256":
             self._ddl = SIGS_DDL
             self._insert_sql = SIGS_INSERT
@@ -273,9 +270,9 @@ class HashSignatureDB:
 
     # ---------- 行映射 (按 hash_algo) ----------
     def _row_for_insert(self, digest, size, name):
-        """把 (digest,size,name) 映射为本库插入行; sha256 库为 v3 九列, md5 库为三列"""
+        """把 (digest,size,name) 映射为本库插入行; sha256 库为四列, md5 库为三列"""
         if self.hash_algo == "sha256":
-            return _sigs_row(digest, size, name)  # 9 列 (含预留列)
+            return _sigs_row(digest, size, name)  # 4 列 (含预留 md5)
         if len(digest) != self.pk_bytes:
             raise ValueError(
                 f"仅支持 {self.hash_label} 签名 ({self.pk_bytes}B), 收到 {len(digest)}B")
@@ -373,15 +370,15 @@ class HashSignatureDB:
             pending = {}
             try:
                 cur = src_conn.execute(
-                    "SELECT " + ("sha256,size,name,md5,sha1,"
-                                 "ssdeep,tlsh,sdhash,mvhash" if self.hash_algo == "sha256"
+                    "SELECT " + ("sha256,size,name,md5"
+                                 if self.hash_algo == "sha256"
                                  else f"{self.pk_col},size,name")
                     + " FROM sigs")
                 while True:
                     rows = cur.fetchmany(50_000)
                     if not rows:
                         break
-                    for row in rows:  # 9 列整行透传 (结构已在迁移时统一为 v3)
+                    for row in rows:  # 4 列整行透传 (sha256: sha256,size,name,md5)
                         sid = self._route(row[0], self.shard_count)
                         pending.setdefault(sid, []).append(row)
             except sqlite3.Error:
