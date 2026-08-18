@@ -219,7 +219,7 @@ venv\Scripts\python app.py
 
 ```
 nkrepo-scanner/
-├── app.py                        # Flask Web 服务（/、/scan 两段式、/api/task/<id> 轮询、/api/stats）
+├── app.py                        # Flask Web 服务（/、/scan 两段式、/api/task/<id> 轮询、/api/stats、/api/hash/<sha256> 哈希查询）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储 + YaraScanner + 静态信息集成）
 ├── staticinfo.py                 # 静态信息与模糊哈希（ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测）
 ├── packer.py                     # 壳/保护器识别（精确特征 DIE+PEiD+外部YARA规则 + 启发特征融合判定）
@@ -306,6 +306,7 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 仅含 Hash DB 命中、`elapsed_ms` 为阶段 1 耗时；**v3 起 Hash DB 仅按 sha256 点查**，md5/sha1 字段为计算展示值、不参与库比对）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（哈希条数）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
+| `/api/hash/<sha256>` | GET | SHA256 哈希查询（VirusTotal 风格首页搜索框）：校验 64 位 hex，命中与否均 200；返回 `{sha256, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情；非 64 位 hex 返回 400 |
 
 ## 安全
 

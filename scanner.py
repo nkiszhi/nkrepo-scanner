@@ -777,12 +777,15 @@ class HashSignatureDB:
         if row is None:
             return hits
         sig_size, name = row
-        if sig_size is not None and sig_size != file_size:
-            return hits  # 大小不符, 视为未命中 (降低碰撞误报)
+        # 大小校验 (降低碰撞误报): 仅当调用方提供了 file_size 时比对;
+        # file_size=None (如 /api/hash/ 哈希查询, 调用方只有哈希没有文件) 跳过该校验
+        if file_size is not None and sig_size is not None and sig_size != file_size:
+            return hits
         hits.append({
             "engine": "Hash DB",
             "type": "hash",
             "name": name,
+            "size": sig_size,
             "detail": f"SHA256 命中: {sha256}",
         })
         return hits

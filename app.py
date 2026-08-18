@@ -204,6 +204,27 @@ def stats():
     })
 
 
+@app.route("/api/hash/<sha256>")
+def hash_lookup(sha256):
+    """SHA256 哈希查询: 校验 64 位 hex 后查询签名库, 返回是否命中及签名详情。
+
+    VirusTotal 风格首页大搜索框的查询接口 (GET, 幂等); 命中与否均 200。
+    """
+    auth_err = _require_auth()
+    if auth_err:
+        return auth_err
+    h = (sha256 or "").strip().lower()
+    if len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+        return jsonify({"error": "无效的 SHA256: 需要 64 位十六进制字符串"}), 400
+    hits = list(hash_db.check(None, None, None, None, h))
+    return jsonify({
+        "sha256": h,
+        "hit": bool(hits),
+        "detections": hits,
+        "scanner": "Hash DB (sha256)",
+    })
+
+
 # 文件超过 MAX_CONTENT_LENGTH 时 Flask/Werkzeug 抛出 413 RequestEntityTooLarge,
 # 默认返回 HTML 错误页 (前端 JSON 解析失败 → 模糊 ERROR)。统一返回明确 JSON 提示。
 @app.errorhandler(RequestEntityTooLarge)
