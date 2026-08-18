@@ -219,6 +219,45 @@ function renderRecent() {
 /* 引擎状态 */
 loadStats();
 renderRecent();
+
+/* ================= 首页跳转接管: ?task=id1,id2 渲染扫描任务; ?err= 显示错误 ================= */
+function handleUrlParams() {
+  const q = new URLSearchParams(location.search);
+  const err = q.get('err');
+  const taskParam = q.get('task');
+  const scrollToResults = () => {
+    const y = results.getBoundingClientRect().top + window.scrollY - 90;
+    window.scrollTo({ top: Math.max(0, y), behavior: 'smooth' });
+  };
+
+  if (err) {
+    pushCard(mkErrCard('扫描未开始', err), results, emptyHint);
+    history.replaceState({}, '', '/scan');
+    scrollToResults();
+    return;
+  }
+  if (taskParam) {
+    const ids = taskParam.split(',').filter(Boolean);
+    const single = ids.length === 1;
+    const name = single ? (q.get('name') || undefined) : undefined;
+    const size = single ? (Number(q.get('size')) || 0) : 0;
+    ids.forEach(tid => {
+      followTask(tid, single ? name : undefined, single ? size : 0, results, emptyHint, (card, d) => {
+        /* 完成/失败后: 写入最近扫描历史 + 清理 URL 参数 (刷新不再重复轮询) */
+        if (d) addRecent({
+          name: d.filename,
+          size: d.size,
+          ts: Date.now(),
+          verdict: d.clean ? 'clean' : 'detected',
+          sha256: d.sha256
+        });
+        history.replaceState({}, '', '/scan');
+      });
+    });
+    scrollToResults();
+  }
+}
+handleUrlParams();
 </script>
 </body>
 </html>

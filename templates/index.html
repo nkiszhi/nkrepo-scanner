@@ -73,8 +73,8 @@
     <div class="stat"><div class="num" id="dbSize">-</div><div class="lbl">签名库存储</div></div>
   </section>
 
-  <!-- ================= 结果区 ================= -->
-  <div class="results-empty" id="emptyHint">扫描结果将显示在这里</div>
+  <!-- ================= 结果区 (哈希查询结果展示; 文件扫描结果在扫描页) ================= -->
+  <div class="results-empty" id="emptyHint">哈希查询结果将显示在这里 · 提交文件后将自动跳转到扫描页查看扫描结果</div>
   <section class="results" id="results"></section>
 
   <footer>
@@ -91,15 +91,58 @@ const fi = document.getElementById('fi');
 const results = document.getElementById('results');
 const emptyHint = document.getElementById('emptyHint');
 
-/* 上传事件 */
+/* 上传事件: 首页不展示扫描结果, 提交后自动跳转到 /scan 显示扫描结果 */
+function goScanErr(msg) { location.href = '/scan?err=' + encodeURIComponent(msg); }
+
+function uploadThenGo(files) {
+  const arr = [...files];
+  if (!arr.length) return;
+  const limit = MAX_UPLOAD_MB * 1024 * 1024;
+  for (const f of arr) {
+    if (f.size > limit) {
+      goScanErr('文件过大: "' + f.name + '" 为 ' + fmtSize(f.size) +
+        ', 超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试');
+      return;
+    }
+  }
+  const tasks = [];
+  let pending = arr.length;
+  arr.forEach(f => {
+    const fd = new FormData();
+    fd.append('file', f);
+    fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
+      .then(r => r.json()
+        .then(d => ({ ok: r.ok, status: r.status, d }))
+        .catch(() => ({ ok: false, status: r.status, d: null })))
+      .then(({ ok, status, d }) => {
+        if (!ok) {
+          goScanErr(status === 413
+            ? '文件超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试'
+            : ((d && d.error) || ('请求失败 (HTTP ' + status + '), 请稍后重试')));
+          return;
+        }
+        if (d.error) { goScanErr(d.error); return; }
+        tasks.push(d.task_id);
+        if (--pending === 0) {
+          const params = 'task=' + tasks.join(',') +
+            (tasks.length === 1
+              ? '&name=' + encodeURIComponent(arr[0].name) + '&size=' + arr[0].size
+              : '');
+          location.href = '/scan?' + params;
+        }
+      })
+      .catch(e => goScanErr('网络错误: ' + e.message));
+  });
+}
+
 dz.addEventListener('click', () => fi.click());
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
 dz.addEventListener('dragleave', () => dz.classList.remove('over'));
 dz.addEventListener('drop', e => {
   e.preventDefault(); dz.classList.remove('over');
-  [...e.dataTransfer.files].forEach(f => upload(f, results, emptyHint));
+  uploadThenGo(e.dataTransfer.files);
 });
-fi.addEventListener('change', () => { [...fi.files].forEach(f => upload(f, results, emptyHint)); fi.value = ''; });
+fi.addEventListener('change', () => { uploadThenGo(fi.files); fi.value = ''; });
 
 /* 哈希搜索 (VT 大搜索框) */
 const hashInput = document.getElementById('hashInput');

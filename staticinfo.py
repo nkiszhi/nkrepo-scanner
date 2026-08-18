@@ -32,7 +32,16 @@ except ImportError:  # pragma: no cover
     SSDEEP_AVAILABLE = False
 
 # 模糊哈希输入上限: 纯 Python 实现逐字节处理, 超大文件耗时失控
-FUZZY_MAX_BYTES = 8 * 1024 * 1024
+# 模糊哈希(ssdeep/tlsh)计算上限: 纯 Python 实现, 耗时随输入近线性增长
+# (实测: 256KB≈1.4s / 512KB≈7.4s / 1MB≈24s / 3MB≈73s), 过大样本全文件逐字节
+# 分析会阻塞 Web 阶段2 后台线程, 故收紧至 256KB; 超过仅跳过模糊哈希, PE/壳等
+# 快速分析不受影响
+FUZZY_MAX_BYTES = 256 * 1024
+
+
+def _fmt_size_kb(n):
+    """把字节数格式化为 KB/MB 文案 (用于 notes 提示)"""
+    return f"{n // 1024}KB" if n < 1024 * 1024 else f"{n // (1024 * 1024)}MB"
 
 # 低于该长度 ssdeep 无意义 (官方 fuzzy_hash_buf 对极短输入返回空)
 SSDEEP_MIN_BYTES = 32
@@ -193,7 +202,7 @@ def compute_static_info(data):
     }
 
     if len(data) > FUZZY_MAX_BYTES:
-        notes.append(f"样本超过 {FUZZY_MAX_BYTES // (1024*1024)}MB, 跳过 ssdeep/tlsh 计算")
+        notes.append(f"样本超过 {_fmt_size_kb(FUZZY_MAX_BYTES)}, 跳过 ssdeep/tlsh 计算")
     else:
         fuzzy["ssdeep"] = compute_ssdeep(data)
         fuzzy["tlsh"] = compute_tlsh(data)

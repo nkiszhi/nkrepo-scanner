@@ -43,7 +43,7 @@ const ICON_NOTE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" s
 
 /* 模糊哈希缺失原因 tooltip */
 const FZ_TIP = {
-  ssdeep: 'CTPH 模糊哈希；需 ≥32B，超过 8MB 上限跳过',
+  ssdeep: 'CTPH 模糊哈希；需 ≥32B，超过 256KB 上限跳过',
   tlsh: 'Trend Micro 局部敏感哈希；需 ≥50B 且内容复杂度足够',
   imphash: 'PE 导入表哈希；仅 PE 样本',
   authentihash: 'PE Authenticode 哈希（清零 CheckSum+安全目录后 SHA256）；仅 PE 样本'
@@ -109,22 +109,39 @@ function upload(file, results, emptyHint, onDone) {
       }
       if (d.error) { renderErr(card, d.error); return; }
       renderPhase1(card, d.result);
-      if (d.status === 'phase2' && d.task_id) pollTask(card, d.task_id);
+      if (d.status === 'phase2' && d.task_id) pollTask(card, d.task_id, true);
       else render(card, d.result);
     })
     .catch(e => renderErr(card, '网络错误: ' + e.message));
 }
 
-function pollTask(card, taskId) {
+/* 轮询后台任务: phase1Shown=true 表示阶段1已渲染过 (POST /scan 直接返回),
+   false 表示需在 phase2 期间用接口返回的 result 渲染阶段1 (从 URL ?task= 接管) */
+function pollTask(card, taskId, phase1Shown) {
   fetch('/api/task/' + taskId, { headers: authHeaders() })
     .then(r => r.json())
     .then(d => {
-      if (d.error) finalizePhase1(card, d.error);
+      if (d.error) {
+        if (phase1Shown) finalizePhase1(card, d.error);
+        else renderErr(card, d.error);
+      }
       else if (d.status === 'done') render(card, d.result);
       else if (d.status === 'error') renderErr(card, '深度分析失败: ' + d.error);
-      else setTimeout(() => pollTask(card, taskId), 600);
+      else {
+        if (d.result && !phase1Shown) renderPhase1(card, d.result);
+        setTimeout(() => pollTask(card, taskId, true), 600);
+      }
     })
-    .catch(() => setTimeout(() => pollTask(card, taskId), 1200));
+    .catch(() => setTimeout(() => pollTask(card, taskId, phase1Shown), 1200));
+}
+
+/* 按 task_id 接管后台任务并渲染 (scan 页从 URL ?task= 进入时使用, 复用两段式轮询;
+   无需重新上传, 服务端任务记录 + /api/task 轮询即可完整展示渐进式结果) */
+function followTask(taskId, name, size, results, emptyHint, onDone) {
+  const card = mkScanCard({ name: name || ('任务 ' + taskId), size: size || 0 }, 'scan');
+  if (onDone) card._onDone = onDone;
+  pushCard(card, results, emptyHint);
+  pollTask(card, taskId, false);
 }
 
 /* ================= 结果卡片构建 ================= */

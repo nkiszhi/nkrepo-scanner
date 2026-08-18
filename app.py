@@ -312,7 +312,8 @@ def task_status(task_id):
     if task is None:
         return jsonify({"error": "任务不存在或已过期"}), 404
     if task["status"] == "phase2":
-        return jsonify({"task_id": task_id, "status": "phase2"})
+        # 附带阶段1结果: 供从 URL (?task=) 跳转接管的页面立即渲染哈希/类型/签名库命中
+        return jsonify({"task_id": task_id, "status": "phase2", "result": task["phase1"]})
     if task["status"] == "error":
         return jsonify({"task_id": task_id, "status": "error", "error": task["error"]})
     result = scanner.merge_phases(task["phase1"], task["phase2"])

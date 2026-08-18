@@ -19,16 +19,16 @@
 
 ## 静态信息与模糊哈希
 
-Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；其中**库比对仅 sha256 生效**，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤8MB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
+Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；其中**库比对仅 sha256 生效**，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤256KB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
 
 | 字段          | 算法                                                             | 适用样本    | 缺失原因（Web 上悬停 `-` 可见）                |
 | ----------- | -------------------------------------------------------------- | ------- | ---------------------------------- |
-| `ssdeep`    | 上下文触发分段哈希（CTPH），SpamSum 兼容，基于 **ppdeep**（纯 Python）        | 任意类型   | 输入 <32B / 超过 8MB 上限 / 未安装 ppdeep |
-| `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 8MB 上限    |
+| `ssdeep`    | 上下文触发分段哈希（CTPH），SpamSum 兼容，基于 **ppdeep**（纯 Python）        | 任意类型   | 输入 <32B / 超过 256KB 上限 / 未安装 ppdeep |
+| `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 256KB 上限    |
 | `imphash`   | PE 导入表哈希（pefile）                                            | 仅 PE    | 非 PE 样本                            |
 | `authentihash` | PE Authenticode 哈希：清零 OptionalHeader.CheckSum 与 Security Directory 条目后 SHA256 全文件 | 仅 PE | 非 PE 样本 |
 
-- **8MB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，超大文件耗时失控，超过上限跳过（8MB 随机数据约 1s）；PE 的 imphash/authentihash 与元数据不受上限影响
+- **256KB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，耗时随输入近线性增长，超大文件会阻塞 Web 阶段2 后台线程。实测 256KB 约 1.4s、512KB 约 7.4s、1MB 约 24s、3MB 约 73s，故上限收紧至 256KB；超过仅跳过模糊哈希，PE 的 imphash/authentihash 与元数据不受影响
 - **PE 静态元数据**（`static_info.pe`）：machine 架构、64 位标记、编译时间戳、subsystem、入口点、ImageBase、节表（名称/VirtualSize/RawSize/Flags）、导入表（每 DLL 最多列出 32 个函数）
 
 ## 壳 / Packer 识别（`static_info.packer`）
