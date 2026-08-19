@@ -18,6 +18,7 @@ extracted/
 *.cvd
 signatures/hdb/
 hdb/
+scan_cache/
 
 # 上传样本目录（运行时生成，程序启动时自动创建，整个目录不入库）
 # 注: eicar.com 为 EICAR 测试样本, 因安全工具会拦截其文件读写, 不入库;
