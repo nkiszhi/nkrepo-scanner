@@ -367,6 +367,29 @@ a { color: var(--accent); text-decoration: none; }
 .copy-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
 .copy-btn.copied { color: var(--green); border-color: var(--green); background: var(--green-soft); }
 
+/* 重新扫描按钮 (扫描结果卡片横幅内): 绕过缓存重新分析同一文件 */
+.rescan-btn {
+  flex: none; align-self: flex-start;
+  border: 1px solid var(--border); background: var(--panel-2);
+  color: var(--text-dim); border-radius: 6px; cursor: pointer;
+  font-size: 12px; padding: 5px 12px; margin-top: 8px;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.rescan-btn:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.rescan-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* "详情页" / "查看扫描报告" 链接按钮 (/file/<sha256> 永久报告页入口) */
+.detail-link {
+  flex: none; align-self: flex-start;
+  display: inline-block;
+  border: 1px solid var(--border); background: var(--panel-2);
+  color: var(--text-dim); border-radius: 6px; cursor: pointer;
+  font-size: 12px; padding: 5px 12px; margin-top: 8px;
+  text-decoration: none;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.detail-link:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+
 /* 文件类型行 */
 .ftype-row {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;

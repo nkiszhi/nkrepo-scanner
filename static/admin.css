@@ -1,0 +1,87 @@
+/* ================= 管理员页面专属样式 (登录页 + 哈希管理页) ================= */
+/* 基础暗色主题变量 / topbar / container / card / stat 复用 app.css */
+
+/* ---------- 登录页 ---------- */
+.login-wrap { max-width: 400px; margin: 64px auto 0; }
+.login-card {
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 32px 28px; box-shadow: var(--shadow);
+}
+.login-card h1 { font-size: 20px; font-weight: 700; text-align: center; }
+.login-card .sub { color: var(--text-dim); font-size: 12.5px; text-align: center; margin: 8px 0 22px; }
+.login-err {
+  color: var(--red); background: var(--red-soft);
+  border: 1px solid rgba(242,85,93,.35); border-radius: 9px;
+  padding: 9px 12px; font-size: 12.5px; margin-bottom: 14px;
+}
+.login-hint { text-align: center; color: var(--text-faint); font-size: 11.5px; margin-top: 18px; line-height: 1.8; }
+.login-hint a { color: var(--accent); }
+
+/* ---------- 通用按钮 ---------- */
+.btn {
+  border: none; cursor: pointer; font-size: 13px; font-weight: 600;
+  padding: 11px 22px; border-radius: 9px;
+  transition: filter .15s, transform .1s; white-space: nowrap;
+}
+.btn:active { transform: scale(.97); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn-primary { background: linear-gradient(135deg, #4f8cff, #3b6fe0); color: #fff; }
+.btn-danger { background: linear-gradient(135deg, #f2555d, #d63a42); color: #fff; }
+.btn-ghost { background: var(--panel-2); color: var(--text-dim); border: 1px solid var(--border); }
+.btn:hover { filter: brightness(1.1); }
+
+/* ---------- 哈希管理页布局 ---------- */
+.mgmt-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-top: 24px;
+}
+.mgmt-card {
+  background: var(--panel); border: 1px solid var(--border-soft);
+  border-radius: 14px; padding: 20px 22px; box-shadow: var(--shadow);
+}
+.mgmt-card.full { grid-column: 1 / -1; }
+.mgmt-card h2 {
+  font-size: 14px; font-weight: 700; display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+}
+.mgmt-card .desc { color: var(--text-dim); font-size: 12px; margin-bottom: 16px; }
+
+/* 表单字段 */
+.field { margin-bottom: 14px; }
+.field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; }
+.field input {
+  width: 100%; background: var(--bg-soft); border: 1px solid var(--border);
+  border-radius: 9px; color: var(--text); font-size: 13.5px; padding: 10px 12px;
+  outline: none; transition: border-color .15s, box-shadow .15s; font-family: var(--mono);
+}
+.field input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.field input::placeholder { color: var(--text-faint); font-family: "Segoe UI","Microsoft YaHei",sans-serif; }
+
+.field-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.field-row .field { flex: 1; min-width: 130px; margin-bottom: 0; }
+.field-row .field.size-field { max-width: 130px; }
+
+/* 结果反馈 */
+.result-box { margin-top: 14px; font-size: 12.5px; }
+.result-ok { color: var(--green); background: var(--green-soft); border: 1px solid rgba(52,209,123,.35); border-radius: 9px; padding: 11px 14px; }
+.result-err { color: var(--red); background: var(--red-soft); border: 1px solid rgba(242,85,93,.35); border-radius: 9px; padding: 11px 14px; }
+.result-info { color: var(--text); background: var(--bg-soft); border: 1px solid var(--border-soft); border-radius: 9px; padding: 11px 14px; }
+.result-box .mono { font-family: var(--mono); word-break: break-all; }
+.result-box .kv2 { display: grid; grid-template-columns: 92px 1fr; gap: 5px 12px; margin-top: 8px; }
+.result-box .kv2 .k { color: var(--text-dim); }
+.result-box .kv2 .v { font-family: var(--mono); word-break: break-all; }
+.det-line { padding: 6px 0; border-bottom: 1px solid var(--border-soft); }
+.det-line:last-child { border-bottom: none; }
+.det-line .dn { color: var(--red); font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.det-line .dd { color: var(--text-dim); font-size: 11.5px; margin-top: 2px; }
+
+/* 管理页 dropzone (复用 .dropzone 基类) */
+.mgmt-card .dropzone { padding: 26px 18px; margin-top: 4px; }
+
+/* 退出登录按钮 */
+.logout-btn {
+  background: var(--panel-2); border: 1px solid var(--border); color: var(--text-dim);
+  border-radius: 8px; font-size: 12.5px; padding: 6px 14px; cursor: pointer;
+  text-decoration: none; transition: color .15s, border-color .15s;
+}
+.logout-btn:hover { color: var(--red); border-color: rgba(242,85,93,.5); }
+
+@media (max-width: 860px) { .mgmt-grid { grid-template-columns: 1fr; } }

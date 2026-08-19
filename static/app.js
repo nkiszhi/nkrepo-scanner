@@ -86,6 +86,7 @@ function fallbackCopy(val, done) {
 function upload(file, results, emptyHint, onDone) {
   const card = mkScanCard(file, 'scan');
   if (onDone) card._onDone = onDone;
+  card._file = file;   // 保留 File 引用, 供 "重新扫描" 按钮重新上传
   pushCard(card, results, emptyHint);
 
   // 本地预检: 超过上限直接拒绝
@@ -97,6 +98,11 @@ function upload(file, results, emptyHint, onDone) {
 
   const fd = new FormData();
   fd.append('file', file);
+  sendScan(card, fd);
+}
+
+/* 发送 /scan 请求并处理响应: 缓存命中直接渲染, 否则两段式 (phase1 → 轮询 phase2) */
+function sendScan(card, fd) {
   fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
     .then(r => r.json()
       .then(d => ({ ok: r.ok, status: r.status, d }))
@@ -109,11 +115,60 @@ function upload(file, results, emptyHint, onDone) {
         return;
       }
       if (d.error) { renderErr(card, d.error); return; }
+      if (d.cached) {
+        // 服务端缓存命中: 直接渲染完整结果 (含缓存时间标注)
+        render(card, d.result);
+        markCached(card, d.result);
+        return;
+      }
       renderPhase1(card, d.result);
       if (d.status === 'phase2' && d.task_id) pollTask(card, d.task_id, true);
       else render(card, d.result);
     })
     .catch(e => renderErr(card, '网络错误: ' + e.message));
+}
+
+/* 缓存命中标注: 横幅副标题追加 "结果缓存 · 扫描于 <时间>" */
+function markCached(card, d) {
+  const sub = card.querySelector('.banner-sub');
+  if (!sub) return;
+  const when = d && d.scanned_at ? '扫描于 ' + esc(d.scanned_at) : '';
+  sub.innerHTML += ' <span class="badge" style="background:rgba(94,158,255,.16);color:var(--accent,#5e9eff)">缓存</span>' +
+    (when ? ' <span style="color:var(--text-faint)">' + when + '</span>' : '');
+}
+
+/* "重新扫描" 按钮: 以 rescan=1 重新上传同一文件, 绕过服务端缓存 */
+function addRescanBtn(card) {
+  if (!card._file || card.querySelector('.rescan-btn')) return;
+  const btn = document.createElement('button');
+  btn.className = 'rescan-btn';
+  btn.type = 'button';
+  btn.textContent = '重新扫描';
+  btn.addEventListener('click', () => {
+    const file = card._file;
+    if (!file) return;
+    // 卡片回到扫描中状态
+    card.classList.remove('updated');
+    const banner = card.querySelector('.banner');
+    banner.className = 'banner scanning';
+    banner.querySelector('.banner-icon').innerHTML = '<span class="spinner"></span>';
+    banner.querySelector('.banner-title').textContent = '正在重新扫描…';
+    banner.querySelector('.banner-sub').innerHTML = '<b>' + esc(file.name) + '</b>' + (file.size ? ' · ' + fmtSize(file.size) : '');
+    banner.querySelector('.ring-wrap').style.display = 'none';
+    card.querySelector('.tabs').style.display = '';
+    card.querySelector('#detCnt').textContent = '0';
+    card.querySelector('.panel-detections').innerHTML =
+      '<div class="pending"><span class="spinner"></span>已绕过缓存, 正在重新分析…</div>';
+    card.querySelector('.panel-details').innerHTML = '';
+    card.querySelector('.rescan-btn').disabled = true;
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('rescan', '1');
+    btn.remove();          // 旧按钮移除; 扫描完成后 render() 会重新添加
+    sendScan(card, fd);
+  });
+  const banner = card.querySelector('.banner');
+  if (banner) banner.appendChild(btn);
 }
 
 /* 轮询后台任务: phase1Shown=true 表示阶段1已渲染过 (POST /scan 直接返回),
@@ -229,8 +284,11 @@ function render(card, d) {
   banner.querySelector('.banner-icon').innerHTML = d.clean ? ICON_CHECK : ICON_X;
   banner.querySelector('.banner-title').textContent =
     d.clean ? '未发现已知威胁' : d.detections.length + ' 个引擎将此文件标记为恶意';
+  /* 提交时间: 优先 submitted_at, 旧缓存无此字段时回退 scanned_at */
+  const subAt = d.submitted_at || d.scanned_at || '';
   banner.querySelector('.banner-sub').innerHTML =
-    '<b>' + esc(d.filename) + '</b> · ' + esc(d.size_human) + ' · ' + esc(d.file_type);
+    '<b>' + esc(d.filename) + '</b> · ' + esc(d.size_human) + ' · ' + esc(d.file_type) +
+    (subAt ? ' · 提交于 ' + esc(subAt) : '');
 
   /* 检测环: n/m (参与引擎数) */
   const n = d.detections.length;
@@ -244,7 +302,21 @@ function render(card, d) {
   card.querySelector('.panel-details').innerHTML = ftypeRow(d) + detailsBlocks(d);
 
   switchTab(card, 'detections');
+  addRescanBtn(card);          // "重新扫描" 按钮 (有原始 File 引用的卡片才显示)
+  addDetailLink(card, d);      // "详情页" 链接: /file/<sha256> 永久报告页 (VT 风格动态路径)
   if (card._onDone) card._onDone(card, d);
+}
+
+/* "详情页" 链接: 以 SHA256 为资源标识的永久报告页 /file/<sha256> */
+function addDetailLink(card, d) {
+  if (!d || !d.sha256 || card.querySelector('.detail-link')) return;
+  const a = document.createElement('a');
+  a.className = 'detail-link';
+  a.href = '/file/' + d.sha256;
+  a.title = '/file/' + d.sha256;
+  a.textContent = '详情页';
+  const banner = card.querySelector('.banner');
+  if (banner) banner.appendChild(a);
 }
 
 /* ================= 检测结果表 ================= */
@@ -339,11 +411,24 @@ function detailsBlocks(d) {
   html += '<div class="dsec"><div class="dsec-head">' + ICON_HASH + '文件哈希</div><div class="dsec-body">' + hashRows(d) + '</div></div>';
 
   html += '<div class="dsec"><div class="dsec-head">' + ICON_INFO + '基本信息</div><div class="dsec-body"><div class="kv">' +
+    '<span class="k">文件名</span><span class="v">' + esc(d.filename) + '</span>' +
+    '<span class="k">提交时间</span><span class="v">' + esc(d.submitted_at || d.scanned_at || '-') + '</span>' +
     '<span class="k">文件类型</span><span class="v">' + esc(d.file_type) + '</span>' +
     '<span class="k">大小</span><span class="v">' + esc(d.size_human) + ' (' + fmtSize(d.size) + ')</span>' +
     '<span class="k">扫描耗时</span><span class="v">' + esc(d.elapsed_ms) + ' ms' + (d.static_ms ? '（含静态 ' + esc(d.static_ms) + ' ms）' : '') + '</span>' +
     '<span class="k">参与引擎</span><span class="v">' + (d.scanners || []).map(esc).join(' + ') + '</span>' +
     '</div></div></div>';
+
+  /* 提交历史: 同一内容 (SHA256) 每次提交的时间与文件名, 记录于服务端缓存 JSON */
+  if (d.history && d.history.length) {
+    html += '<div class="dsec"><div class="dsec-head">' + ICON_NOTE + '提交历史' +
+      '<span class="pk-score" style="margin-left:8px">共 ' + d.history.length + ' 次提交</span></div>' +
+      '<div class="dsec-body"><div class="kv">' +
+      d.history.map(h =>
+        '<span class="k">' + esc(h.submitted_at || '-') + '</span>' +
+        '<span class="v">' + esc(h.filename || '-') + '</span>').join('') +
+      '</div></div></div>';
+  }
 
   /* 模糊哈希 */
   if (si && si.fuzzy) {
@@ -498,15 +583,20 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.banner').className = 'banner detected';
         card.querySelector('.banner-icon').innerHTML = ICON_X;
         card.querySelector('.banner-title').textContent = d.detections.length + ' 个引擎将此哈希标记为恶意';
-        card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 命中签名库';
+        /* 横幅直接显示哈希对应的恶意代码名称 (name) */
+        const names = d.detections.map(x => x.name).filter(Boolean);
+        card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 命中签名库: <b>' +
+          esc(names.length ? names.join(', ') : 'unknown') + '</b>';
         const t = card.querySelector('.tabs'); t.style.display = 'none';
-        card.querySelector('.panel-details').innerHTML =
+        /* 写入当前可见的 panel-detections (panel-details 无 active class, 之前写错面板导致 name 不可见) */
+        card.querySelector('.panel-detections').innerHTML =
           '<div class="det-table">' + d.detections.map(x => {
             const isFuzzy = x.engine === 'Fuzzy Hash DB';
+            const sizeInfo = (x.size != null && x.size !== '') ? ' · 大小: ' + fmtSize(x.size) : '';
             return '<div class="det-row hit" style="display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(242,85,93,.14)">' +
               '<div style="min-width:0"><div class="det-name">' + esc(x.name) +
               (isFuzzy && x.fuzzy ? '<span class="badge">' + Object.keys(x.fuzzy).filter(k => x.fuzzy[k]).join('+') + '</span>' : '') + '</div>' +
-              '<div class="det-detail">' + esc(x.detail || '') + '</div>' +
+              '<div class="det-detail">' + esc(x.detail || '') + sizeInfo + '</div>' +
               (isFuzzy && x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') + '</div>' +
               '<span class="engine-cell" style="flex:none"><span class="e-icon ' + (isFuzzy ? 'f' : 'h') + '">' + (isFuzzy ? 'F' : 'H') + '</span> ' +
               (isFuzzy ? 'Fuzzy Hash DB' : 'Hash DB') + '<span class="badge">' + (isFuzzy ? '' : label) + '</span></span></div>';
@@ -521,10 +611,24 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.banner-sub').innerHTML = label + ' <b>' + v + '</b> · 该样本尚未被标记';
         const t = card.querySelector('.tabs'); t.style.display = 'none';
         const total = label === 'MD5' ? (STATS_MD5 || 0) : (STATS_HASH || 0);
-        card.querySelector('.panel-details').innerHTML =
+        card.querySelector('.panel-detections').innerHTML =
           '<div class="det-verdict ok" style="gap:8px">' + ICON_CHECK_SM +
           '<span>签名库（' + fmtNum(total) + ' 条 ' + label + '）中不存在此哈希，未命中任何已知恶意签名。</span></div>';
         card.querySelector('.ring-wrap').style.display = 'none';
+      }
+      /* SHA256 且已有扫描报告缓存 → 追加 "查看扫描报告" 链接 (跳转 /file/<sha256> 详情页) */
+      if (algo === 'sha256') {
+        fetch('/api/file/' + v, { headers: authHeaders() })
+          .then(r => r.json())
+          .then(fd => {
+            if (fd && fd.found && !card.querySelector('.detail-link')) {
+              const a = document.createElement('a');
+              a.className = 'detail-link';
+              a.href = '/file/' + v;
+              a.textContent = '查看扫描报告';
+              card.querySelector('.banner').appendChild(a);
+            }
+          }).catch(() => {});
       }
     })
     .catch(e => renderErr(card, '网络错误: ' + e.message));

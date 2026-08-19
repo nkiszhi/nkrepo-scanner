@@ -17,6 +17,12 @@
     "_comment_max_open_shards": "256 片时建议增大 LRU 缓存上限, 减少频繁换页; 4 足够基本查询, 16-32 更适合高并发",
     "max_open_shards": 16
   },
+  "fuzzy": {
+    "_comment_layout": "模糊哈希库分片布局: 'hex' = 按首字节分 256 片 (00-ff); 5 表 (ssdeep/vhash/authentihash/imphash/rich_header_hash) 共享同一组分片文件",
+    "layout": "hex",
+    "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图懒加载 LRU 缓存上限 (5 表共享同一连接, bloom 按 类型×分片 独立)",
+    "max_open_shards": 16
+  },
   "hash_db": {
     "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图的懒加载 LRU 缓存上限",
     "max_open_shards": 4
@@ -35,7 +41,17 @@
     "_comment_phase2_max_mb": "阶段2 深度分析(模糊哈希/PE元数据/查壳)的样本大小上限; 超过仅执行 YARA (10s 超时), 防超大文件纯 Python 逐字节分析打满 CPU",
     "phase2_max_mb": 32,
     "_comment_phase2_concurrency": "阶段2 后台线程并发上限 (信号量, 超限排队); 控制 CPU 峰值",
-    "phase2_concurrency": 4
+    "phase2_concurrency": 4,
+    "_comment_secret_key": "Flask 会话签名密钥 (登录态 Cookie 由其签名); 更换后已登录管理员需重新登录; 勿泄露",
+    "secret_key": "c1871772a122d32658c91530b81497a11cfd0c93eb260adc"
+  },
+  "admin": {
+    "_comment_admin": "哈希管理页面管理员凭据; 检测功能无需登录, 仅 /admin/hash 与 /api/admin/* 需登录; 密码存 SHA-256(salt:password), 修改密码后同步更新 password_hash",
+    "username": "admin",
+    "_comment_salt": "密码盐 (8 字节十六进制); 与密码拼接做单向哈希, 弱化彩虹表",
+    "salt": "a59944e58938c531",
+    "_comment_password_hash": "默认密码 admin123 的哈希: SHA-256(salt:password); 修改密码请重算",
+    "password_hash": "f35e2544f0ca4871cb09849ff1e6a19e93123f47e32ea638d997f2955b695ada"
   },
   "packer": {
     "_comment_rules_dir": "外部 YARA 扩展壳库目录: 相对路径基于项目根目录解析 (如 packer_rules), 也支持绝对路径; 目录下所有 .yar/.yara 规则自动加载, 命中即作为精确特征进入壳识别 (规则约定见 packer_rules/README.md)",

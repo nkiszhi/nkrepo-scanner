@@ -24,7 +24,7 @@
       <a href="/">搜索</a>
       <a href="/scan" class="active">扫描</a>
       <a href="/#stats">统计</a>
-      <a href="https://www.clamav.net" target="_blank" rel="noopener">ClamAV 格式</a>
+      <a href="/admin/hash">管理</a>
     </div>
     <div class="nav-right">
       <span class="engine-pill" id="enginePill"><span class="dot"></span><span id="engineText">引擎加载中…</span></span>
@@ -89,7 +89,7 @@
 
   <footer>
     NKAMG Scanner · 参考 <a href="https://www.clamav.net" target="_blank">ClamAV</a> 签名格式 · 哈希 + YARA + PE 静态分析<br>
-    界面风格参考 <a href="https://www.virustotal.com" target="_blank">VirusTotal</a> · 仅用于安全研究
+    仅用于安全研究
   </footer>
 </div>
 
@@ -199,10 +199,10 @@ function renderRecent() {
     el.addEventListener('click', () => {
       const it = getRecent().find(x => x.ts === Number(el.dataset.ts));
       if (it && it.sha256) {
-        lookupHashCard(it.sha256, results, emptyHint, it.name);
-        window.scrollTo({ top: results.getBoundingClientRect().top + window.scrollY - 90, behavior: 'smooth' });
+        /* 跳转到文件详情页 (/file/<sha256> 永久报告链接) */
+        location.href = '/file/' + it.sha256;
       } else {
-        toast('该记录没有 SHA256，无法重新查询');
+        toast('该记录没有 SHA256，无法查看详情页');
       }
     }));
 }

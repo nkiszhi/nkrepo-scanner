@@ -736,7 +736,8 @@ class HashSignatureDB:
                     except ValueError:
                         continue
                     size_field = parts[1].strip()
-                    size = None if size_field == "*" else int(size_field)
+                    # "*" 和 "0" 均归一化为 None (不限大小): 否则 size=0 的签名在文件扫描时永远无法通过大小校验
+                    size = None if size_field in ("*", "0") else int(size_field)
                     name = parts[2].strip()
                     # 仅本库主键长度的签名入库, 按摘要前缀路由分片
                     pending.setdefault(
@@ -788,36 +789,125 @@ class HashSignatureDB:
                 t0 = time.time()
                 rebuilt = 0
                 for sid in dirty:
-                    path = self._shard_path(sid)
-                    if not os.path.exists(path):
-                        continue
-                    conn = self._ro_conn(sid)
-                    if conn is None:
-                        continue
-                    lock = self._conn_locks.get(sid)
-                    if lock is None:
-                        continue
-                    with lock:  # 连接级串行锁: 避免与并发查询交叉执行
-                        cnt = conn.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
-                        if cnt == 0:
-                            continue
-                        bf = BloomFilter(cnt, self.bloom_fp_rate)
-                        cur = conn.execute(
-                            f"SELECT {self.pk_col} FROM sigs")
-                        while True:
-                            rows = cur.fetchmany(100_000)
-                            if not rows:
-                                break
-                            for (h,) in rows:
-                                bf.add(h)
-                    bf.save(self._bloom_path(sid))
-                    with self._cache_lock:
-                        self._blooms[sid] = bf  # 引用替换, 查询中的旧引用不受影响
-                    rebuilt += 1
+                    if self.rebuild_bloom_shard(sid) is not None:
+                        rebuilt += 1
                 self._bloom_dirty.clear()
                 status["bloom_rebuilt"] = rebuilt
                 status["bloom_rebuilt_s"] = round(time.time() - t0, 1)
         return status
+
+    # ---------- 单条写入 (管理接口: 增 / 删) ----------
+    def rebuild_bloom_shard(self, sid):
+        """重建单个分片的 Bloom 位图 (从该分片 SQLite 全量重算并落盘)。返回 bf 或 None。
+
+        用于: ① 新增哈希后该分片尚无 bloom 文件 (首条入库)；② finalize() 增量重建 dirty 分片。
+        已存在 bloom 的分片不会走到这里 (add_hash 直接复用并追加)。
+        """
+        path = self._shard_path(sid)
+        if not os.path.exists(path):
+            return None
+        conn = self._ro_conn(sid)
+        if conn is None:
+            return None
+        lock = self._conn_locks.get(sid)
+        if lock is None:
+            return None
+        with lock:
+            cnt = conn.execute(f"SELECT COUNT(*) FROM sigs").fetchone()[0]
+            if cnt == 0:
+                return None
+            bf = BloomFilter(cnt, self.bloom_fp_rate)
+            cur = conn.execute(f"SELECT {self.pk_col} FROM sigs")
+            while True:
+                rows = cur.fetchmany(100_000)
+                if not rows:
+                    break
+                for (h,) in rows:
+                    bf.add(h)
+        bf.save(self._bloom_path(sid))
+        with self._cache_lock:
+            self._blooms[sid] = bf
+        return bf
+
+    def add_hash(self, hash_hex, size, name):
+        """新增单条哈希签名 (hash:size:name), 自动按主键长度路由到 SHA256/MD5 库。
+
+        写入对应分片 SQLite + 更新计数 + 增量更新 Bloom (命中即被后续查询发现)。
+        返回新增条数 (0 表示已存在, 1 表示新增)。哈希长度须与本库主键等长
+        (sha256 库 64hex / md5 库 32hex), 否则抛 ValueError。
+        """
+        h = (hash_hex or "").strip().lower()
+        if len(h) != self.pk_hex_len:
+            raise ValueError(
+                f"需要 {self.pk_hex_len} 位 {self.hash_label} 十六进制, 收到 {len(h)} 位")
+        try:
+            digest = bytes.fromhex(h)
+        except ValueError:
+            raise ValueError("非法的十六进制哈希")
+        # "*", "" 和 0 均归一化为 None (不限大小), 与 import_hdb 行为一致
+        size_field = None if size in (None, "*", "", 0, "0") else int(size)
+        name_field = (name or "").strip() or "unknown"
+        with self._lock:
+            sid = self._route(digest)
+            shard = self._open_rw(self._shard_path(sid))
+            shard.execute(self._ddl)
+            before = shard.total_changes
+            shard.execute(self._insert_sql, self._row_for_insert(digest, size_field, name_field))
+            inserted = shard.total_changes - before
+            shard.commit()
+            if inserted:
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                with self.meta:
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                        (self._shard_name(sid), cnt))
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+                self._count += inserted
+                # Bloom: 已有位图则追加并落盘; 否则首次全量重建 (含本条)
+                bf = self._load_bloom_shard(sid)
+                if bf is None:
+                    bf = self.rebuild_bloom_shard(sid)
+                if bf is not None:
+                    bf.add(digest)
+                    bf.save(self._bloom_path(sid))
+                    with self._cache_lock:
+                        self._blooms[sid] = bf
+            return inserted
+
+    def delete_hash(self, hash_hex):
+        """删除单条哈希签名, 返回删除条数 (0 表示不存在)。
+
+        仅从 SQLite 移除; Bloom 位图不回收该位 (布隆过滤器不可删除, 残留位只会造成
+        无害的假阳性 → SQLite 点查返回空 → 正确判定为未命中)。计数与分片计数同步更新。
+        """
+        h = (hash_hex or "").strip().lower()
+        if len(h) != self.pk_hex_len:
+            raise ValueError(
+                f"需要 {self.pk_hex_len} 位 {self.hash_label} 十六进制, 收到 {len(h)} 位")
+        try:
+            digest = bytes.fromhex(h)
+        except ValueError:
+            raise ValueError("非法的十六进制哈希")
+        with self._lock:
+            sid = self._route(digest)
+            if not os.path.exists(self._shard_path(sid)):
+                return 0
+            shard = self._open_rw(self._shard_path(sid))
+            before = shard.total_changes
+            shard.execute(f"DELETE FROM sigs WHERE {self.pk_col}=?", (digest,))
+            deleted = shard.total_changes - before
+            shard.commit()
+            if deleted:
+                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                with self.meta:
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
+                        (self._shard_name(sid), cnt))
+                    self.meta.execute(
+                        "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+                self._count -= deleted
+            return deleted
 
     # ---------- 查询 ----------
     @property
@@ -960,19 +1050,60 @@ class HashSignatureDB:
 
 
 # ============================================================
-# 模糊哈希签名库 (FuzzySignatureDB): 与 sha256/md5 库并列的第三库
+# 模糊哈希签名库 (FuzzySignatureDB): 5 表独立结构
+# 每种 fuzzy hash 独立成表, 以 fuzzy hash 本身为主键 (不再是 sha256)
 # 数据源 ClamAV 8 字段 hdb 行: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
 # ============================================================
-FUZZY_COLS = "sha256,size,name,ssdeep,vhash,authentihash,imphash,rich_header_hash"
-FUZZY_DDL = (
-    "CREATE TABLE IF NOT EXISTS sigs("
-    " sha256 BLOB PRIMARY KEY,"
-    " size INTEGER, name TEXT,"
-    " ssdeep TEXT,"
-    " vhash BLOB, authentihash BLOB, imphash BLOB, rich_header_hash BLOB)"
-    " WITHOUT ROWID"
-)
-FUZZY_INSERT = "INSERT OR IGNORE INTO sigs(" + FUZZY_COLS + ") VALUES(?,?,?,?,?,?,?,?)"
+FUZZY_TYPES = ["ssdeep", "vhash", "authentihash", "imphash", "rich_header_hash"]
+
+# 每种 fuzzy hash 的表定义: 表名 / 列名 / SQL 类型 / DDL / INSERT / SELECT 列
+FUZZY_TABLE_SPECS = {
+    "ssdeep": {
+        "col": "ssdeep", "sql_type": "TEXT", "label": "SSDeep",
+        "table": "sigs_ssdeep",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_ssdeep("
+               " ssdeep TEXT PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_ssdeep(ssdeep,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "ssdeep,size,name,sha256",
+    },
+    "vhash": {
+        "col": "vhash", "sql_type": "BLOB", "label": "VHash",
+        "table": "sigs_vhash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_vhash("
+               " vhash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_vhash(vhash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "vhash,size,name,sha256",
+    },
+    "authentihash": {
+        "col": "authentihash", "sql_type": "BLOB", "label": "Authentihash",
+        "table": "sigs_authentihash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_authentihash("
+               " authentihash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_authentihash(authentihash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "authentihash,size,name,sha256",
+    },
+    "imphash": {
+        "col": "imphash", "sql_type": "BLOB", "label": "Imphash",
+        "table": "sigs_imphash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_imphash("
+               " imphash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_imphash(imphash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "imphash,size,name,sha256",
+    },
+    "rich_header_hash": {
+        "col": "rich_header_hash", "sql_type": "BLOB", "label": "RichHeaderHash",
+        "table": "sigs_rich_header_hash",
+        "ddl": "CREATE TABLE IF NOT EXISTS sigs_rich_header_hash("
+               " rich_header_hash BLOB PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
+               " WITHOUT ROWID",
+        "insert": "INSERT OR IGNORE INTO sigs_rich_header_hash(rich_header_hash,size,name,sha256) VALUES(?,?,?,?)",
+        "cols": "rich_header_hash,size,name,sha256",
+    },
+}
 
 
 def _hex_to_blob(s):
@@ -985,46 +1116,246 @@ def _hex_to_blob(s):
     return bytes.fromhex(s)
 
 
-class FuzzySignatureDB(HashSignatureDB):
-    """ClamAV 8 字段 hdb 的模糊哈希增强库 (与 sha256/md5 库并列的第三库)。
+class FuzzySignatureDB:
+    """5 表模糊哈希签名库 (每种 fuzzy hash 独立成表, 以 fuzzy hash 为主键)。
 
-    表结构参考 sha256 库 (sha256 BLOB 主键 + size/name), 扩展 5 个模糊哈希列:
-      ssdeep TEXT                    变长模糊哈希 (非 hex, 直存文本)
-      vhash/authentihash/imphash/rich_header_hash BLOB  (hex → 字节, 非法为 NULL)
-    只存**至少一个模糊字段非空**的行 (无 fuzzy 信息的行仅存在于 sha256 库即可)。
-    主键路由/Bloom 与 sha256 库同构 (digest[:4] % N), 可按 sha256 反查增强信息。
+    每个 hex 分片文件 (00.db ~ ff.db) 包含 5 张表:
+      sigs_ssdeep(ssdeep TEXT PK, size, name, sha256 BLOB)
+      sigs_vhash(vhash BLOB PK, size, name, sha256 BLOB)
+      sigs_authentihash(authentihash BLOB PK, size, name, sha256 BLOB)
+      sigs_imphash(imphash BLOB PK, size, name, sha256 BLOB)
+      sigs_rich_header_hash(rich_header_hash BLOB PK, size, name, sha256 BLOB)
+
+    路由: BLOB 类型取首字节, ssdeep 取 sha256(string) 首字节 → 00~ff 分片。
+    Bloom 按类型 × 分片: {shard}_{type}.bloom, 懒加载 + LRU 缓存。
+    数据源: ClamAV 8 字段 hdb 行, 每个非空 fuzzy 字段独立写入对应表。
     """
 
-    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
-                 max_open_shards=4, layout="modulo"):
-        super().__init__(db_path, shard_count=shard_count, bloom_fp_rate=bloom_fp_rate,
-                         max_open_shards=max_open_shards, hash_algo="sha256",
-                         ddl=FUZZY_DDL, insert_sql=FUZZY_INSERT, row_cols=FUZZY_COLS,
-                         layout=layout)
+    LAYOUT_HEX = "hex"
 
-    # ---------- 行映射 (8 列) ----------
-    def _row_for_insert(self, sha256_digest, size, name, ssdeep=None,
-                        vhash=None, authentihash=None, imphash=None,
-                        rich_header_hash=None):
-        """把 8 字段 hdb 行映射为表行; 模糊字段 hex → BLOB, 空/非法 → NULL"""
-        if len(sha256_digest) != 32:
-            raise ValueError(f"仅支持 SHA256 主键 (32B), 收到 {len(sha256_digest)}B")
-        return (sha256_digest, size, name,
-                ssdeep or None,
-                _hex_to_blob(vhash), _hex_to_blob(authentihash),
-                _hex_to_blob(imphash), _hex_to_blob(rich_header_hash))
+    def __init__(self, db_path, shard_count=4, bloom_fp_rate=0.01,
+                 max_open_shards=16, layout="hex"):
+        self.db_path = db_path
+        self.shard_dir = db_path + ".shards"
+        self.bloom_dir = db_path + ".bloom"
+        self.meta_path = os.path.join(self.shard_dir, "_meta.db")
+        self.bloom_fp_rate = bloom_fp_rate
+        self.max_open_shards = max(4, max_open_shards)
+        self.layout = layout
+        self.shard_count = 256 if layout == self.LAYOUT_HEX else max(1, int(shard_count))
+
+        os.makedirs(self.shard_dir, exist_ok=True)
+        os.makedirs(self.bloom_dir, exist_ok=True)
+
+        self._lock = threading.RLock()
+        self._cache_lock = threading.Lock()
+
+        # Meta DB
+        self.meta = self._open_rw(self.meta_path)
+        self._init_meta()
+
+        # LRU caches: 连接按 shard_id 共享 (5 表在同一文件), bloom 按 (type, shard_id)
+        self._conns = OrderedDict()
+        self._conn_locks = {}
+        self._blooms = OrderedDict()    # (fuzzy_type, shard_id) -> BloomFilter
+        self._bloom_dirty = set()       # {(fuzzy_type, shard_id)}
+        self._retired = []
+
+        self._counts = self._load_counts()
+        self.source_files = [
+            r[0] for r in self.meta.execute("SELECT name FROM imported_files")
+        ]
+        self._scan_bloom()
+
+    # ---------- Meta ----------
+    @staticmethod
+    def _open_rw(path):
+        conn = sqlite3.connect(path, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_meta(self):
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)")
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        self.meta.execute(
+            "CREATE TABLE IF NOT EXISTS fuzzy_counts("
+            " type TEXT, prefix TEXT, cnt INTEGER NOT NULL,"
+            " PRIMARY KEY(type, prefix))")
+        self.meta.commit()
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('layout','hex')")
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('shard_count','256')")
+        self.meta.execute(
+            "INSERT OR IGNORE INTO meta(k,v) VALUES('schema_version','4')")
+        self.meta.commit()
+
+    # ---------- 路由 ----------
+    def _route(self, fuzzy_type, value):
+        """Route fuzzy hash value → shard_id (0-255). ssdeep: sha256(str)[0]; BLOB: blob[0]"""
+        if fuzzy_type == "ssdeep":
+            return hashlib.sha256(value.encode("utf-8")).digest()[0]
+        return value[0]
+
+    def _bloom_key(self, fuzzy_type, value):
+        """Bloom 用的字节: ssdeep → sha256(str); BLOB → 原始字节"""
+        if fuzzy_type == "ssdeep":
+            return hashlib.sha256(value.encode("utf-8")).digest()
+        return value
+
+    def _shard_name(self, shard_id):
+        return "%02x" % shard_id
+
+    def _shard_path(self, shard_id):
+        return os.path.join(self.shard_dir, self._shard_name(shard_id) + ".db")
+
+    def _bloom_path(self, fuzzy_type, shard_id):
+        return os.path.join(self.bloom_dir,
+                            f"{self._shard_name(shard_id)}_{fuzzy_type}.bloom")
+
+    # ---------- 连接管理 (5 表共享同一 shard 连接) ----------
+    def _ro_conn(self, shard_id):
+        """获取分片只读连接 (懒加载 + LRU); 5 表共用同一连接"""
+        with self._cache_lock:
+            conn = self._conns.get(shard_id)
+            if conn is not None:
+                self._conns.move_to_end(shard_id)
+                return conn
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                conn.execute("PRAGMA query_only=ON")
+            except sqlite3.Error:
+                pass
+            self._conns[shard_id] = conn
+            self._conn_locks[shard_id] = threading.Lock()
+            while len(self._conns) > self.max_open_shards:
+                old_id, old = self._conns.popitem(last=False)
+                self._conn_locks.pop(old_id, None)
+                self._retired.append(old)
+            return conn
+
+    def _query_shard(self, shard_id, sql, params=()):
+        conn = self._ro_conn(shard_id)
+        if conn is None:
+            return None
+        lock = self._conn_locks.get(shard_id)
+        if lock is None:
+            return None
+        with lock:
+            return conn.execute(sql, params).fetchone()
+
+    # ---------- 计数 ----------
+    def _load_counts(self):
+        """从 meta 的 fuzzy_counts 表加载各类型计数; 缓存失效则逐片重数"""
+        valid = self.meta.execute(
+            "SELECT v FROM meta WHERE k='counts_valid'").fetchone()
+        if valid and valid[0] == "1":
+            rows = self.meta.execute(
+                "SELECT type, SUM(cnt) FROM fuzzy_counts GROUP BY type").fetchall()
+            return {t: (c or 0) for t, c in rows}
+        counts = {t: 0 for t in FUZZY_TYPES}
+        count_rows = []
+        for sid in range(self.shard_count):
+            path = self._shard_path(sid)
+            if not os.path.exists(path):
+                continue
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            prefix = self._shard_name(sid)
+            for ftype in FUZZY_TYPES:
+                spec = FUZZY_TABLE_SPECS[ftype]
+                try:
+                    cnt = conn.execute(
+                        f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
+                except sqlite3.Error:
+                    cnt = 0
+                counts[ftype] += cnt
+                if cnt > 0:
+                    count_rows.append((ftype, prefix, cnt))
+            conn.close()
+        with self.meta:
+            self.meta.execute("DELETE FROM fuzzy_counts")
+            self.meta.executemany(
+                "INSERT OR REPLACE INTO fuzzy_counts(type,prefix,cnt) VALUES(?,?,?)",
+                count_rows)
+            self.meta.execute(
+                "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+        return counts
+
+    @property
+    def count(self):
+        return sum(self._counts.values())
+
+    def already_imported(self, filename):
+        with self._lock:
+            row = self.meta.execute(
+                "SELECT 1 FROM imported_files WHERE name=?", (filename,)).fetchone()
+            return row is not None
+
+    # ---------- Bloom ----------
+    @staticmethod
+    def _bloom_stored_n(path):
+        try:
+            with open(path, "rb") as f:
+                if f.read(4) != BloomFilter.MAGIC:
+                    return None
+                f.read(24)
+                return struct.unpack("<Q", f.read(8))[0]
+        except OSError:
+            return None
+
+    def _scan_bloom(self):
+        """校验各 (type, shard) bloom 与计数是否一致; 不一致标记 dirty"""
+        rows = self.meta.execute(
+            "SELECT type, prefix, cnt FROM fuzzy_counts WHERE cnt > 0").fetchall()
+        for ftype, prefix, cnt in rows:
+            try:
+                sid = int(prefix, 16)
+            except ValueError:
+                continue
+            path = self._bloom_path(ftype, sid)
+            if self._bloom_stored_n(path) != cnt:
+                self._bloom_dirty.add((ftype, sid))
+
+    def _load_bloom(self, fuzzy_type, shard_id):
+        """懒加载 (type, shard) 的 Bloom (LRU)"""
+        with self._cache_lock:
+            key = (fuzzy_type, shard_id)
+            bf = self._blooms.get(key)
+            if bf is not None:
+                self._blooms.move_to_end(key)
+                return bf
+            path = self._bloom_path(fuzzy_type, shard_id)
+            if not os.path.exists(path):
+                return None
+            try:
+                bf = BloomFilter.load(path)
+            except Exception:
+                self._bloom_dirty.add(key)
+                return None
+            self._blooms[key] = bf
+            while len(self._blooms) > self.max_open_shards:
+                self._blooms.popitem(last=False)
+            return bf
 
     # ---------- 导入 ----------
     def import_hdb(self, filepath, batch=50_000):
-        """导入 ClamAV 8 字段 hdb 文件 (增量, 幂等), 返回新插入条数。
+        """导入 ClamAV 8 字段 hdb 文件, 每个非空 fuzzy 字段独立写入对应表。
 
         行格式: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
-        仅收 64hex sha256 主键行; 至少一个模糊字段非空才入库 (INSERT OR IGNORE 去重)。
+        每个 fuzzy hash 按自身值路由到 00~ff 分片, 写入对应表 (INSERT OR IGNORE 去重)。
         """
         basename = os.path.basename(filepath)
-        pending = {}  # shard_id -> [8 列行]
         start = time.time()
         with self._lock:
+            # pending: {(fuzzy_type, shard_id): [(hash_value, size, name, sha256_blob)]}
+            pending = {}
             with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
                 for line in f:
                     line = line.strip()
@@ -1034,103 +1365,226 @@ class FuzzySignatureDB(HashSignatureDB):
                     if len(parts) < 8:
                         continue
                     h = parts[0].strip().lower()
-                    if len(h) != 64:  # 仅收 SHA256 主键行
+                    if len(h) != 64:
                         continue
                     try:
-                        digest = bytes.fromhex(h)
+                        sha256_blob = bytes.fromhex(h)
                     except ValueError:
                         continue
                     size_field = parts[1].strip()
                     try:
-                        size = None if size_field == "*" else int(size_field)
+                        # "*" 和 "0" 均归一化为 None (不限大小), 与 HashSignatureDB.import_hdb 一致
+                        size = None if size_field in ("*", "0") else int(size_field)
                     except ValueError:
                         size = None
                     name = parts[2].strip()
-                    ssdeep = parts[3].strip() or None
-                    fz = [_hex_to_blob(p) for p in (parts[4], parts[5], parts[6], parts[7])]
-                    if ssdeep is None and not any(fz):
-                        continue  # 无模糊哈希信息, 不入库
-                    pending.setdefault(
-                        self._route(digest, self.shard_count), []
-                    ).append((digest, size, name, ssdeep, *fz))
+                    ssdeep_val = parts[3].strip() or None
+                    vhash_blob = _hex_to_blob(parts[4])
+                    auth_blob = _hex_to_blob(parts[5])
+                    imp_blob = _hex_to_blob(parts[6])
+                    rich_blob = _hex_to_blob(parts[7])
+                    # 分发到 5 个表
+                    fuzzy_values = {
+                        "ssdeep": ssdeep_val,
+                        "vhash": vhash_blob,
+                        "authentihash": auth_blob,
+                        "imphash": imp_blob,
+                        "rich_header_hash": rich_blob,
+                    }
+                    for ftype, val in fuzzy_values.items():
+                        if val is None:
+                            continue
+                        sid = self._route(ftype, val)
+                        pending.setdefault((ftype, sid), []).append(
+                            (val, size, name, sha256_blob))
             inserted = 0
             count_updates = []
             dirty = set()
-            for sid, rows in pending.items():
+            for (ftype, sid), rows in pending.items():
+                spec = FUZZY_TABLE_SPECS[ftype]
                 shard = self._open_rw(self._shard_path(sid))
-                shard.execute(self._ddl)
+                # 确保所有 5 张表都存在
+                for ft in FUZZY_TYPES:
+                    shard.execute(FUZZY_TABLE_SPECS[ft]["ddl"])
                 before = shard.total_changes
                 for i in range(0, len(rows), batch):
-                    shard.executemany(self._insert_sql, rows[i:i + batch])
+                    shard.executemany(spec["insert"], rows[i:i + batch])
                 shard.commit()
                 delta = shard.total_changes - before
-                cnt = shard.execute("SELECT COUNT(*) FROM sigs").fetchone()[0]
+                cnt = shard.execute(
+                    f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
                 shard.close()
                 inserted += delta
-                count_updates.append((self._shard_name(sid), cnt))
-                dirty.add(sid)
+                count_updates.append((ftype, self._shard_name(sid), cnt))
+                dirty.add((ftype, sid))
             with self.meta:
                 self.meta.executemany(
-                    "INSERT OR REPLACE INTO shard_counts(prefix,cnt) VALUES(?,?)",
-                    count_updates,
-                )
+                    "INSERT OR REPLACE INTO fuzzy_counts(type,prefix,cnt) VALUES(?,?,?)",
+                    count_updates)
                 self.meta.execute(
-                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,)
-                )
-            self._count += inserted
-            self._bloom_dirty |= dirty  # 新增签名的分片 bloom 失效, 待 finalize 重建
+                    "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,))
+                self.meta.execute(
+                    "INSERT OR REPLACE INTO meta(k,v) VALUES('counts_valid','1')")
+            self._counts = self._load_counts()
+            self._bloom_dirty |= dirty
         if basename not in self.source_files:
             self.source_files.append(basename)
         return inserted
 
-    # ---------- 查询 ----------
-    def check_hash(self, sha256_hex, file_size=None):
-        """按 sha256 反查模糊哈希增强信息 (命中返回含 5 个 fuzzy 字段的完整数据)。
+    # ---------- Finalize ----------
+    def finalize(self):
+        """导入完成后调用: 重建标记为 dirty 的 (type, shard) Bloom"""
+        status = {}
+        with self._lock:
+            dirty = list(self._bloom_dirty)
+            if dirty:
+                t0 = time.time()
+                rebuilt = 0
+                for ftype, sid in dirty:
+                    path = self._shard_path(sid)
+                    if not os.path.exists(path):
+                        continue
+                    conn = self._ro_conn(sid)
+                    if conn is None:
+                        continue
+                    lock = self._conn_locks.get(sid)
+                    if lock is None:
+                        continue
+                    spec = FUZZY_TABLE_SPECS[ftype]
+                    with lock:
+                        cnt = conn.execute(
+                            f"SELECT COUNT(*) FROM {spec['table']}").fetchone()[0]
+                        if cnt == 0:
+                            continue
+                        bf = BloomFilter(cnt, self.bloom_fp_rate)
+                        cur = conn.execute(
+                            f"SELECT {spec['col']} FROM {spec['table']}")
+                        while True:
+                            rows = cur.fetchmany(100_000)
+                            if not rows:
+                                break
+                            for (h,) in rows:
+                                bf.add(self._bloom_key(ftype, h))
+                    bf.save(self._bloom_path(ftype, sid))
+                    with self._cache_lock:
+                        self._blooms[(ftype, sid)] = bf
+                    rebuilt += 1
+                self._bloom_dirty.clear()
+                status["bloom_rebuilt"] = rebuilt
+                status["bloom_rebuilt_s"] = round(time.time() - t0, 1)
+        return status
 
-        与 sha256/md5 库 check_hash 同构: Bloom 排除短路 + 单分片 SQLite 点查;
-        仅收 64hex 主键; file_size 提供时做大小碰撞防护。
-        """
+    # ---------- 查询 ----------
+    def check_fuzzy(self, fuzzy_type, hash_value, file_size=None):
+        """按 fuzzy hash 值查询对应表。hash_value: ssdeep 传 str, BLOB 类型传 bytes。"""
         hits = []
-        if not sha256_hex or len(sha256_hex) != 64:
+        if fuzzy_type not in FUZZY_TABLE_SPECS:
             return hits
-        try:
-            digest = bytes.fromhex(sha256_hex)
-        except ValueError:
-            return hits
-        shard_id = self._route(digest, self.shard_count)
-        bf = self._load_bloom_shard(shard_id)
-        if bf is not None and digest not in bf:
+        spec = FUZZY_TABLE_SPECS[fuzzy_type]
+        sid = self._route(fuzzy_type, hash_value)
+        bf = self._load_bloom(fuzzy_type, sid)
+        bloom_key = self._bloom_key(fuzzy_type, hash_value)
+        if bf is not None and bloom_key not in bf:
             return hits
         row = self._query_shard(
-            shard_id,
-            "SELECT size,name,ssdeep,vhash,authentihash,imphash,rich_header_hash"
-            " FROM sigs WHERE sha256=?",
-            (digest,),
-        )
+            sid,
+            f"SELECT size, name, sha256 FROM {spec['table']} WHERE {spec['col']}=?",
+            (hash_value,))
         if row is None:
             return hits
-        sig_size, name, ssdeep, vhash, auth, imp, rich = row
+        sig_size, name, sha256_blob = row
         if file_size is not None and sig_size is not None and sig_size != file_size:
             return hits
+        sha256_hex = sha256_blob.hex() if sha256_blob else None
         hits.append({
             "engine": "Fuzzy Hash DB",
-            "type": "hash",
+            "type": "fuzzy",
             "name": name,
             "size": sig_size,
-            "detail": f"Fuzzy 命中: {sha256_hex}",
-            "fuzzy": {
-                "ssdeep": ssdeep,
-                "vhash": vhash.hex() if vhash else None,
-                "authentihash": auth.hex() if auth else None,
-                "imphash": imp.hex() if imp else None,
-                "rich_header_hash": rich.hex() if rich else None,
-            },
+            "detail": f"{spec['label']} 命中",
+            "fuzzy_type": fuzzy_type,
+            "sha256": sha256_hex,
         })
         return hits
 
-    # 文件扫描兼容接口: 本库主键即 sha256, 语义与 sha256 库 check 相同
-    def check(self, file_path, file_size, md5, sha1, sha256):
-        return self.check_hash(sha256, file_size)
+    def check_by_computed_hashes(self, ssdeep=None, imphash_hex=None,
+                                  authentihash_hex=None, file_size=None):
+        """批量查询: 用 staticinfo 计算出的 fuzzy hash 查各表, 返回命中列表"""
+        hits = []
+        if ssdeep:
+            hits.extend(self.check_fuzzy("ssdeep", ssdeep, file_size))
+        if imphash_hex:
+            try:
+                hits.extend(self.check_fuzzy("imphash", bytes.fromhex(imphash_hex), file_size))
+            except ValueError:
+                pass
+        if authentihash_hex:
+            try:
+                hits.extend(self.check_fuzzy("authentihash", bytes.fromhex(authentihash_hex), file_size))
+            except ValueError:
+                pass
+        return hits
+
+    # ---------- 统计 ----------
+    def stats(self):
+        with self._cache_lock:
+            bloom_items = list(self._blooms.values())
+            open_conns = len(self._conns)
+        bloom_info = None
+        if bloom_items:
+            total_mem = sum(b.mem_bytes for b in bloom_items)
+            bloom_info = {
+                "shards_configured": self.shard_count,
+                "types": len(FUZZY_TYPES),
+                "loaded": len(bloom_items),
+                "mem_mb": round(total_mem / 1048576, 2),
+                "fp_rate": self.bloom_fp_rate,
+            }
+        shard_files = [
+            f for f in os.listdir(self.shard_dir)
+            if f.endswith(".db") and f != "_meta.db"
+            and len(f) == 5 and all(c in "0123456789abcdef" for c in f[:2])
+        ]
+        db_size = 0
+        for f in shard_files:
+            for suffix in ("", "-wal", "-shm"):
+                try:
+                    db_size += os.path.getsize(os.path.join(self.shard_dir, f + suffix))
+                except OSError:
+                    pass
+        try:
+            db_size += os.path.getsize(self.meta_path)
+        except OSError:
+            pass
+        return {
+            "count": self.count,
+            "counts_by_type": dict(self._counts),
+            "tier": "fuzzy-5table-sharded-sqlite" if self._blooms else "sharded-sqlite",
+            "bloom": bloom_info,
+            "shards": {
+                "configured": self.shard_count,
+                "total": len(shard_files),
+                "types": len(FUZZY_TYPES),
+                "open_conns": open_conns,
+                "max_open": self.max_open_shards,
+            },
+            "db_size_mb": round(db_size / 1048576, 1),
+        }
+
+    def close(self):
+        with self._lock:
+            with self._cache_lock:
+                conns = list(self._conns.values()) + self._retired
+                self._conns.clear()
+                self._conn_locks.clear()
+                self._retired = []
+                self._blooms.clear()
+            for conn in conns:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            self.meta.close()
 
 
 # ============================================================
@@ -1268,7 +1722,7 @@ class Scanner:
         self.hash_db = hash_db
         self.yara_scanner = yara_scanner
         self.md5_db = md5_db  # 独立 MD5 分片库 (可选); 命中并入 detections
-        self.fuzzy_db = fuzzy_db  # 模糊哈希增强库 (可选); sha256 命中时附加 ssdeep/vhash 等信息
+        self.fuzzy_db = fuzzy_db  # 模糊哈希库 (可选); phase2 用计算的 fuzzy hash 按值查 5 张表
 
     def scan_file(self, file_path, filename=None):
         """扫描单个文件 (兼容接口)。
@@ -1333,9 +1787,7 @@ class Scanner:
         detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
         if self.md5_db is not None:
             detections.extend(self.md5_db.check_hash(md5, file_size))
-        if self.fuzzy_db is not None:
-            # 模糊哈希增强库: sha256 命中时附加 ssdeep/vhash/authentihash/imphash/rich_header_hash
-            detections.extend(self.fuzzy_db.check_hash(sha256, file_size))
+        # 模糊哈希查询移至 phase2: 需先计算 ssdeep/imphash/authentihash 才能按值查询
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
             "filename": filename or "unnamed",
@@ -1359,7 +1811,7 @@ class Scanner:
     def _phase2(self, data, filename):
         """阶段 2 (深度, 后台执行): YARA 规则匹配 + 静态信息/模糊哈希 + 查壳
 
-        返回合并阶段 1 所需的补充字段: detections(YARA) / static_info / static_ms / elapsed_ms / scanners。
+        返回合并阶段 1 所需的补充字段: detections(YARA + Fuzzy Hash) / static_info / static_ms / elapsed_ms / scanners。
         """
         start = time.time()
         detections = list(self.yara_scanner.scan_data(data))
@@ -1369,10 +1821,23 @@ class Scanner:
         static_info = staticinfo.compute_static_info(data)
         static_ms = round((time.time() - static_start) * 1000, 1)
 
+        # 模糊哈希签名库查询: 用 staticinfo 计算出的 ssdeep/imphash/authentihash 查各表
+        if self.fuzzy_db is not None:
+            fuzzy_info = static_info.get("fuzzy", {}) if static_info else {}
+            fuzzy_hits = self.fuzzy_db.check_by_computed_hashes(
+                ssdeep=fuzzy_info.get("ssdeep"),
+                imphash_hex=fuzzy_info.get("imphash"),
+                authentihash_hex=fuzzy_info.get("authentihash"),
+                file_size=len(data),
+            )
+            detections.extend(fuzzy_hits)
+
         elapsed_ms = round((time.time() - start) * 1000, 1)
         scanners = (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else [])
+        if self.fuzzy_db is not None:
+            scanners.append("Fuzzy Hash DB")
         return {
-            "detections": detections,            # 仅 YARA 命中
+            "detections": detections,            # YARA + Fuzzy Hash 命中
             "static_info": static_info,
             "static_ms": static_ms,
             "elapsed_ms": elapsed_ms,            # 阶段2耗时

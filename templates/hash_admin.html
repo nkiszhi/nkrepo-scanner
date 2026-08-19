@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>哈希管理 - NKAMG Scanner</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+
+<!-- ================= 顶部导航 ================= -->
+<nav class="topbar">
+  <div class="nav-inner">
+    <a class="brand" href="/">
+      <span class="brand-logo">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2l8 3.5v5.2c0 5-3.4 9.6-8 11.3-4.6-1.7-8-6.3-8-11.3V5.5L12 2z"/>
+          <path d="M8.5 12l2.4 2.4 4.6-4.8"/>
+        </svg>
+      </span>
+      NKAMG <em>Scanner</em>
+    </a>
+    <div class="nav-links">
+      <a href="/">搜索</a>
+      <a href="/scan">扫描</a>
+      <a href="/admin/hash" class="active">管理</a>
+      <a href="/#stats">统计</a>
+    </div>
+    <div class="nav-right">
+      <span class="engine-pill" id="enginePill"><span class="dot"></span><span id="engineText">引擎加载中…</span></span>
+      <a href="/admin/logout" class="logout-btn">退出登录</a>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+
+  <!-- ================= Hero ================= -->
+  <section class="hero">
+    <h1>哈希<span class="grad">管理</span></h1>
+    <div class="hero-sub">新增 / 查询 / 删除 / 批量导入签名 · 恶意代码检测功能无需登录即可使用</div>
+  </section>
+
+  <!-- ================= 统计 (复用 loadStats 的 ID) ================= -->
+  <section class="stats" id="stats">
+    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名（SHA256）</div></div>
+    <div class="stat"><div class="num" id="md5Count">-</div><div class="lbl">哈希签名（MD5）</div></div>
+    <div class="stat"><div class="num" id="fuzzyCount">-</div><div class="lbl">模糊哈希增强</div></div>
+    <div class="stat"><div class="num" id="yaraCount">-</div><div class="lbl">YARA 规则</div></div>
+    <div class="stat"><div class="num" id="pkCount">-</div><div class="lbl">壳库扩展规则</div></div>
+    <div class="stat"><div class="num" id="dbSize">-</div><div class="lbl">签名库存储</div></div>
+  </section>
+
+  <!-- ================= 管理操作区 ================= -->
+  <div class="mgmt-grid">
+
+    <!-- 添加哈希 -->
+    <div class="mgmt-card">
+      <h2>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        添加哈希签名
+      </h2>
+      <div class="desc">手动录入单条整文件哈希（64 位=SHA256，32 位=MD5），立即生效可被扫描命中</div>
+      <div class="field-row">
+        <div class="field"><label>哈希值</label><input id="addHash" placeholder="64 位 SHA256 / 32 位 MD5（0-9 a-f）"></div>
+        <div class="field size-field"><label>大小(可选)</label><input id="addSize" placeholder="* 或字节数"></div>
+        <div class="field"><label>名称</label><input id="addName" placeholder="如 Trojan.Generic"></div>
+        <button class="btn btn-primary" id="addBtn">添加</button>
+      </div>
+      <div class="result-box" id="addResult"></div>
+    </div>
+
+    <!-- 查询 / 删除 -->
+    <div class="mgmt-card">
+      <h2>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+        查询 / 删除
+      </h2>
+      <div class="desc">按哈希查询签名库是否存在，或删除单条签名</div>
+      <div class="field-row">
+        <div class="field"><label>哈希值</label><input id="qHash" placeholder="64 位 SHA256 / 32 位 MD5"></div>
+        <button class="btn btn-ghost" id="lookupBtn">查询</button>
+        <button class="btn btn-danger" id="delBtn">删除</button>
+      </div>
+      <div class="result-box" id="qResult"></div>
+    </div>
+
+    <!-- 批量导入 -->
+    <div class="mgmt-card full">
+      <h2>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+        批量导入签名文件
+      </h2>
+      <div class="desc">上传 <b>.hdb / .hsb</b>（哈希签名）或 <b>.yar / .yara</b>（YARA 规则）文件，导入到当前签名库（幂等可重复）</div>
+      <div class="dropzone" id="dz">
+        <div class="dz-icon">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#4f8cff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4"/><path d="M7 9l5-5 5 5"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+        </div>
+        <div class="dz-main">拖拽文件到此处，或点击选择</div>
+        <div class="dz-hint">支持 .hdb / .hsb / .yar / .yara · 可多选</div>
+        <input type="file" id="fi" multiple hidden>
+      </div>
+      <div class="result-box" id="impResult"></div>
+    </div>
+
+  </div>
+
+  <footer>
+    NKAMG Scanner · 哈希管理页面 · 仅管理员可访问 · 检测功能对所有人开放<br>
+    仅用于安全研究
+  </footer>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script src="/static/admin.js"></script>
+<script>
+/* bfcache 破除: 登出后按返回键若浏览器从内存还原本页, 强制重新请求服务端 (未登录会被 302 到登录页) */
+window.addEventListener('pageshow', function (e) {
+  if (e.persisted) location.reload();
+});
+</script>
+</body>
+</html>

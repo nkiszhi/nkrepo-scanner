@@ -4,12 +4,15 @@ NKAMG Scanner - Web 服务入口
 """
 import json
 import os
+import hashlib
+import hmac
 import threading
 import time
 import uuid
 from collections import OrderedDict, defaultdict, deque
+from functools import wraps
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, redirect, url_for, abort, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from scanner import FuzzySignatureDB, HashSignatureDB, Scanner, YaraScanner
@@ -33,6 +36,10 @@ DEFAULT_CONFIG = {
         "layout": "hex",           # MD5 库分片布局: "hex" = 按前两字符分 256 片; "modulo" = 取模分 N 片
         "max_open_shards": 16,     # 256 片时建议增大 LRU 缓存上限, 减少频繁换页
     },
+    "fuzzy": {
+        "layout": "hex",           # 模糊哈希库分片布局: "hex" = 按首字节分 256 片; 5 表共享分片文件
+        "max_open_shards": 16,     # LRU 缓存上限 (连接 × bloom)
+    },
     "hash_db": {
         "max_open_shards": 4,      # 分片 SQLite 连接 / Bloom 位图懒加载 LRU 上限
     },
@@ -53,6 +60,7 @@ DEFAULT_CONFIG = {
         "rules_dir": "packer_rules",      # 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径)
         "max_yara_bytes": 16777216,       # 外部规则匹配的样本大小上限 (16MB)
     },
+    "admin": {},                          # 管理员凭据 (哈希管理页面登录); config.json 的 admin 节会合并进来
 }
 
 
@@ -88,12 +96,32 @@ md5cfg = cfg.get("md5", {})
 _md5_layout = str(md5cfg.get("layout", "modulo")).strip()
 _md5_max_open = int(md5cfg.get("max_open_shards", hcfg["max_open_shards"]))
 
+fuzzycfg = cfg.get("fuzzy", {})
+_fuzzy_layout = str(fuzzycfg.get("layout", "hex")).strip()
+_fuzzy_max_open = int(fuzzycfg.get("max_open_shards", hcfg["max_open_shards"]))
+
 # 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建; 仅用于放置测试样本, /scan 不落盘
 _uploads_cfg = str(scfg.get("uploads_dir", "uploads")).strip()
 UPLOAD_DIR = _uploads_cfg if os.path.isabs(_uploads_cfg) else os.path.join(BASE_DIR, _uploads_cfg)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
+
+# 会话密钥: 用于管理员登录态 Cookie 签名; 默认空时随机生成 (重启即失效, 仅本地兜底)
+_secret_key = str(scfg.get("secret_key", "")).strip()
+if not _secret_key:
+    import secrets as _secrets
+    _secret_key = _secrets.token_hex(24)
+    print("[NKAMG] 未配置 server.secret_key, 已生成临时会话密钥 (重启失效, 建议在 config.json 配置)")
+app.secret_key = _secret_key
+
+# ---------- 管理员凭据 (哈希管理页面登录) ----------
+# 检测功能 (/ /scan /api/*) 无需登录; 仅 /admin/hash 与 /api/admin/* 需登录。
+# 密码以 SHA-256(salt:password) 形式存储, 明文不出现在配置中。
+ADMIN_CFG = cfg.get("admin", {}) or {}
+ADMIN_USER = str(ADMIN_CFG.get("username", "")).strip() or "admin"
+ADMIN_SALT = str(ADMIN_CFG.get("salt", "")).strip()
+ADMIN_PW_HASH = str(ADMIN_CFG.get("password_hash", "")).strip().lower()
 
 # ---------- 初始化扫描引擎 ----------
 # 哈希签名持久化在动态分片 SQLite (signatures/sha256.db.shards/),
@@ -123,19 +151,19 @@ if os.path.isdir(_md5_base + ".shards"):
     print(f"[NKAMG] MD5 库就绪: {md5_db.count:,} 条")
 else:
     print("[NKAMG] 未检测到 MD5 分片库, 跳过 (运行 build_md5_db.py 可构建)")
-# 模糊哈希增强库 (与 SHA256/MD5 库并列的第三库): 由 build_fuzzy_db.py 从 hdb/
-# 8 字段行 (sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash)
-# 提取 5 个模糊哈希字段构建 (signatures/fuzzy.db.shards/); 未构建则降级 None
+# 模糊哈希签名库 (5 表独立结构): 由 build_fuzzy_db.py 从 hdb/
+# 8 字段行提取 5 个模糊哈希, 每种独立成表, 以 fuzzy hash 为主键
+# (signatures/fuzzy.db.shards/); 256 hex 分片, 每分片含 5 张表
 fuzzy_db = None
 _fuzzy_base = os.path.join(SIG_DIR, "fuzzy.db")
 if os.path.isdir(_fuzzy_base + ".shards"):
     fuzzy_db = FuzzySignatureDB(
         _fuzzy_base,
-        shard_count=int(bcfg["shards"]),
         bloom_fp_rate=float(bcfg["fp_rate"]),
-        max_open_shards=int(hcfg["max_open_shards"]),
+        max_open_shards=_fuzzy_max_open,
+        layout=_fuzzy_layout,
     )
-    print(f"[NKAMG] 模糊哈希库就绪: {fuzzy_db.count:,} 条")
+    print(f"[NKAMG] 模糊哈希库就绪: {fuzzy_db.count:,} 条 ({fuzzy_db._counts})")
 else:
     print("[NKAMG] 未检测到模糊哈希分片库, 跳过 (运行 build_fuzzy_db.py 可构建)")
 yara_scanner = YaraScanner()
@@ -204,6 +232,74 @@ P2_MAX_MB = P2_MAX_BYTES // (1024 * 1024)
 P2_CONCURRENCY = max(1, int(scfg.get("phase2_concurrency", 4)))
 P2_SEM = threading.Semaphore(P2_CONCURRENCY)
 
+# ---------- 扫描结果缓存 (按文件 SHA256 命名的 JSON) ----------
+# 同一文件 (内容相同 → SHA256 相同) 重复扫描时直接返回缓存结果, 跳过两段式扫描;
+# 前端可通过 "重新扫描" 按钮 (rescan=1) 强制绕过缓存重新分析并覆盖缓存。
+RESULTS_CACHE_DIR = os.path.join(BASE_DIR, "scan_cache")
+os.makedirs(RESULTS_CACHE_DIR, exist_ok=True)
+
+
+def _cache_path(sha256_hex):
+    """缓存文件路径: scan_cache/<sha256>.json (小写十六进制, 防大小写歧义)"""
+    return os.path.join(RESULTS_CACHE_DIR, str(sha256_hex).strip().lower() + ".json")
+
+
+def _load_cached_result(sha256_hex):
+    """读取缓存结果; 不存在或损坏返回 None"""
+    path = _cache_path(sha256_hex)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+# 提交历史上限: 超过后保留最近的条目 (防止同一文件反复提交撑爆 JSON)
+HISTORY_MAX = 100
+
+
+def _append_history(result, filename, submitted_at):
+    """向扫描结果 dict 追加一条提交历史 {filename, submitted_at} (原地修改)"""
+    hist = result.get("history")
+    if not isinstance(hist, list):
+        hist = []
+    hist.append({"filename": filename, "submitted_at": submitted_at})
+    result["history"] = hist[-HISTORY_MAX:]
+    return result
+
+
+def _save_cached_result(sha256_hex, result):
+    """写入缓存结果 (临时文件 + 原子替换, 防并发写坏文件)
+
+    Windows 下目标文件被并发读取时 os.replace 可能抛 PermissionError (共享冲突),
+    此处短暂重试; 仍失败则退回直接覆写 (非原子但内容完整)。
+    """
+    path = _cache_path(sha256_hex)
+    tmp = path + ".tmp." + uuid.uuid4().hex[:8]
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+        for i in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (i + 1))
+        # 重试仍失败: 直接覆写目标文件
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+    except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
+        pass
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
 
 def _require_auth():
     """api_token 已配置时校验 Authorization: Bearer / ?token=; 未配置放行 (返回 None)"""
@@ -215,6 +311,48 @@ def _require_auth():
     if request.args.get("token") == API_TOKEN:
         return None
     return jsonify({"error": "未授权: 缺少或无效的 API token"}), 401
+
+
+# ---------- 管理员会话认证 (哈希管理页面登录) ----------
+# 检测功能 (/ /scan /api/task /api/stats /api/hash) 完全不需要登录;
+# 仅 /admin/hash 页面与 /api/admin/* 接口要求管理员登录 (session 标记)。
+def is_admin():
+    """当前会话是否已登录管理员"""
+    return bool(session.get("admin"))
+
+
+def _check_admin_credentials(user, pw):
+    """校验用户名 + 密码; 存储形式 SHA-256(salt:password), 明文不在配置中"""
+    if not ADMIN_PW_HASH or not user:
+        return False
+    if user != ADMIN_USER:
+        return False
+    calc = hashlib.sha256(f"{ADMIN_SALT}:{pw}".encode("utf-8")).hexdigest()
+    return hmac.compare_digest(calc, ADMIN_PW_HASH)  # 常量时间比较, 防计时侧信道
+
+
+def admin_required(view):
+    """装饰器: 仅放行已登录管理员; 未登录 GET 跳转登录页, 其余返回 401 JSON"""
+    @wraps(view)
+    def _wrapped(*args, **kwargs):
+        if not is_admin():
+            if request.method == "GET":
+                nxt = request.full_path
+                return redirect(url_for("admin_login", **({"next": nxt} if nxt else {})))
+            return jsonify({"error": "未登录管理员, 请先登录"}), 401
+        return view(*args, **kwargs)
+    return _wrapped
+
+
+def _route_hash_db(h):
+    """按哈希长度路由到对应库: 64hex→SHA256 库, 32hex→MD5 库(若已构建)"""
+    h = (h or "").strip().lower()
+    valid = all(c in "0123456789abcdef" for c in h) if h else False
+    if len(h) == 64 and valid:
+        return hash_db, "sha256"
+    if len(h) == 32 and valid:
+        return (md5_db if md5_db is not None else None), "md5"
+    return None, None
 
 
 def _rate_limited():
@@ -316,9 +454,7 @@ def hash_lookup(hash):
         })
     if len(h) == 64 and valid:  # SHA256
         hits = list(hash_db.check(None, None, None, None, h))
-        if fuzzy_db is not None:
-            # 模糊哈希增强: sha256 命中时附加 ssdeep/vhash/authentihash/imphash/rich_header_hash
-            hits.extend(fuzzy_db.check_hash(h))
+        # 模糊哈希库不再按 SHA256 查询 (fuzzy hash 是主键, 需按 hash 值查)
         return jsonify({
             "sha256": h,
             "hash_algo": "sha256",
@@ -352,14 +488,48 @@ def scan():
 
     # 直接内存读取扫描 (受 MAX_CONTENT_LENGTH 限制), 全程不落盘
     data = f.read()
+    # 文件提交时间 (本机时间): 注入扫描结果, 供前端展示
+    submitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---------- 结果缓存: 按 SHA256 查缓存, 命中直接返回 (跳过两段式扫描) ----------
+    # rescan=1 (前端 "重新扫描" 按钮) 强制绕过缓存重新分析, 完成后覆盖缓存。
+    sha256_hex = hashlib.sha256(data).hexdigest()
+    rescan = request.form.get("rescan") in ("1", "true", "on")
+    cached = None if rescan else _load_cached_result(sha256_hex)
+    if cached is not None:
+        cached_result = dict(cached)
+        # 文件名/提交时间以本次上传为准 (内容相同但文件名可能不同, 其余结果内容一致)
+        cached_result["filename"] = f.filename
+        cached_result["submitted_at"] = submitted_at
+        # 提交历史: 追加本次 {filename, submitted_at} 并写回缓存 (命中缓存也记录每次提交)
+        _append_history(cached_result, f.filename, submitted_at)
+        _save_cached_result(sha256_hex, cached_result)
+        return jsonify({
+            "task_id": None,
+            "status": "done",
+            "cached": True,
+            "sha256": sha256_hex,
+            "result": cached_result,
+        })
+
+    # 提交历史: 重新扫描时从既有缓存延续历史 (首次扫描为空), 再追加本次提交
+    history = []
+    if rescan:
+        old = _load_cached_result(sha256_hex)
+        if old and isinstance(old.get("history"), list):
+            history = list(old["history"])[-HISTORY_MAX:]
+    history.append({"filename": f.filename, "submitted_at": submitted_at})
+
     _task_cleanup()
     task_id = uuid.uuid4().hex[:12]
 
     # 阶段 1: 哈希 + 文件类型 + 哈希签名库命中 → 立即返回 (毫秒级)
     phase1 = scanner.scan_phase1(data, filename=f.filename)
+    phase1["submitted_at"] = submitted_at   # 提交时间随阶段1结果下发/合并
     task = {
         "id": task_id,
         "ts": time.time(),
+        "history": history,                 # 提交历史 (含本次提交), 随合并结果返回/入缓存
         "phase1": phase1,
         "phase2": None,
         "status": "phase2",   # 阶段 2 后台执行中
@@ -391,6 +561,17 @@ def scan():
                     p2 = scanner.scan_phase2(data, filename=f.filename)
                 task["phase2"] = p2
                 task["status"] = "done"
+                # 扫描完成 → 写入结果缓存 (scan_cache/<sha256>.json), 供后续重复扫描秒回
+                try:
+                    merged = scanner.merge_phases(task["phase1"], p2)
+                    if p2.get("note"):
+                        merged["phase2_note"] = p2["note"]
+                    merged["submitted_at"] = submitted_at
+                    merged["history"] = history
+                    merged["scanned_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    _save_cached_result(sha256_hex, merged)
+                except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
+                    pass
             except Exception as e:  # noqa: BLE001 - 后台异常记录到任务, 由轮询端呈现
                 task["error"] = str(e)
                 task["status"] = "error"
@@ -415,9 +596,167 @@ def task_status(task_id):
     if task["status"] == "error":
         return jsonify({"task_id": task_id, "status": "error", "error": task["error"]})
     result = scanner.merge_phases(task["phase1"], task["phase2"])
+    result["submitted_at"] = task["phase1"].get("submitted_at")   # 文件提交时间
+    result["history"] = task.get("history") or []                 # 提交历史
     if task["phase2"].get("note"):
         result["phase2_note"] = task["phase2"]["note"]
     return jsonify({"task_id": task_id, "status": "done", "result": result})
+
+
+# ================= 文件详情页 (VirusTotal 风格 /file/<sha256> 动态路径) =================
+# 以文件 SHA256 作为资源唯一标识放入 URL 路径参数; 页面从扫描结果缓存加载完整报告。
+def _is_valid_sha256(h):
+    """64 位十六进制 (大小写不敏感, 统一转小写)"""
+    h = (h or "").strip().lower()
+    return h if len(h) == 64 and all(c in "0123456789abcdef" for c in h) else None
+
+
+@app.route("/file/<file_hash>")
+def file_page(file_hash):
+    """文件扫描报告详情页: /file/<sha256> (参考 VirusTotal /gui/file/<hash>)"""
+    h = _is_valid_sha256(file_hash)
+    # 非法哈希仍渲染页面, 由前端给出友好提示 (保持与 VT 一致的体验而非裸 404)
+    return render_template("file.html", file_hash=h or (file_hash or ""), valid=bool(h))
+
+
+@app.route("/api/file/<file_hash>")
+def file_report(file_hash):
+    """按 SHA256 读取缓存中的扫描报告 (scan_cache/<sha256>.json); 未扫描过返回 404"""
+    auth_err = _require_auth()
+    if auth_err:
+        return auth_err
+    h = _is_valid_sha256(file_hash)
+    if not h:
+        return jsonify({"error": "无效的哈希: 需要 64 位 (SHA256) 十六进制字符串"}), 400
+    cached = _load_cached_result(h)
+    if cached is None:
+        return jsonify({"found": False, "sha256": h, "error": "该文件尚未在本系统扫描过"}), 404
+    return jsonify({"found": True, "sha256": h, "result": cached})
+
+
+# ================= 管理员登录 / 哈希管理页面 =================
+# 检测功能无需登录; 以下路由保护哈希管理页面与对应 API。
+@app.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    """管理员登录页 (用户名 + 密码); GET 渲染表单, POST 校验后写 session"""
+    if is_admin():
+        return redirect(url_for("admin_hash"))
+    if request.method == "POST":
+        user = (request.form.get("username") or "").strip()
+        pw = request.form.get("password") or ""
+        if _check_admin_credentials(user, pw):
+            session["admin"] = True
+            nxt = request.args.get("next")
+            # 防开放重定向: 仅允许站内相对路径
+            if not nxt or not nxt.startswith("/") or nxt.startswith("//"):
+                nxt = url_for("admin_hash")
+            return redirect(nxt)
+        return render_template("login.html", error="用户名或密码错误", username=user)
+    return render_template("login.html")
+
+
+@app.route("/admin/logout")
+def admin_logout():
+    """退出登录, 清空整个会话 (比 pop 单键更彻底)"""
+    session.clear()
+    return redirect(url_for("admin_login"))
+
+
+@app.after_request
+def _admin_no_store(resp):
+    """管理页面禁止缓存: 防止登出后浏览器从缓存/bfcache 还原管理页, 造成"未退出"假象"""
+    if request.path.startswith("/admin"):
+        resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+    return resp
+
+
+@app.route("/admin/hash")
+@admin_required
+def admin_hash():
+    """哈希管理页面 (需登录): 增 / 删 / 查 / 批量导入签名"""
+    return render_template("hash_admin.html")
+
+
+@app.route("/api/admin/hash/<hash>")
+@admin_required
+def admin_hash_lookup(hash):
+    """按哈希查询单条签名 (32hex→MD5 库, 64hex→SHA256 库); 命中与否均 200"""
+    db, algo = _route_hash_db(hash)
+    if db is None:
+        return jsonify({"error": "无效的哈希或对应库未构建: 需要 32 位(MD5) 或 64 位(SHA256) 十六进制"}), 400
+    hits = list(db.check_hash(hash))
+    return jsonify({"hash": hash, "hash_algo": algo, "hit": bool(hits), "detections": hits})
+
+
+@app.route("/api/admin/hash", methods=["POST"])
+@admin_required
+def admin_hash_add():
+    """新增单条哈希签名 (hash:size:name); 自动路由 SHA256/MD5 库"""
+    data = request.get_json(silent=True) or {}
+    h = (data.get("hash") or "").strip().lower()
+    size = data.get("size")
+    name = (data.get("name") or "").strip()
+    db, algo = _route_hash_db(h)
+    if db is None:
+        return jsonify({"error": "无效的哈希或对应库未构建: 需要 32 位(MD5) 或 64 位(SHA256) 十六进制"}), 400
+    try:
+        added = db.add_hash(h, size, name)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"hash": h, "hash_algo": algo, "added": added, "total": db.count})
+
+
+@app.route("/api/admin/hash/<hash>", methods=["DELETE"])
+@admin_required
+def admin_hash_delete(hash):
+    """删除单条哈希签名; 返回删除条数"""
+    db, algo = _route_hash_db(hash)
+    if db is None:
+        return jsonify({"error": "无效的哈希或对应库未构建"}), 400
+    try:
+        deleted = db.delete_hash(hash)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    return jsonify({"hash": hash, "hash_algo": algo, "deleted": deleted, "total": db.count})
+
+
+@app.route("/api/admin/import", methods=["POST"])
+@admin_required
+def admin_import():
+    """批量导入签名文件: .hdb/.hsb → 哈希库 (SHA256 + MD5), .yar/.yara → YARA 规则库"""
+    if "file" not in request.files:
+        return jsonify({"error": "未收到文件"}), 400
+    f = request.files["file"]
+    if not f.filename:
+        return jsonify({"error": "空文件名"}), 400
+    fname = os.path.basename(f.filename)
+    lower = fname.lower()
+    if not lower.endswith((".hdb", ".hsb", ".yar", ".yara")):
+        return jsonify({"error": "仅支持 .hdb/.hsb (哈希) 或 .yar/.yara (YARA) 文件"}), 400
+    dest = os.path.join(SIG_DIR, fname)
+    f.save(dest)
+    result = {"saved": fname}
+    if lower.endswith((".hdb", ".hsb")):
+        result["type"] = "hash"
+        sha_added = hash_db.import_hdb(dest)
+        md5_added = md5_db.import_hdb(dest) if md5_db else 0
+        hash_db.finalize()
+        if md5_db:
+            md5_db.finalize()
+        result["sha256_added"] = sha_added
+        result["md5_added"] = md5_added
+        result["sha256_total"] = hash_db.count
+        result["md5_total"] = md5_db.count if md5_db else 0
+    else:  # .yar / .yara
+        result["type"] = "yara"
+        added = yara_scanner.load_rules(dest)
+        result["yara_added"] = added
+        result["yara_total"] = yara_scanner.rule_count
+        if added == 0 and yara_scanner.errors:
+            result["error"] = f"规则编译失败: {yara_scanner.errors[-1][1]}"
+    return jsonify(result)
 
 
 if __name__ == "__main__":

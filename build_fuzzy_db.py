@@ -1,19 +1,24 @@
 #!/usr/bin/env python
-"""构建模糊哈希增强库 (FuzzySignatureDB) — 与 SHA256/MD5 库并列的第三库。
+"""构建模糊哈希签名库 (FuzzySignatureDB) — 5 表独立结构。
 
 数据源: hdb/ 下 ClamAV 官方 hdb 分桶文件 (00.hdb ~ ff.hdb, 256 个)。
 行格式 (8 字段):
   sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
 
-提取其中 5 个模糊哈希字段 (ssdeep/vhash/authentihash/imphash/rich_header_hash),
-表结构参考 sha256/md5 库: sigs(sha256 BLOB PRIMARY KEY, size, name,
-  ssdeep TEXT, vhash/authentihash/imphash/rich_header_hash BLOB) WITHOUT ROWID
-只存**至少一个模糊字段非空**的行 (无 fuzzy 信息的行仅存在于 sha256 库即可)。
+每种 fuzzy hash 独立成表, 以 fuzzy hash 本身为主键:
+  sigs_ssdeep(ssdeep TEXT PK, size, name, sha256 BLOB)
+  sigs_vhash(vhash BLOB PK, size, name, sha256 BLOB)
+  sigs_authentihash(authentihash BLOB PK, size, name, sha256 BLOB)
+  sigs_imphash(imphash BLOB PK, size, name, sha256 BLOB)
+  sigs_rich_header_hash(rich_header_hash BLOB PK, size, name, sha256 BLOB)
 
-幂等导入 signatures/fuzzy.db 分片 (shard_count=4) + 重建 bloom。
-增量更新: 重新下载 hdb 分桶后重跑本脚本, 仅新增 sha256 主键行入库 (INSERT OR IGNORE)。
+每个非空 fuzzy 字段按自身值路由到 00~ff 分片, 写入对应表。
+256 hex 分片 (layout=hex), 每个分片文件含 5 张表。
+
+幂等导入: INSERT OR IGNORE 去重, 重跑仅新增。
 用法: python build_fuzzy_db.py
 """
+import argparse
 import glob
 import os
 import sys
@@ -26,12 +31,18 @@ HDB_DIR = os.path.join(HERE, "hdb")
 
 
 def main():
-    files = sorted(glob.glob(os.path.join(HDB_DIR, "*.hdb")))
+    ap = argparse.ArgumentParser(description="构建模糊哈希签名库 (5 表独立结构)")
+    ap.add_argument("--hdb-dir", default=HDB_DIR,
+                    help=f"hdb 分桶文件目录 (默认: {HDB_DIR})")
+    args = ap.parse_args()
+    hdb_dir = args.hdb_dir
+
+    files = sorted(glob.glob(os.path.join(hdb_dir, "*.hdb")))
     if not files:
-        print(f"[NKAMG][FUZZY] 未找到 hdb 文件: {HDB_DIR}")
+        print(f"[NKAMG][FUZZY] 未找到 hdb 文件: {hdb_dir}")
         sys.exit(1)
-    print(f"[NKAMG][FUZZY] 数据源: {len(files)} 个分桶 hdb 文件 ({HDB_DIR})")
-    db = FuzzySignatureDB(DB, shard_count=4)
+    print(f"[NKAMG][FUZZY] 数据源: {len(files)} 个分桶 hdb 文件 ({hdb_dir})")
+    db = FuzzySignatureDB(DB, layout="hex")
     added_total = 0
     for p in files:
         if db.already_imported(os.path.basename(p)):
@@ -42,6 +53,7 @@ def main():
               f"(累计 {db.count:,}, 耗时见总计时)")
         added_total += n
     print(f"\n[NKAMG][FUZZY] 本次新增 {added_total:,} 条, 库总条数 {db.count:,}")
+    print(f"[NKAMG][FUZZY] 各类型计数: {db._counts}")
     st = db.finalize()
     print(f"[NKAMG][FUZZY] bloom 重建: {st}")
     print(f"[NKAMG][FUZZY] stats: {db.stats()}")

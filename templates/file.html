@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>文件报告 - NKAMG Scanner</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<!-- ================= 顶部导航 ================= -->
+<nav class="topbar">
+  <div class="nav-inner">
+    <a class="brand" href="/">
+      <span class="brand-logo">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2l8 3.5v5.2c0 5-3.4 9.6-8 11.3-4.6-1.7-8-6.3-8-11.3V5.5L12 2z"/>
+          <path d="M8.5 12l2.4 2.4 4.6-4.8"/>
+        </svg>
+      </span>
+      NKAMG <em>Scanner</em>
+    </a>
+    <div class="nav-links">
+      <a href="/">搜索</a>
+      <a href="/scan">扫描</a>
+      <a href="/#stats">统计</a>
+      <a href="/admin/hash">管理</a>
+    </div>
+    <div class="nav-right">
+      <span class="engine-pill" id="enginePill"><span class="dot"></span><span id="engineText">引擎加载中…</span></span>
+    </div>
+  </div>
+</nav>
+
+<div class="container">
+
+  <!-- ================= Hero: 文件 SHA256 ================= -->
+  <section class="hero">
+    <h1>文件<span class="grad">扫描报告</span></h1>
+    <div class="hero-sub" style="font-family:var(--mono);word-break:break-all" id="heroHash">-</div>
+  </section>
+
+  <!-- ================= 结果区 ================= -->
+  <div class="results-empty" id="emptyHint">正在加载扫描报告…</div>
+  <section class="results" id="results"></section>
+
+  <footer>
+    NKAMG Scanner · 参考 <a href="https://www.clamav.net" target="_blank">ClamAV</a> 签名格式 · 哈希 + YARA + PE 静态分析<br>
+    仅用于安全研究
+  </footer>
+</div>
+
+<script src="/static/app.js"></script>
+<script>
+/* ================= 文件详情页: /file/<sha256> ================= */
+const FILE_HASH = {{ file_hash | tojson }};
+const HASH_VALID = {{ (valid | tojson) if valid is defined else 'false' }};
+const results = document.getElementById('results');
+const emptyHint = document.getElementById('emptyHint');
+
+document.title = (HASH_VALID ? FILE_HASH.slice(0, 16) + '…' : '文件报告') + ' - NKAMG Scanner';
+document.getElementById('heroHash').textContent = HASH_VALID ? FILE_HASH : ('无效的文件标识: ' + FILE_HASH);
+
+if (!HASH_VALID) {
+  pushCard(mkErrCard('无效的链接',
+    'URL 路径需要 64 位 SHA256 十六进制哈希作为文件唯一标识, 例如 /file/' + 'a'.repeat(64)), results, emptyHint);
+} else {
+  const card = mkScanCard({ name: FILE_HASH.slice(0, 24) + '…', size: 0 }, 'file');
+  card.querySelector('.banner-title').textContent = '正在加载扫描报告…';
+  card.querySelector('.banner-sub').innerHTML = 'SHA256 <b>' + esc(FILE_HASH) + '</b>';
+  pushCard(card, results, emptyHint);
+
+  fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
+    .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, d }))
+      .catch(() => ({ ok: false, status: r.status, d: null })))
+    .then(({ ok, d }) => {
+      if (d && d.found && d.result) {
+        render(card, d.result);
+        /* 报告生成时间标注 (缓存结果自上次扫描起未变) */
+        if (d.result.scanned_at) markCached(card, d.result);
+      } else if (ok && d && !d.found) {
+        /* 已扫描过但缓存尚未生成: 稍后重试一次 (阶段2后台线程可能仍在写) */
+        setTimeout(() => {
+          fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
+            .then(r => r.json())
+            .then(d2 => {
+              if (d2 && d2.found && d2.result) { render(card, d2.result); if (d2.result.scanned_at) markCached(card, d2.result); }
+              else showNotFound();
+            }).catch(() => showNotFound());
+        }, 1200);
+      } else {
+        showNotFound();
+      }
+    })
+    .catch(() => showNotFound());
+
+  function showNotFound() {
+    renderErr(card, '该文件尚未在本系统扫描过 — 请前往扫描页上传文件, 扫描完成后即可通过本链接查看报告', '未找到扫描报告');
+    /* 给出跳转扫描页的操作入口 */
+    const det = card.querySelector('.panel-detections');
+    if (det) det.innerHTML +=
+      '<div style="padding:14px 16px"><a class="detail-link" href="/scan" style="text-decoration:none;display:inline-block">前往扫描页上传文件</a></div>';
+  }
+}
+
+/* 引擎状态 */
+loadStats();
+</script>
+</body>
+</html>
