@@ -70,9 +70,8 @@ def _sigs_row(sha256_digest, size, name):
 
 
 def compute_hashes(file_path):
-    """一次性分块计算文件的 MD5 / SHA1 / SHA256"""
+    """一次性分块计算文件的 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5)"""
     md5 = hashlib.md5()
-    sha1 = hashlib.sha1()
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         while True:
@@ -80,17 +79,15 @@ def compute_hashes(file_path):
             if not chunk:
                 break
             md5.update(chunk)
-            sha1.update(chunk)
             sha256.update(chunk)
-    return md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest()
+    return md5.hexdigest(), None, sha256.hexdigest()
 
 
 def compute_hashes_bytes(data):
-    """从内存缓冲一次性计算 MD5 / SHA1 / SHA256 (内存复用扫描: 文件只读一遍)"""
-    md5 = hashlib.md5(data)
-    sha1 = hashlib.sha1(data)
-    sha256 = hashlib.sha256(data)
-    return md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest()
+    """从内存缓冲一次性计算 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5, 省 ~33% 哈希 CPU)"""
+    md5 = hashlib.md5(data).hexdigest()
+    sha256 = hashlib.sha256(data).hexdigest()
+    return md5, None, sha256
 
 
 def guess_file_type(file_path):
@@ -507,13 +504,23 @@ class HashSignatureDB:
             return conn
 
     def _query_shard(self, shard_id, sql, params=()):
-        """分片连接点查 (连接级串行锁; 连接被淘汰瞬间保守跳过)"""
+        """分片连接点查 (连接级串行锁; 连接被淘汰瞬间开临时连接补查, 不漏报)"""
         conn = self._ro_conn(shard_id)
         if conn is None:
             return None
-        lock = self._conn_locks.get(shard_id)
+        with self._cache_lock:
+            lock = self._conn_locks.get(shard_id)
         if lock is None:
-            return None  # 连接刚被 LRU 淘汰, 保守跳过 (宁可不查不误报)
+            # 连接刚被 LRU 淘汰: 开临时只读连接补查, 确保不漏报 (C1 修复)
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            tmp_conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                return tmp_conn.execute(sql, params).fetchone()
+            finally:
+                tmp_conn.close()
         with lock:
             return conn.execute(sql, params).fetchone()
 
@@ -1245,9 +1252,19 @@ class FuzzySignatureDB:
         conn = self._ro_conn(shard_id)
         if conn is None:
             return None
-        lock = self._conn_locks.get(shard_id)
+        with self._cache_lock:
+            lock = self._conn_locks.get(shard_id)
         if lock is None:
-            return None
+            # 连接刚被 LRU 淘汰: 开临时只读连接补查, 确保不漏报 (C1 修复)
+            path = self._shard_path(shard_id)
+            if not os.path.exists(path):
+                return None
+            tmp_conn = sqlite3.connect(
+                f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+            try:
+                return tmp_conn.execute(sql, params).fetchone()
+            finally:
+                tmp_conn.close()
         with lock:
             return conn.execute(sql, params).fetchone()
 
@@ -1588,18 +1605,23 @@ class FuzzySignatureDB:
 
 
 # ============================================================
-# YARA 扫描器 (不变)
+# YARA 扫描器 (合并编译 + 单次匹配)
 # ============================================================
 class YaraScanner:
-    """YARA 规则扫描器
+    """YARA 规则扫描器 (合并编译优化)
 
-    支持加载**多个** .yar 规则文件: 每个文件独立编译为一个规则集 (Rules 对象),
-    全部累积到 self.rulesets。匹配时遍历所有规则集, 因此从不同仓库收集的大量
-    规则文件可同时生效 (旧实现每次 load_rules 会覆盖上一个文件, 仅最后一个生效)。
+    启动时收集全部 .yar 文件路径, 首次匹配前用 yara.compile(filepaths=...)
+    合并为**单一 Rules 对象** (每文件独立 namespace, 规则名冲突互不干扰),
+    匹配时只需一次 .match() 调用, 避免 1433+ 次串行编译/匹配的初始化开销。
+
+    旧实现逐文件编译为独立 Rules 对象, 匹配时 for r in rulesets 串行调用,
+    每次重复支付 YARA 初始化开销; 合并后从 N 次降为 1 次。
     """
 
     def __init__(self):
-        self.rulesets = []           # 已编译的规则集列表 (每个 .yar 文件一个)
+        self._pending = {}           # {filename: filepath} 待批量编译
+        self._compiled = None        # 合并编译的单一 Rules 对象
+        self._compile_lock = threading.Lock()
         self.rule_count = 0          # 累计规则条数
         self.source_files = []       # 成功加载的文件名列表
         self.errors = []             # [(文件名, 错误), ...] 编译失败的文件
@@ -1607,27 +1629,70 @@ class YaraScanner:
 
     @property
     def rules(self):
-        """向后兼容: 返回首个规则集 (无则 None)。真正扫描会遍历全部 rulesets。"""
-        return self.rulesets[0] if self.rulesets else None
+        """触发延迟编译, 返回合并后的单一 Rules 对象 (无则 None)"""
+        self._ensure_compiled()
+        return self._compiled
+
+    @property
+    def rulesets(self):
+        """向后兼容: 返回 [compiled] 或 []"""
+        self._ensure_compiled()
+        return [self._compiled] if self._compiled else []
 
     def load_rules(self, filepath):
-        """编译并加载单个 .yar/.yara 文件, 累积到 rulesets
-        (失败仅记录到 errors, 不影响其它文件加载)"""
+        """收集 .yar/.yara 文件路径, 标记需重新编译 (实际编译延迟到首次匹配)
+
+        不再逐文件预编译 (旧实现); 批量编译在 _ensure_compiled 中一次性完成,
+        坏文件在批量编译失败后逐个排查。
+        """
         if not YARA_AVAILABLE:
             return 0
-        try:
-            r = yara.compile(filepath=filepath)
-        except yara.Error as e:
-            self.errors.append((os.path.basename(filepath), str(e)))
-            return 0
-        except (MemoryError, OSError) as e:
-            self.errors.append((os.path.basename(filepath), f"编译资源不足: {e}"))
-            return 0
+        fname = os.path.basename(filepath)
+        with self._compile_lock:
+            self._pending[fname] = filepath
+            self._compiled = None  # 标记需重新编译
         count = self._count_rules(filepath)
-        self.rulesets.append(r)
         self.rule_count += count
-        self.source_files.append(os.path.basename(filepath))
+        if fname not in self.source_files:
+            self.source_files.append(fname)
         return count
+
+    def warmup(self):
+        """启动时预编译全部规则 (避免首次扫描延迟)"""
+        self._ensure_compiled()
+
+    def _ensure_compiled(self):
+        """延迟批量编译: 用 yara.compile(filepaths=...) 合并全部规则为单一 Rules"""
+        if self._compiled is not None or not self._pending:
+            return
+        with self._compile_lock:
+            if self._compiled is not None:  # double-check
+                return
+            pending_copy = dict(self._pending)
+            # 尝试一次性合并编译 (每文件独立 namespace, 规则名冲突互不干扰)
+            try:
+                self._compiled = yara.compile(filepaths=pending_copy)
+                self.errors = []
+                return
+            except yara.Error:
+                pass
+            # 合并编译失败: 逐文件编译找出坏文件, 好文件批量重编译
+            good = {}
+            new_errors = []
+            for fname, fpath in pending_copy.items():
+                try:
+                    yara.compile(filepath=fpath)
+                    good[fname] = fpath
+                except yara.Error as e:
+                    new_errors.append((fname, str(e)))
+                except (MemoryError, OSError) as e:
+                    new_errors.append((fname, f"编译资源不足: {e}"))
+            self.errors = new_errors
+            if good:
+                try:
+                    self._compiled = yara.compile(filepaths=good)
+                except yara.Error as e:
+                    self.error = f"YARA 批量编译失败: {e}"
 
     @staticmethod
     def _count_rules(filepath):
@@ -1642,35 +1707,29 @@ class YaraScanner:
 
     def scan(self, file_path):
         """扫描文件, 返回命中列表 (路径版本: YARA 自行读盘)"""
-        if not self.rulesets:
+        self._ensure_compiled()
+        if not self._compiled:
             return []
-        hits = []
-        for r in self.rulesets:
-            try:
-                matches = r.match(file_path, timeout=10)
-            except yara.TimeoutError:
-                return self._timeout_hit()
-            except yara.Error:
-                # 单规则集匹配异常 (如样本触发模块 bug) 跳过该集, 不阻断其余
-                continue
-            hits.extend(self._format_matches(matches))
-        return hits
+        try:
+            matches = self._compiled.match(file_path, timeout=30)
+        except yara.TimeoutError:
+            return self._timeout_hit()
+        except yara.Error:
+            return []
+        return self._format_matches(matches)
 
     def scan_data(self, data):
-        """扫描内存缓冲, 返回命中列表 (与 scan 等价, 但复用调用方已读入的数据,
-        避免哈希/类型识别后 YARA 再次读盘 → 文件只读一遍)"""
-        if not self.rulesets:
+        """扫描内存缓冲, 返回命中列表 (单次 .match 调用, 复用调用方已读入的数据)"""
+        self._ensure_compiled()
+        if not self._compiled:
             return []
-        hits = []
-        for r in self.rulesets:
-            try:
-                matches = r.match(data=data, timeout=10)
-            except yara.TimeoutError:
-                return self._timeout_hit()
-            except yara.Error:
-                continue
-            hits.extend(self._format_matches(matches))
-        return hits
+        try:
+            matches = self._compiled.match(data=data, timeout=30)
+        except yara.TimeoutError:
+            return self._timeout_hit()
+        except yara.Error:
+            return []
+        return self._format_matches(matches)
 
     @staticmethod
     def _timeout_hit():
@@ -1678,7 +1737,7 @@ class YaraScanner:
             "engine": "YARA",
             "type": "error",
             "name": "YaraScanTimeout",
-            "detail": "规则匹配超时 (10s)",
+            "detail": "规则匹配超时 (30s)",
         }]
 
     @staticmethod
@@ -1743,9 +1802,12 @@ class Scanner:
         """直接扫描内存数据 (Web 上传路径: 全程不落盘, 零额外磁盘 IO)"""
         return self._scan_common(data, filename or "unnamed", len(data))
 
-    def scan_phase1(self, data, filename=None):
-        """两段式扫描·阶段1 (Web 上传): 哈希 + 文件类型 + 哈希签名库命中, 毫秒级立即返回"""
-        return self._phase1(data, filename or "unnamed")
+    def scan_phase1(self, data, filename=None, hashes=None):
+        """两段式扫描·阶段1 (Web 上传): 哈希 + 文件类型 + 哈希签名库命中, 毫秒级立即返回
+
+        hashes: 可选 (md5, sha1, sha256) 预计算哈希元组, 传入则不再重算 (P0-2)。
+        """
+        return self._phase1(data, filename or "unnamed", hashes=hashes)
 
     def scan_phase2(self, data, filename=None):
         """两段式扫描·阶段2 (Web 上传, 后台线程): YARA 规则 + 静态信息/模糊哈希 + 查壳"""
@@ -1765,14 +1827,18 @@ class Scanner:
         p2 = self._phase2(data, filename)
         return self._merge_phases(p1, p2)
 
-    def _phase1(self, data, filename):
+    def _phase1(self, data, filename, hashes=None):
         """阶段 1 (快速, 同步返回): 哈希 → 文件类型 → 哈希签名库命中
 
         只做 O(1) 哈希计算 + Bloom/SQLite 点查, 毫秒级返回;
+        hashes 参数可传入预计算的 (md5, sha1, sha256) 避免重算 (P0-2);
         返回结构带 phase="hash" 标记, detections 仅含 Hash DB 命中。
         """
         start = time.time()
-        md5, sha1, sha256 = compute_hashes_bytes(data)
+        if hashes:
+            md5, sha1, sha256 = hashes
+        else:
+            md5, sha1, sha256 = compute_hashes_bytes(data)
         file_size = len(data)
 
         # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)

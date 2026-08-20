@@ -31,12 +31,12 @@ try:
 except ImportError:  # pragma: no cover
     SSDEEP_AVAILABLE = False
 
-# 模糊哈希输入上限: 纯 Python 实现逐字节处理, 超大文件耗时失控
-# 模糊哈希(ssdeep/tlsh)计算上限: 纯 Python 实现, 耗时随输入近线性增长
-# (实测: 256KB≈1.4s / 512KB≈7.4s / 1MB≈24s / 3MB≈73s), 过大样本全文件逐字节
-# 分析会阻塞 Web 阶段2 后台线程, 故收紧至 256KB; 超过仅跳过模糊哈希, PE/壳等
-# 快速分析不受影响
-FUZZY_MAX_BYTES = 256 * 1024
+# 模糊哈希输入上限: 纯 Python 实现, 耗时随输入近线性增长
+# (实测: 256KB≈1.4s / 512KB≈7.4s / 1MB≈24s / 3MB≈73s)。绝大多数真实 PE 样本
+# 远超 256KB, 原上限使模糊哈希对实际样本形同虚设 (P2-1); 故提升至 2MB——
+# 计算发生在 Web 阶段2 后台线程, 不阻塞 HTTP 响应, 接受较长耗时。
+# (长期优化: 替换为 C 扩展 ssdeep/pyssdeep, 1MB 可降至 <100ms)
+FUZZY_MAX_BYTES = 2 * 1024 * 1024
 
 
 def _fmt_size_kb(n):
@@ -82,11 +82,16 @@ def compute_tlsh(data):
     return tlsh_mod.hash_bytes(data)
 
 
-def compute_imphash(data):
-    """PE 导入表哈希 (pefile); 非 PE 或解析失败返回 None"""
+def compute_imphash(data, pe_obj=None):
+    """PE 导入表哈希 (pefile); 非 PE 或解析失败返回 None
+
+    pe_obj: 可选已解析的 pefile.PE 实例 (C5: 复用解析结果, 避免重复解析)
+    """
     if not PEFILE_AVAILABLE or not data:
         return None
     try:
+        if pe_obj is not None:
+            return pe_obj.get_imphash()
         if not _is_pe(data):
             return None
         pe = pefile.PE(data=data)
@@ -134,12 +139,22 @@ def _is_pe(data):
     return data[pe_off:pe_off + 4] == b"PE\x00\x00"
 
 
-def compute_pe_meta(data):
-    """提取 PE 静态元数据; 非 PE 返回 None"""
-    if not PEFILE_AVAILABLE or not _is_pe(data):
+def compute_pe_meta(data, pe_obj=None):
+    """提取 PE 静态元数据; 非 PE 返回 None
+
+    pe_obj: 可选已解析的 pefile.PE 实例 (C5: 复用解析结果, 避免重复解析)
+    """
+    if not PEFILE_AVAILABLE:
         return None
+    if pe_obj is None:
+        if not data or not _is_pe(data):
+            return None
+        try:
+            pe_obj = pefile.PE(data=data)
+        except Exception:
+            return None
     try:
-        pe = pefile.PE(data=data)
+        pe = pe_obj
         meta = {
             "machine": MACHINE_NAMES.get(pe.FILE_HEADER.Machine, hex(pe.FILE_HEADER.Machine)),
             "is_64bit": pe.FILE_HEADER.Machine in (0x8664, 0xAA64),
@@ -192,6 +207,9 @@ def compute_static_info(data):
       pe:     PE 元数据 (仅 PE 样本, 否则 None)
       packer: 壳/保护器识别结果 (仅 PE 样本, 否则 None)
       notes:  说明列表 (不可用的原因)
+
+    C5 优化: PE 样本只解析一次 pefile.PE 实例, 传入 imphash/pe_meta/packer 复用,
+    避免 pefile.PE(data=data) 对同一数据重复解析 3 次。
     """
     notes = []
     fuzzy = {
@@ -211,15 +229,27 @@ def compute_static_info(data):
         if fuzzy["tlsh"] is None and len(data) >= tlsh_mod.MIN_DATA_LEN:
             notes.append("tlsh 不可用: 内容复杂度不足或输入过短")
 
-    if _is_pe(data):
-        fuzzy["imphash"] = compute_imphash(data)
+    # C5 优化: 统一解析一次 PE 实例, 传入各子函数复用
+    is_pe = _is_pe(data)
+    pe_obj = None
+    if is_pe and PEFILE_AVAILABLE:
+        try:
+            pe_obj = pefile.PE(data=data)
+        except Exception:
+            pe_obj = None
+
+    if is_pe:
+        if pe_obj is not None:
+            fuzzy["imphash"] = compute_imphash(data, pe_obj=pe_obj)
+        else:
+            fuzzy["imphash"] = None  # PE 解析失败或 pefile 不可用
         fuzzy["authentihash"] = compute_authentihash(data)
         if not PEFILE_AVAILABLE:
             notes.append("imphash/authentihash 不可用: 未安装 pefile")
 
     return {
         "fuzzy": fuzzy,
-        "pe": compute_pe_meta(data) if _is_pe(data) else None,
-        "packer": packer.detect_packer(data) if _is_pe(data) else None,
+        "pe": compute_pe_meta(data, pe_obj=pe_obj) if is_pe and pe_obj is not None else None,
+        "packer": packer.detect_packer(data, pe_obj=pe_obj) if is_pe else None,
         "notes": notes,
     }

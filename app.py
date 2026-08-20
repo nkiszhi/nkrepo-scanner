@@ -15,7 +15,8 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, redirect, url_for, abort, session
 from werkzeug.exceptions import RequestEntityTooLarge
 
-from scanner import FuzzySignatureDB, HashSignatureDB, Scanner, YaraScanner
+from scanner import (FuzzySignatureDB, HashSignatureDB, Scanner,
+                     YaraScanner, compute_hashes_bytes)
 import packer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -201,6 +202,9 @@ if yara_scanner.rule_count:
 for _f, _e in yara_scanner.errors[:5]:
     print(f"[NKAMG] YARA 编译警告 [{_f}]: {_e}")
 
+# P0-1: 启动时预编译全部 YARA 规则 (合并为单一 Rules 对象, 避免首次扫描延迟)
+yara_scanner.warmup()
+
 finalize_status = hash_db.finalize()
 if finalize_status:
     print(f"[NKAMG] 签名库整理: {finalize_status}")
@@ -260,6 +264,15 @@ def _load_cached_result(sha256_hex):
 # 提交历史上限: 超过后保留最近的条目 (防止同一文件反复提交撑爆 JSON)
 HISTORY_MAX = 100
 
+# ---------- 缓存 LRU 淘汰 (C3) ----------
+# 无限增长的缓存目录最终会耗尽磁盘; 惰性清理: 超过 30 天的缓存删除,
+# 总量超过 CACHE_MAX_FILES 时按 mtime 从旧到新淘汰, 只保留最近使用的。
+CACHE_MAX_FILES = 10000
+CACHE_MAX_AGE_DAYS = 30
+_cache_cleanup_interval = 3600.0  # 清理节流间隔 (秒), 避免每次扫描都遍历目录
+_cache_last_cleanup = 0.0
+_cache_cleanup_lock = threading.Lock()
+
 
 def _append_history(result, filename, submitted_at):
     """向扫描结果 dict 追加一条提交历史 {filename, submitted_at} (原地修改)"""
@@ -299,6 +312,54 @@ def _save_cached_result(sha256_hex, result):
                 os.remove(tmp)
         except OSError:
             pass
+
+
+def _cache_cleanup(force=False):
+    """惰性清理扫描缓存: 删除过期文件 (超 CACHE_MAX_AGE_DAYS 天) 并按 mtime LRU
+    淘汰超量文件 (保最新 CACHE_MAX_FILES 个)。
+
+    带节流: 距上次清理不足 _cache_cleanup_interval 秒时直接跳过 (force=True 除外),
+    防止高频上传时反复遍历目录。清理失败静默忽略, 不影响扫描主流程。
+    """
+    global _cache_last_cleanup
+    now = time.time()
+    if not force:
+        with _cache_cleanup_lock:
+            if now - _cache_last_cleanup < _cache_cleanup_interval:
+                return
+            _cache_last_cleanup = now
+    try:
+        entries = []
+        for name in os.listdir(RESULTS_CACHE_DIR):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(RESULTS_CACHE_DIR, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            entries.append((mtime, path))
+        if not entries:
+            return
+        # 1) 删除超过 max age 的过期缓存
+        stale_cutoff = now - CACHE_MAX_AGE_DAYS * 86400.0
+        keep = [(m, p) for m, p in entries if m >= stale_cutoff]
+        expired = [p for m, p in entries if m < stale_cutoff]
+        for path in expired:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        # 2) 超量时按 mtime 从旧到新淘汰 (保留最新 CACHE_MAX_FILES 个)
+        if len(keep) > CACHE_MAX_FILES:
+            keep.sort(key=lambda e: e[0])
+            for _, path in keep[:-CACHE_MAX_FILES]:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except Exception:  # noqa: BLE001 - 清理失败不影响扫描主流程
+        pass
 
 
 def _require_auth():
@@ -491,9 +552,14 @@ def scan():
     # 文件提交时间 (本机时间): 注入扫描结果, 供前端展示
     submitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
 
+    # P0-2: 一次性计算全部哈希 (供缓存 key + scanner 复用, 不再重算 SHA256)
+    md5_hex, sha1_hex, sha256_hex = compute_hashes_bytes(data)
+
+    # C3: 惰性触发缓存清理 (带 1 小时节流, 避免高频上传时反复遍历目录)
+    threading.Thread(target=_cache_cleanup, daemon=True).start()
+
     # ---------- 结果缓存: 按 SHA256 查缓存, 命中直接返回 (跳过两段式扫描) ----------
     # rescan=1 (前端 "重新扫描" 按钮) 强制绕过缓存重新分析, 完成后覆盖缓存。
-    sha256_hex = hashlib.sha256(data).hexdigest()
     rescan = request.form.get("rescan") in ("1", "true", "on")
     cached = None if rescan else _load_cached_result(sha256_hex)
     if cached is not None:
@@ -501,9 +567,15 @@ def scan():
         # 文件名/提交时间以本次上传为准 (内容相同但文件名可能不同, 其余结果内容一致)
         cached_result["filename"] = f.filename
         cached_result["submitted_at"] = submitted_at
-        # 提交历史: 追加本次 {filename, submitted_at} 并写回缓存 (命中缓存也记录每次提交)
+        # 提交历史: 追加本次 {filename, submitted_at} (命中缓存也记录每次提交)
         _append_history(cached_result, f.filename, submitted_at)
-        _save_cached_result(sha256_hex, cached_result)
+        # P2-2: 磁盘写回放到后台线程, 响应立即返回 (高并发时避免磁盘 I/O 排队阻塞)
+        # history 已在内存中的 cached_result 追加完毕, 本次响应内容不受异步写回影响
+        threading.Thread(
+            target=_save_cached_result,
+            args=(sha256_hex, cached_result),
+            daemon=True,
+        ).start()
         return jsonify({
             "task_id": None,
             "status": "done",
@@ -524,7 +596,9 @@ def scan():
     task_id = uuid.uuid4().hex[:12]
 
     # 阶段 1: 哈希 + 文件类型 + 哈希签名库命中 → 立即返回 (毫秒级)
-    phase1 = scanner.scan_phase1(data, filename=f.filename)
+    # P0-2: 传入预计算哈希, scanner 不再重算
+    phase1 = scanner.scan_phase1(data, filename=f.filename,
+                                 hashes=(md5_hex, sha1_hex, sha256_hex))
     phase1["submitted_at"] = submitted_at   # 提交时间随阶段1结果下发/合并
     task = {
         "id": task_id,
@@ -559,9 +633,7 @@ def scan():
                     }
                 else:
                     p2 = scanner.scan_phase2(data, filename=f.filename)
-                task["phase2"] = p2
-                task["status"] = "done"
-                # 扫描完成 → 写入结果缓存 (scan_cache/<sha256>.json), 供后续重复扫描秒回
+                # C2 修复: 先合并+写缓存, 再标记 done (消除 gap 期 /api/file 404 窗口)
                 try:
                     merged = scanner.merge_phases(task["phase1"], p2)
                     if p2.get("note"):
@@ -572,6 +644,8 @@ def scan():
                     _save_cached_result(sha256_hex, merged)
                 except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
                     pass
+                task["phase2"] = p2
+                task["status"] = "done"
             except Exception as e:  # noqa: BLE001 - 后台异常记录到任务, 由轮询端呈现
                 task["error"] = str(e)
                 task["status"] = "error"
@@ -767,4 +841,6 @@ if __name__ == "__main__":
           + (f" | MD5 库: {md5_db.count:,} 条" if md5_db else " | MD5 库: 未构建"))
     if yara_scanner.error:
         print(f"[NKAMG] YARA 警告: {yara_scanner.error}")
+    # C3: 启动时后台强制清理一次过期/超量缓存
+    threading.Thread(target=_cache_cleanup, kwargs={"force": True}, daemon=True).start()
     app.run(host=scfg["host"], port=int(scfg["port"]), debug=False, threaded=True)

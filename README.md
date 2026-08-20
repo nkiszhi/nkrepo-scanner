@@ -19,17 +19,42 @@
 
 ## 静态信息与模糊哈希
 
-Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA1/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；**SHA256 比对 SHA256 库、MD5 比对并列的 MD5 库**均生效，见「存储架构」），随后在后台计算一组**模糊哈希 / 静态特征**（≤256KB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）：
+Web 扫描采用**两段式**：`/scan` 先返回**哈希查询结果**（MD5/SHA256 计算值 + 哈希签名库命中 + 文件类型，毫秒级；**SHA256 比对 SHA256 库、MD5 比对并列的 MD5 库**均生效，见「存储架构」；SHA1 因不参与任何库查询已**不再计算**，字段返回 `null`——单次哈希计算省去 1/3 CPU），随后在后台计算一组**模糊哈希 / 静态特征**（≤2MB 的文件），前端轮询 `/api/task/<id>` **动态更新**展示（类似 VirusTotal 的渐进式结果，深度分析完成前卡片保持 `SCANNING` 状态）。已完成扫描的结果按 SHA256 落盘缓存，重复上传同一文件直接命中缓存毫秒级返回（见「扫描缓存与报告详情页」）：
 
 | 字段          | 算法                                                             | 适用样本    | 缺失原因（Web 上悬停 `-` 可见）                |
 | ----------- | -------------------------------------------------------------- | ------- | ---------------------------------- |
-| `ssdeep`    | 上下文触发分段哈希（CTPH），SpamSum 兼容，基于 **ppdeep**（纯 Python）        | 任意类型   | 输入 <32B / 超过 256KB 上限 / 未安装 ppdeep |
-| `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 256KB 上限    |
+| `ssdeep`    | 上下文触发分段哈希（CTPH），SpamSum 兼容，基于 **ppdeep**（纯 Python）        | 任意类型   | 输入 <32B / 超过 2MB 上限 / 未安装 ppdeep |
+| `tlsh`      | Trend Micro 局部敏感哈希，基于本地 **`tlsh.py`**（官方 C 算法 JS 移植，纯 Python） | 任意类型   | 输入 <50B / 内容复杂度不足 / 超过 2MB 上限    |
 | `imphash`   | PE 导入表哈希（pefile）                                            | 仅 PE    | 非 PE 样本                            |
 | `authentihash` | PE Authenticode 哈希：清零 OptionalHeader.CheckSum 与 Security Directory 条目后 SHA256 全文件 | 仅 PE | 非 PE 样本 |
 
-- **256KB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，耗时随输入近线性增长，超大文件会阻塞 Web 阶段2 后台线程。实测 256KB 约 1.4s、512KB 约 7.4s、1MB 约 24s、3MB 约 73s，故上限收紧至 256KB；超过仅跳过模糊哈希，PE 的 imphash/authentihash 与元数据不受影响
+- **2MB 上限（`FUZZY_MAX_BYTES`）**：ssdeep/TLSH 为纯 Python 逐字节实现，耗时随输入近线性增长（实测 256KB 约 1.4s、512KB 约 7.4s、1MB 约 24s、3MB 约 73s）。绝大多数真实 PE 样本超过原来的 256KB 上限，故提升至 2MB 以覆盖常见样本体积；计算在 Web 阶段2 后台线程执行，不阻塞 HTTP 响应。超过 2MB 仅跳过模糊哈希，PE 的 imphash/authentihash 与元数据不受影响
 - **PE 静态元数据**（`static_info.pe`）：machine 架构、64 位标记、编译时间戳、subsystem、入口点、ImageBase、节表（名称/VirtualSize/RawSize/Flags）、导入表（每 DLL 最多列出 32 个函数）
+
+## 扫描缓存与报告详情页（2026-08-19 新增）
+
+- **结果缓存**：阶段 1+2 全部完成后，合并结果以 `scan_cache/<sha256>.json` 落盘（原子写入：先写临时文件再 rename）。相同 SHA256 再次上传 `/scan` 时**直接命中缓存**返回完整结果（响应含 `cached: true`，`filename` / `submitted_at` 以本次上传为准），毫秒级跳过全部扫描
+- **提交历史**：缓存内含 `history` 数组，每次上传（含缓存命中）追加 `{filename, submitted_at}`，保留最近 `HISTORY_MAX=100` 条；缓存命中路径的历史追加与写盘在**后台线程异步执行**（P2-2），不阻塞 HTTP 响应
+- **缓存写入顺序**：先合并结果并写缓存，再标记任务 `done` —— 消除轮询到 `done` 但 `/api/file` 尚未就绪的 404 窗口
+- **LRU 淘汰（C3）**：总量超过 `CACHE_MAX_FILES=10000` 时按 mtime 从旧到新删除，超过 `CACHE_MAX_AGE_DAYS=30` 天的过期删除；启动时后台强制清理一次 + 每次 `/scan` 提交后惰性触发（1 小时节流，高频上传不反复遍历目录）
+- **报告详情页** `/file/<sha256>`（参考 VirusTotal `/gui/file/<hash>`）：渲染该文件的完整扫描报告（基本信息 / 哈希 / 检测命中 / 静态信息 / 提交历史）；非法哈希渲染友好提示而非裸 404。数据接口为 `GET /api/file/<sha256>`（读缓存；该文件未在本系统扫描过返回 404 `{"found": false}`）
+
+## 管理端（哈希签名管理，2026-08-19 新增）
+
+检测功能（`/`、`/scan`、`/api/*`）**无需登录**；仅哈希管理页面 `/admin/hash` 与 `/api/admin/*` 接口要求管理员登录（Flask session）。
+
+- **登录**：`/admin/login`（用户名 + 密码表单）。凭据存 `config.json` 的 `admin` 节——`username` / `salt` / `password_hash`，其中 `password_hash = SHA256(salt:password)`（明文不落配置）；校验用 `hmac.compare_digest` 常量时间比较防计时侧信道。登录跳转 `next` 参数仅接受站内相对路径（防开放重定向）；登出 `/admin/logout` 清空整个会话；管理响应统一带 `Cache-Control: no-store`（防登出后从浏览器缓存还原管理页）
+- **管理页** `/admin/hash`：单条签名查 / 增 / 删 + 签名文件批量导入
+- **API**（均需登录，未登录 GET 跳登录页 / 其余返回 401 JSON）：
+  - `GET /api/admin/hash/<hash>`——按哈希查单条签名（32hex→MD5 库 / 64hex→SHA256 库，命中与否均 200）
+  - `POST /api/admin/hash`——JSON `{hash, size, name}` 新增单条（自动按长度路由 SHA256/MD5 库；写分片 SQLite + **增量更新 Bloom** 即时生效；已存在返回 `added: 0`）
+  - `DELETE /api/admin/hash/<hash>`——删除单条签名
+  - `POST /api/admin/import`——上传 `.hdb/.hsb`（同时导入 SHA256 与 MD5 并列库，按行长度自动分流）或 `.yar/.yara`（追加 YARA 规则并即时编译生效）；文件存入 `signatures/` 持久化，重启不丢失
+- 生成密码哈希示例：
+
+  ```bash
+  python -c "import hashlib,os; salt=os.urandom(16).hex(); pw='你的密码'; print('salt:', salt); print('password_hash:', hashlib.sha256(f'{salt}:{pw}'.encode()).hexdigest())"
+  ```
 
 ## 壳 / Packer 识别（`static_info.packer`）
 
@@ -214,8 +239,13 @@ sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
     "phase2_concurrency": 4 // 阶段2 后台线程并发上限 (信号量, 超限排队), 控制 CPU 峰值
   },
   "packer": {
-    "rules_dir": "packer_rules",   // 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径); 目录下所有 .yar/.yara 自动加载
-    "max_yara_bytes": 16777216     // 外部规则匹配的样本大小上限 (16MB); 内置 DIE/PEiD 特征不受限
+    "rules_dir": "packer_rules",      // 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径); 目录下所有 .yar/.yara 自动加载
+    "max_yara_bytes": 16777216        // 外部规则匹配的样本大小上限 (16MB); 内置 DIE/PEiD 特征不受限
+  },
+  "admin": {
+    "username": "admin",              // 管理员用户名 (/admin/login 登录)
+    "salt": "<32hex 随机串>",          // 密码盐: os.urandom(16).hex() 生成
+    "password_hash": "<64hex>"        // SHA256(salt:password); 留空则管理端不可登录
   }
 }
 ```
@@ -239,9 +269,22 @@ venv\Scripts\python app.py
 
 - **多线程 Web 服务**：`app.py` 以 `threaded=True` 启动，每个请求独立线程；`/scan` 上传走
   内存流（`scan_bytes`），哈希 / 文件类型识别 / YARA 复用同一份缓冲，**全程不落盘**（每文件只读一遍）
+- **YARA 合并编译（P0-1）**：全部规则文件（`signatures/` + `yara_sources/` + 壳库）收集后用
+  `yara.compile(filepaths={namespace: path})` **一次性合并编译为单一 Rules 对象**（双检查锁保护，
+  启动时 `warmup()` 预热），单个样本匹配从「逐规则集 N 次 `.match()`」降为**单次调用**；
+  批量编译失败自动逐文件排查剔除坏文件后重编
+- **哈希一次计算全程传递（P0-2）**：`/scan` 请求线程内 `compute_hashes_bytes(data)` 一次算出
+  MD5+SHA256，以元组传入 `scan_phase1(hashes=...)`，阶段 1 与缓存 key 复用同一结果，
+  不再各自重算 SHA256；**SHA1 因不参与任何库查询已跳过**（P1-1，省约 1/3 哈希 CPU，字段返回 `null`）
+- **pefile 统一解析（C5）**：阶段 2 中 PE 文件只做一次 `pefile.PE(data)`，解析实例传给
+  imphash / PE 元数据 / 查壳（`detect_packer(data, pe_obj=...)`）复用，不再重复解析 2~3 次
+- **熵计算与 magic 搜索加速（P1-2 / P1-3）**：节熵统计用 `collections.Counter` 替代逐字节循环
+  （约 5 倍加速）；壳 magic 特征用预编译 `re.IGNORECASE` 正则直接匹配，不再产生整文件
+  `lower()` 的 32MB 内存副本
 - **查询并发模型**：`HashSignatureDB.check()` 不再持全局锁 —— Bloom 位图查询期只读（无锁读），
   SQLite 分片连接用**连接级串行锁**（同一连接内串行、不同分片连接并行，并发度 = min(分片数, LRU 上限)），
-  LRU 字典操作用细粒度缓存锁；被淘汰的连接延迟到 `close()` 统一关闭
+  LRU 字典操作用细粒度缓存锁；被淘汰的连接延迟到 `close()` 统一关闭；
+  查询路径上连接锁被 LRU 并发淘汰的竞态以临时只读连接补查兜底（C1，确保不漏报）
 - **sha256 / md5 单次点查**：SHA256 库只对 sha256 摘要做 1 次 Bloom + SQL 主键点查；MD5 库（参数化 `hash_algo="md5"`）对 md5 摘要做同样流程（两者并列，见上「MD5 并列哈希库」）；`scanner.check` 接口对上层透明，文件扫描自动合并两库命中
 - **Bloom 热路径**：`_positions`（blake2b 双哈希 → k 个位）带实例级 LRU 缓存（上限 4096），
   重复样本直接复用位置数组，省去重复哈希与求模
@@ -254,7 +297,7 @@ venv\Scripts\python app.py
 
 ```
 nkrepo-scanner/
-├── app.py                        # Flask Web 服务（/ 搜索首页、GET /scan 扫描页、POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<hash> 哈希查询（32hex→MD5 库 / 64hex→SHA256 库））
+├── app.py                        # Flask Web 服务（/ 搜索首页、GET/POST /scan 两段式上传、/api/task/<id> 轮询、/api/stats、/api/hash/<hash> 双库哈希查询、/file/<sha256> 报告详情页、/api/file/<sha256>、/admin/login 登录、/admin/hash 哈希管理页、/api/admin/* 签名增删查/批量导入、扫描缓存 + LRU 淘汰）
 ├── scanner.py                    # 扫描核心（HashSignatureDB 动态分片存储[可参数化为 md5/sha256 并列库] + FuzzySignatureDB 模糊哈希增强库 + YaraScanner + 静态信息集成）
 ├── build_md5_db.py               # 构建并列 MD5 哈希库（从 extracted/ 的 ClamAV .hdb/.hsb 提取 32hex MD5 签名 → signatures/md5.db.shards/）
 ├── build_fuzzy_db.py             # 构建模糊哈希增强库（从项目根 hdb/ 8 字段行提取 ssdeep/vhash/authentihash/imphash/rich_header_hash → signatures/fuzzy.db.shards/）
@@ -271,7 +314,10 @@ nkrepo-scanner/
 │   └── app.js                    # 共享渲染库（扫描结果卡 / 检测环 / 哈希查询 / 统计加载；upload 带 onDone 回调）
 ├── templates/
 │   ├── index.html                # 搜索首页（VT 风格大搜索框哈希查询 + 拖拽上传 + 统计卡 + 结果展示）
-│   └── scan.html                 # 扫描页（GET /scan，VT 风格：FILE/搜索选项条 + 大上传区 + 最近扫描历史 localStorage + 结果展示）
+│   ├── scan.html                 # 扫描页（GET /scan，VT 风格：FILE/搜索选项条 + 大上传区 + 最近扫描历史 localStorage + 结果展示）
+│   ├── file.html                 # 文件报告详情页（/file/<sha256>：基本信息/哈希/检测命中/静态信息/提交历史）
+│   ├── login.html                # 管理员登录页（/admin/login，用户名 + 密码）
+│   └── hash_admin.html           # 哈希签名管理页（/admin/hash：查/增/删单条 + 批量导入）
 ├── config.json                   # 配置（bloom 分片数/误判率、连接缓存上限、服务端口/上传目录）
 ├── extract_cvd.py                # 从 ClamAV .cvd 病毒库解包提取签名
 ├── hdb/                          # ClamAV 官方整文件哈希分桶（00.hdb~ff.hdb 共 256 文件，8 字段完整行、sha256 主键 64hex，约 12.4GB、62,586,907 行；SHA256 库与模糊哈希库的共同数据源，不自动导入）
@@ -289,6 +335,7 @@ nkrepo-scanner/
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd
+├── scan_cache/                   # 扫描结果缓存（<sha256>.json，含提交历史；LRU 淘汰 10000 个 / 30 天）
 ├── uploads/                      # 测试样本目录（路径由 server.uploads_dir 配置，相对项目根目录或绝对路径；启动时不存在会自动创建；/scan 上传不落盘）
 └── requirements.txt
 ```
@@ -344,7 +391,7 @@ CVD 文件为 512 字节头 + gzip 压缩 tar，`extract_cvd.py` 解包后会顺
 - **MD5 哈希（并列库）**：MD5 库不通过启动自动导入构建，而是运行 `python build_md5_db.py`（从 `extracted/` 的 ClamAV `.hdb/.hsb` 提取 32hex MD5 签名，仅 MD5 行入库）；构建后重启即自动加载 `signatures/md5.db.shards/`
 - **模糊哈希（增强库）**：运行 `python build_fuzzy_db.py`（从项目根 `hdb/` 8 字段行提取 5 个模糊哈希字段入库，见上文「模糊哈希增强库」）；构建后重启即自动加载 `signatures/fuzzy.db.shards/`
 - **YARA**：往 `signatures/*.yar` 追加规则或新增 `.yar` 文件，重启生效
-- **第三方 YARA 规则库**（`yara_sources/`，2026-08-18 新增）：从 GitHub 开源社区收集的 YARA 规则，启动时递归加载 `yara_sources/` 下全部 `.yar/.yara` 文件（每个文件独立编译为规则集，累积生效；编译失败的单个文件跳过不影响其它）。当前来源：
+- **第三方 YARA 规则库**（`yara_sources/`，2026-08-18 新增）：从 GitHub 开源社区收集的 YARA 规则，启动时递归收集 `yara_sources/` 下全部 `.yar/.yara` 文件，首次匹配前用 `yara.compile(filepaths=...)` **合并编译为单一 Rules 对象**（P0-1，启动时 `warmup()` 预热），匹配只需单次 `.match()` 调用（10s 超时）而非逐规则集扫描；批量合并编译失败时自动退化为逐文件编译排查坏文件，坏文件跳过不影响其它。当前来源：
 
   | 目录 | 仓库 | 规则文件数 | 说明 |
   | ---- | ---- | --------- | ---- |
@@ -374,10 +421,19 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 | ------------ | ---- | -------------------------------------------------------------------------------------------------- |
 | `/`          | GET  | Web 界面（搜索首页：MD5/SHA256 哈希查询 + 拖拽上传 + 统计；页面本身无需认证，数据接口受保护）                             |
 | `/scan`      | GET  | Web 界面（VirusTotal 风格扫描页：FILE/搜索选项条 + 大上传区 + 最近扫描历史，结果渲染与首页共用 `static/app.js`） |
-| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha1/sha256`、`file_type_info`、`detections` 含 Hash DB 命中（SHA256 库 + 并列 MD5 库均参与比对）、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空 |
+| `/scan`      | POST | 上传文件（multipart 字段 `file`，**全程内存不落盘**，受 `server.max_upload_mb` 限制）。**两段式**：立即返回 `{task_id, status: "phase2", result}`，`result` 为阶段 1 哈希查询结果（`phase:"hash"`、`md5/sha256`（`sha1` 恒为 `null`，见 P1-1）、`file_type_info`、`detections` 含 Hash DB 命中（SHA256 库 + 并列 MD5 库 + Fuzzy 增强库均参与比对）、`elapsed_ms` 为阶段 1 耗时）；阶段 2（YARA 规则 + `static_info` 模糊哈希/PE 元数据/查壳）由后台线程执行。超过 `server.phase2_max_mb` 的样本阶段 2 仅执行 YARA 并返回 `phase2_note` 说明，`static_info` 为空。**缓存命中**：该 SHA256 已扫描过时直接返回 `{status: "done", cached: true, result}`（完整合并结果，含每次提交的 `history`；历史追加与写盘异步执行） |
 | `/api/task/<task_id>` | GET | 轮询深度分析进度：`phase2`（进行中）/ `done`（返回 `{task_id, status:"done", result}`，`result.phase:"done"`，为阶段 1 + 阶段 2 合并的完整扫描结果，结构同旧版 `/scan`：`verdict`/`detections`（Hash DB + YARA）/`static_info`/`static_ms`/`elapsed_ms`，超限样本含 `phase2_note`）/ `error`（后台异常）；任务过期或不存在返回 404（内存保留 `TASKS_MAX=100` 个、`TASK_TTL=600s`） |
 | `/api/stats` | GET  | 签名统计：`hash_signatures`（SHA256 哈希条数）、`md5_signatures`/`md5_available`/`md5_sources`/`md5_storage`（并列 MD5 库）、`fuzzy_signatures`/`fuzzy_available`/`fuzzy_sources`/`fuzzy_storage`（模糊哈希增强库）、`yara_rules`、`yara_available`、`packer_yara_rules`/`packer_yara_available`/`packer_yara_error`（壳库外部规则）、`hash_sources`/`yara_sources`（签名来源文件）、`storage`（存储层 tier / 分片 / Bloom 位图状态，见下）、`max_upload_mb`（上传大小上限，前端据此本地预检超限文件） |
 | `/api/hash/<hash>` | GET | 哈希查询（VirusTotal 风格首页搜索框）：**32 位 hex → MD5 库，64 位 hex → SHA256 库**，命中与否均 200；返回 `{md5\|sha256, hash_algo, hit, detections, scanner}`，`hit=true` 时 `detections` 为签名库命中详情（SHA256 命中时若模糊哈希库也有该样本，`detections` 追加 `engine="Fuzzy Hash DB"` 项并携带 `fuzzy` 5 字段对象：`ssdeep/vhash/authentihash/imphash/rich_header_hash`）；非 32/64 位 hex 返回 400 |
+| `/file/<sha256>` | GET | 文件报告详情页（参考 VT `/gui/file/<hash>`）：渲染完整扫描报告（基本信息/哈希/检测命中/静态信息/提交历史）；非法哈希渲染友好提示而非 404；页面本身无需认证，数据接口受保护 |
+| `/api/file/<sha256>` | GET | 按 SHA256 读取缓存中的扫描报告（`scan_cache/<sha256>.json`）：返回 `{found: true, sha256, result}`（result 含 `history` 提交历史）；该文件未在本系统扫描过返回 404 `{found: false}`；非 64 位 hex 返回 400 |
+| `/admin/login` | GET/POST | 管理员登录页（用户名 + 密码表单）；POST 校验通过写 session 并跳转 `next`（仅站内相对路径）。凭据见 `config.json` 的 `admin` 节 |
+| `/admin/logout` | GET | 退出登录，清空整个会话 |
+| `/admin/hash` | GET | 哈希签名管理页（**需管理员登录**）：单条签名查/增/删 + 批量导入签名文件 |
+| `/api/admin/hash/<hash>` | GET | 查询单条签名（32hex→MD5 / 64hex→SHA256，**需登录**），命中与否均 200 |
+| `/api/admin/hash` | POST | 新增单条签名（JSON `{hash, size, name}`，**需登录**；自动路由 SHA256/MD5 库，Bloom 增量更新即时生效；已存在返回 `added: 0`） |
+| `/api/admin/hash/<hash>` | DELETE | 删除单条签名（**需登录**），返回删除条数 |
+| `/api/admin/import` | POST | 批量导入签名文件（**需登录**）：`.hdb/.hsb` 同时导入 SHA256 + MD5 库（按行长分流）、`.yar/.yara` 追加 YARA 规则即时编译；文件存入 `signatures/` 持久化 |
 
 ## 安全
 
@@ -385,6 +441,10 @@ python bench.py                   # 延迟 / 内存 / 磁盘基准
 
 - **认证（M1）**：`server.api_token` 非空时，`/scan`、`/api/task/<id>`、`/api/stats` 全部要求
   `Authorization: Bearer <token>` 或 `?token=<token>`（`401`）；默认留空 = 匿名本地模式，方便本机使用
+- **管理端认证（M1）**：哈希管理页与 `/api/admin/*` 独立于 api_token，走管理员 session 认证——
+  凭据为 `config.json` 的 `admin` 节（`password_hash = SHA256(salt:password)` 明文不落配置），
+  校验用 `hmac.compare_digest` 常量时间比较；登录跳转仅接受站内相对路径（防开放重定向）；
+  管理响应带 `Cache-Control: no-store`（防登出后从缓存还原页面）；`admin` 节留空则管理端不可登录
 - **限流（M1）**：`/scan` 每 IP 每分钟滑动窗口计数（`scan_rate_limit`，默认 30），超限 `429`，
   防未认证部署下被恶意刷扫描耗尽 CPU
 - **阶段 2 资源上限（M3）**：超过 `phase2_max_mb`（默认 32MB）的样本跳过模糊哈希 / PE 元数据 / 查壳，

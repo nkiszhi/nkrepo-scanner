@@ -58,3 +58,11 @@ yara_sources/
 # 签名库分片临时目录
 signatures/*.db.shards.resharding/
 signatures/*.db.shards.resharding.done/
+
+# 分片数调整产生的运行时备份目录
+signatures/*.bak_4shard/
+signatures/*.bak_*/
+
+# 本地导出的哈希清单 / ssdeep C 扩展构建临时目录
+signatures/md5_out.hdb
+_ssdeep_build/
