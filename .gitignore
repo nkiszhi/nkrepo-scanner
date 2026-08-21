@@ -18,10 +18,10 @@ extracted/
 *.cvd
 signatures/hdb/
 hdb/
-scan_cache/
 
 # 上传样本目录（运行时生成，程序启动时自动创建，整个目录不入库）
-# 注: eicar.com 为 EICAR 测试样本, 因安全工具会拦截其文件读写, 不入库;
+# 注: 样本原始字节 (<sha256>) 与扫描报告 (<sha256>.json) 均存于 uploads/ 同目录;
+#     eicar.com 为 EICAR 测试样本, 因安全工具会拦截其文件读写, 不入库;
 #     本地测试可手动生成 (见 README「测试样本」)
 uploads/
 

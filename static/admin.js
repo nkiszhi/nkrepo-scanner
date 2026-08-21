@@ -137,9 +137,94 @@ dz.addEventListener('dragleave', () => dz.classList.remove('over'));
 dz.addEventListener('drop', e => { e.preventDefault(); dz.classList.remove('over'); importFiles(e.dataTransfer.files); });
 fi.addEventListener('change', () => { importFiles(fi.files); fi.value = ''; });
 
+/* ---------- 添加 SSDeep / TLSH 模糊哈希 ---------- */
+const addFKind = document.getElementById('addFKind');
+const addFValue = document.getElementById('addFValue');
+const addFSha = document.getElementById('addFSha');
+const addFSize = document.getElementById('addFSize');
+const addFName = document.getElementById('addFName');
+const addFBtn = document.getElementById('addFBtn');
+const addFResult = document.getElementById('addFResult');
+
+addFBtn.addEventListener('click', () => {
+  const kind = addFKind.value;
+  const value = addFValue.value.trim();
+  const sha256 = addFSha.value.trim();
+  if (!value) { setErr(addFResult, '请填写 ' + (kind === 'ssdeep' ? 'SSDeep' : 'TLSH') + ' 哈希值'); return; }
+  if (!/^[0-9a-f]{64}$/i.test(sha256)) { setErr(addFResult, 'SHA256 需 64 位十六进制'); return; }
+  addFBtn.disabled = true;
+  fetch('/api/admin/fuzzy/' + kind, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ value, sha256, name: addFName.value.trim(), size: addFSize.value.trim() || null })
+  }).then(r => r.json().then(d => ({ ok: r.ok, d })))
+    .then(({ ok, d }) => {
+      if (!ok || d.error) { setErr(addFResult, d.error || '请求失败'); return; }
+      setOk(addFResult, '已新增 1 条 <span class="mono">' + esc(kind.toUpperCase()) + '</span>' + renderFuzzyKV(d.value, d.kind, d.total));
+      addFValue.value = ''; addFSha.value = ''; addFSize.value = ''; addFName.value = '';
+      loadStats();
+    }).catch(e => setErr(addFResult, '网络错误: ' + e.message))
+    .finally(() => addFBtn.disabled = false);
+});
+
+/* ---------- 查询 / 删除 SSDeep / TLSH 模糊哈希 ---------- */
+const qFKind = document.getElementById('qFKind');
+const qFValue = document.getElementById('qFValue');
+const qFLookupBtn = document.getElementById('qFLookupBtn');
+const qFDelBtn = document.getElementById('qFDelBtn');
+const qFResult = document.getElementById('qFResult');
+
+function fqUrl(kind, value) { return '/api/admin/fuzzy/' + kind + '/' + encodeURIComponent(value); }
+
+qFLookupBtn.addEventListener('click', () => {
+  const kind = qFKind.value;
+  const value = qFValue.value.trim();
+  if (!value) { setErr(qFResult, '请填写 ' + (kind === 'ssdeep' ? 'SSDeep' : 'TLSH') + ' 哈希值'); return; }
+  qFLookupBtn.disabled = true;
+  fetch(fqUrl(kind, value)).then(r => r.json().then(d => ({ ok: r.ok, d })))
+    .then(({ ok, d }) => {
+      if (!ok || d.error) { setErr(qFResult, d.error || '请求失败'); return; }
+      if (d.hit) {
+        setInfo(qFResult, '<b>命中 ' + esc(kind.toUpperCase()) + ' 库</b>' + renderFuzzyKV(d.value, d.kind, d.total)
+          + '<div style="margin-top:8px">' + (d.detections || []).map(x =>
+            '<div class="det-line"><div class="dn">' + esc(x.name) + '</div>'
+            + '<div class="dd">SHA256: ' + esc(x.sha256 || '-') + (x.size ? ' · ' + fmtSize(x.size) : '') + '</div></div>').join('') + '</div>');
+      } else {
+        setInfo(qFResult, '未在 ' + esc(kind.toUpperCase()) + ' 库中找到此哈希' + renderFuzzyKV(d.value, d.kind, d.total));
+      }
+    }).catch(e => setErr(qFResult, '网络错误: ' + e.message))
+    .finally(() => qFLookupBtn.disabled = false);
+});
+
+qFDelBtn.addEventListener('click', () => {
+  const kind = qFKind.value;
+  const value = qFValue.value.trim();
+  if (!value) { setErr(qFResult, '请填写 ' + (kind === 'ssdeep' ? 'SSDeep' : 'TLSH') + ' 哈希值'); return; }
+  if (!confirm('确认从 ' + kind.toUpperCase() + ' 库删除该记录？\n' + value)) return;
+  qFDelBtn.disabled = true;
+  fetch(fqUrl(kind, value), { method: 'DELETE' }).then(r => r.json().then(d => ({ ok: r.ok, d })))
+    .then(({ ok, d }) => {
+      if (!ok || d.error) { setErr(qFResult, d.error || '请求失败'); return; }
+      setOk(qFResult, (d.deleted ? '已删除 1 条 ' : '该记录不在库中，未删除 ') + renderFuzzyKV(d.value, d.kind, d.total));
+      qFValue.value = '';
+      loadStats();
+    }).catch(e => setErr(qFResult, '网络错误: ' + e.message))
+    .finally(() => qFDelBtn.disabled = false);
+});
+
 /* ---------- 公共渲染片段 ---------- */
 function renderHashKV(hash, algo, total) {
   let h = '<div class="kv2"><span class="k">' + esc(algo || '哈希') + '</span><span class="v">' + esc(hash) + '</span>';
+  if (total !== null && total !== undefined) {
+    h += '<span class="k">库总数</span><span class="v">' + fmtNum(total) + '</span>';
+  }
+  h += '</div>';
+  return h;
+}
+
+/* 模糊哈希 KV 渲染 (SSDeep / TLSH) */
+function renderFuzzyKV(value, kind, total) {
+  let h = '<div class="kv2"><span class="k">' + esc((kind || '模糊').toUpperCase()) + '</span><span class="v">' + esc(value) + '</span>';
   if (total !== null && total !== undefined) {
     h += '<span class="k">库总数</span><span class="v">' + fmtNum(total) + '</span>';
   }

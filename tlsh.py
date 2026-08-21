@@ -296,3 +296,104 @@ def hash_bytes(data):
     if not t.final():
         return None
     return t.hexdigest()
+
+
+# ---------------------------------------------------------------- 距离计算 (相似度比对)
+# 移植自官方 trendmicro/tlsh 的 lsh_bin_totalDiff / lsh_bin_h_distance
+#   bit_pairs_diff_table 256×256 查表可分解为 4 个独立 2-bit 四分位比较,
+#   权重矩阵从 bit_pairs_diff_table[0][0..15] 推导 (见官方 tlsh_impl.h)
+
+# 2-bit 四分位对差异权重矩阵 (va=行, vb=列)
+# 官方 bit_pairs_diff_table 的 4×4 基础表 (对角线=0, d(0,3)=d(3,0)=6 加重惩罚)
+_BIT_PAIRS_DIFF = (
+    (0,  1,  2,  6),   # va=0
+    (1,  0,  1,  2),   # va=1
+    (2,  1,  0,  1),   # va=2
+    (6,  2,  1,  0),   # va=3
+)
+
+# 距离计算常量 (与官方一致)
+LENGTH_MULT = 12       # 长度差异乘子
+QRATIO_MULT = 12       # Q 比率差异乘子
+
+
+def _mod_diff(x, y, R):
+    """模意义下的循环距离: min(|x-y| % R, R - |x-y| % R)"""
+    d = abs(x - y) % R
+    return min(d, R - d)
+
+
+def _h_distance(x, y):
+    """单字节 body code 差异: 4 个 2-bit 四分位对差异之和 (对应官方 h_distance)"""
+    diff = 0
+    for a in range(4):
+        va = (x >> (a * 2)) & 0x3
+        vb = (y >> (a * 2)) & 0x3
+        diff += _BIT_PAIRS_DIFF[va][vb]
+    return diff
+
+
+def diff(h1_hex, h2_hex):
+    """计算两个 TLSH hex 哈希的距离 (越小越相似, 0=完全相同)。
+
+    算法移植自官方 trendmicro/tlsh 的 lsh_bin_totalDiff:
+      1. 校验和 (1 字节): 不同则 +1
+      2. 长度值 Lvalue: mod_diff(L1, L2, 256); ldiff==0→+0, ldiff==1→+1, else +ldiff×12
+      3. Q 比率 (Q1/Q2 各一): mod_diff(Q1, Q2, 16); qdiff≤1→+qdiff, else +(qdiff-1)×12
+      4. body code (32 字节): 逐字节 h_distance 累加
+
+    返回 -1 表示输入无效 (长度不匹配/非 hex)。
+    """
+    if not h1_hex or not h2_hex:
+        return -1
+    h1_hex = h1_hex.upper()
+    h2_hex = h2_hex.upper()
+    # 去除可选的 "T1" 前缀 (py-tlsh 兼容; 用 startswith 而非 lstrip 避免误删合法字符)
+    if h1_hex.startswith("T1"):
+        h1_hex = h1_hex[2:]
+    if h2_hex.startswith("T1"):
+        h2_hex = h2_hex[2:]
+    if len(h1_hex) != TLSH_STRING_LEN or len(h2_hex) != TLSH_STRING_LEN:
+        return -1
+    try:
+        b1 = bytes.fromhex(h1_hex)
+        b2 = bytes.fromhex(h2_hex)
+    except ValueError:
+        return -1
+
+    total = 0
+
+    # 1. 校验和 (hex byte 0): 不同则 +1 (TLSH_CHECKSUM_LEN=1, 仅 1 字节)
+    if b1[0] != b2[0]:
+        total += 1
+
+    # 2. 长度值 (hex byte 1, 存储为 _swap_byte(Lvalue)): 反 swap 后做 mod_diff
+    l1 = _swap_byte(b1[1])
+    l2 = _swap_byte(b2[1])
+    ldiff = _mod_diff(l1, l2, RANGE_LVALUE)
+    if ldiff == 1:
+        total += 1
+    elif ldiff > 1:
+        total += ldiff * LENGTH_MULT
+
+    # 3. Q 比率 (hex byte 2, 存储为 _swap_byte(Q)):
+    #    低 nibble = Q1ratio, 高 nibble = Q2ratio; 各做 mod_diff(q, RANGE_QRATIO=16)
+    q1b = _swap_byte(b1[2])
+    q2b = _swap_byte(b2[2])
+    for qa, qb in [(q1b & 0x0F, q2b & 0x0F), ((q1b >> 4) & 0x0F, (q2b >> 4) & 0x0F)]:
+        qdiff = _mod_diff(qa, qb, RANGE_QRATIO)
+        if qdiff <= 1:
+            total += qdiff
+        else:
+            total += (qdiff - 1) * QRATIO_MULT
+
+    # 4. body code (hex bytes 3..34, 存储为 tmp_code 反序):
+    #    两哈希同序, 逐位 h_distance 累加即可 (反序不影响求和)
+    for i in range(CODE_SIZE):
+        total += _h_distance(b1[3 + i], b2[3 + i])
+
+    return total
+
+
+# 别名, 与官方 py-tlsh API 一致
+total_diff = diff

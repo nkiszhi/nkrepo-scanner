@@ -22,8 +22,6 @@
     </a>
     <div class="nav-links">
       <a href="/">搜索</a>
-      <a href="/scan">扫描</a>
-      <a href="/#stats">统计</a>
       <a href="/admin/hash">管理</a>
     </div>
     <div class="nav-right">
@@ -70,29 +68,140 @@ if (!HASH_VALID) {
   card.querySelector('.banner-sub').innerHTML = 'SHA256 <b>' + esc(FILE_HASH) + '</b>';
   pushCard(card, results, emptyHint);
 
-  fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
-    .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, d }))
-      .catch(() => ({ ok: false, status: r.status, d: null })))
-    .then(({ ok, d }) => {
-      if (d && d.found && d.result) {
-        render(card, d.result);
-        /* 报告生成时间标注 (缓存结果自上次扫描起未变) */
-        if (d.result.scanned_at) markCached(card, d.result);
-      } else if (ok && d && !d.found) {
-        /* 已扫描过但缓存尚未生成: 稍后重试一次 (阶段2后台线程可能仍在写) */
-        setTimeout(() => {
-          fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
-            .then(r => r.json())
-            .then(d2 => {
-              if (d2 && d2.found && d2.result) { render(card, d2.result); if (d2.result.scanned_at) markCached(card, d2.result); }
-              else showNotFound();
-            }).catch(() => showNotFound());
-        }, 1200);
-      } else {
-        showNotFound();
-      }
-    })
-    .catch(() => showNotFound());
+  /* 报告渲染包装: 删除横幅中的"详情页"自引用链接 (指向当前页面自身, 冗余) */
+  function renderReport(card, result) {
+    render(card, result);
+    const dl = card.querySelector('.detail-link');
+    if (dl) dl.remove();
+    resetRescanBtn(card);   /* 渲染完成: 恢复/补充"重新扫描"按钮 */
+  }
+
+  /* "重新扫描"按钮 (报告页): 调用 /api/rescan/<sha256> 重跑完整扫描并覆盖缓存 JSON 报告 */
+  function ensureRescanBtn(card) {
+    let btn = card.querySelector('.rescan-btn');
+    if (btn) return btn;
+    btn = document.createElement('button');
+    btn.className = 'rescan-btn';
+    btn.type = 'button';
+    btn.textContent = '重新扫描';
+    btn.addEventListener('click', () => doRescan(card, btn));
+    const banner = card.querySelector('.banner');
+    if (banner) banner.appendChild(btn);
+    return btn;
+  }
+
+  function resetRescanBtn(card) {
+    const btn = ensureRescanBtn(card);
+    btn.disabled = false;
+    btn.textContent = '重新扫描';
+    btn.style.display = '';
+  }
+
+  function doRescan(card, btn) {
+    btn.disabled = true;
+    btn.textContent = '扫描中…';
+    card.classList.remove('updated');
+    const banner = card.querySelector('.banner');
+    banner.className = 'banner scanning';
+    banner.querySelector('.banner-icon').innerHTML = '<span class="spinner"></span>';
+    banner.querySelector('.banner-title').textContent = '正在重新扫描…';
+    banner.querySelector('.banner-sub').innerHTML = '<b>' + esc(FILE_HASH) + '</b>';
+    banner.querySelector('.ring-wrap').style.display = 'none';
+    /* 移除"缓存"标注与旧详情页链接: 重扫结果即最新 */
+    const badge = banner.querySelector('.badge');
+    if (badge) badge.remove();
+    const dl = banner.querySelector('.detail-link');
+    if (dl) dl.remove();
+    card.querySelector('#detCnt').textContent = '0';
+    card.querySelector('.panel-detections').innerHTML =
+      '<div class="pending"><span class="spinner"></span>已重新提交, 正在分析…</div>';
+    card.querySelector('.panel-details').innerHTML = '';
+
+    fetch('/api/rescan/' + FILE_HASH, { method: 'POST', headers: authHeaders() })
+      .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, d }))
+        .catch(() => ({ ok: false, status: r.status, d: null })))
+      .then(({ ok, status, d }) => {
+        if (!ok) {
+          /* 样本未保留 (404) 为永久性错误 → 隐藏按钮; 其余错误恢复按钮供重试 */
+          if (status === 404) btn.style.display = 'none';
+          else resetRescanBtn(card);
+          renderErr(card, (d && d.error) || ('重新扫描失败 (' + status + ')'), '重新扫描失败');
+          return;
+        }
+        if (d && d.status === 'phase2' && d.task_id) {
+          renderPhase1(card, d.result);      /* 立即展示哈希/类型结果 */
+          pollTaskReport(card, d.task_id);   /* 完成后 renderReport 重渲染并恢复按钮 */
+        } else if (d && d.status === 'done' && d.result) {
+          renderReport(card, d.result);
+        } else {
+          loadReport(card);                  /* 兜底: 回退读缓存报告 */
+        }
+      })
+      .catch(() => {
+        resetRescanBtn(card);
+        renderErr(card, '网络错误, 重新扫描失败', '重新扫描失败');
+      });
+  }
+
+  const TASK_ID = new URLSearchParams(location.search).get('task');
+  if (TASK_ID) {
+    /* 刚上传的文件: 阶段2 后台执行中, 轮询任务直至完成直接渲染完整报告 */
+    pollTaskReport(card, TASK_ID);
+  } else {
+    loadReport(card);
+  }
+
+  /* 常规路径: 读缓存报告 (扫描已完成的文件) */
+  function loadReport(card) {
+    fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
+      .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, d }))
+        .catch(() => ({ ok: false, status: r.status, d: null })))
+      .then(({ ok, d }) => {
+        if (d && d.found && d.result) {
+          renderReport(card, d.result);
+          /* 报告生成时间标注 (缓存结果自上次扫描起未变) */
+          if (d.result.scanned_at) markCached(card, d.result);
+        } else if (ok && d && !d.found) {
+          /* 已扫描过但缓存尚未生成: 稍后重试一次 (阶段2后台线程可能仍在写) */
+          setTimeout(() => {
+            fetch('/api/file/' + FILE_HASH, { headers: authHeaders() })
+              .then(r => r.json())
+              .then(d2 => {
+                if (d2 && d2.found && d2.result) { renderReport(card, d2.result); if (d2.result.scanned_at) markCached(card, d2.result); }
+                else showNotFound();
+              }).catch(() => showNotFound());
+          }, 1200);
+        } else {
+          showNotFound();
+        }
+      })
+      .catch(() => showNotFound());
+  }
+
+  /* 刚提交的任务: 轮询 /api/task/<id> 直至完成; 超时/异常回退缓存读取 */
+  function pollTaskReport(card, taskId) {
+    const deadline = Date.now() + 120000;   /* 上限 120s, 超过回退缓存 */
+    const tick = () => {
+      fetch('/api/task/' + taskId, { headers: authHeaders() })
+        .then(r => r.json().then(d => ({ ok: r.ok, d })).catch(() => ({ ok: false, d: null })))
+        .then(({ ok, d }) => {
+          if (d && d.status === 'done' && d.result) {
+            renderReport(card, d.result);
+            /* 清理 URL 的 ?task= 参数, 使其成为规范报告链接 */
+            history.replaceState({}, '', '/file/' + FILE_HASH);
+          } else if (d && d.status === 'error') {
+            renderErr(card, d.error || '扫描失败，请重试', '扫描失败');
+          } else if (ok && d && d.status === 'phase2' && Date.now() < deadline) {
+            card.querySelector('.banner-title').textContent = '正在扫描…';
+            setTimeout(tick, 1000);
+          } else {
+            loadReport(card);   /* 任务过期/未完成 → 回退读缓存 */
+          }
+        })
+        .catch(() => loadReport(card));
+    };
+    tick();
+  }
 
   function showNotFound() {
     renderErr(card, '该文件尚未在本系统扫描过 — 请前往扫描页上传文件, 扫描完成后即可通过本链接查看报告', '未找到扫描报告');

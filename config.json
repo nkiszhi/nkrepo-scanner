@@ -18,9 +18,9 @@
     "max_open_shards": 16
   },
   "fuzzy": {
-    "_comment_layout": "模糊哈希库分片布局: 'hex' = 按首字节分 256 片 (00-ff); 5 表 (ssdeep/vhash/authentihash/imphash/rich_header_hash) 共享同一组分片文件",
+    "_comment_layout": "模糊哈希库分片布局: 'hex' = 按首字节分 256 片 (00-ff); 4 表 (vhash/authentihash/imphash/rich_header_hash) 共享同一组分片文件 (ssdeep 已独立到 ssdeep_library.db)",
     "layout": "hex",
-    "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图懒加载 LRU 缓存上限 (5 表共享同一连接, bloom 按 类型×分片 独立)",
+    "_comment_max_open_shards": "分片 SQLite 连接 / Bloom 位图懒加载 LRU 缓存上限 (4 表共享同一连接, bloom 按 类型×分片 独立)",
     "max_open_shards": 16
   },
   "hash_db": {
@@ -32,7 +32,7 @@
     "host": "127.0.0.1",
     "port": 5000,
     "max_upload_mb": 10,
-    "_comment_uploads_dir": "上传测试样本目录: 相对路径基于项目根目录解析 (如 uploads), 也支持绝对路径 (如 D:/scanner_uploads); 启动时若目录不存在会自动创建",
+    "_comment_uploads_dir": "上传样本目录: /scan 上传时按 SHA256 去重保存原始字节 (uploads/<sha256>) 与扫描报告 (uploads/<sha256>.json), 均与上传文件同目录; 供报告页'重新扫描'按钮读取重扫; 相对路径基于项目根目录解析 (如 uploads), 也支持绝对路径; 随缓存 LRU 一起清理 (2026-08-22)",
     "uploads_dir": "uploads",
     "_comment_api_token": "API 认证 (安全加固): 留空 = 匿名本地模式; 配置任意字符串后, /scan /api/task /api/stats 需带 Authorization: Bearer <token> 或 ?token=<token>; 前端页面首次带 ?token=<token> 访问即自动记住 (localStorage)",
     "api_token": "",
@@ -58,5 +58,21 @@
     "rules_dir": "packer_rules",
     "_comment_max_yara_bytes": "外部规则匹配的样本大小上限 (字节), 超过则跳过外部规则; 内置 DIE/PEiD 特征不受此限制",
     "max_yara_bytes": 16777216
+  },
+  "tlsh": {
+    "_comment_threshold": "TLSH 距离阈值 (≤ threshold 视为相似; 0=完全相同, 典型 30-50; 越小越严格)",
+    "threshold": 40,
+    "_comment_top_k": "返回距离最小的前 N 条相似结果",
+    "top_k": 10,
+    "_comment_max_entries": "自增长库容量上限; 超限自动淘汰最先插入的条目 (ROWID 最小)",
+    "max_entries": 50000
+  },
+  "ssdeep": {
+    "_comment_threshold": "SSDeep 相似度阈值 (≥ threshold 视为相似; 0-100, 官方推荐 ≥50; 越大越严格)",
+    "threshold": 50,
+    "_comment_top_k": "返回得分最高的前 N 条相似结果",
+    "top_k": 5,
+    "_comment_max_entries": "自增长库容量上限; 超限自动淘汰最先插入的条目 (ROWID 最小)",
+    "max_entries": 50000
   }
 }

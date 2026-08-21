@@ -235,7 +235,10 @@ function renderPhase1(card, d) {
   const detPanel = card.querySelector('.panel-detections');
   const detPanelD = card.querySelector('.panel-details');
 
-  const hashHits = d.detections.filter(x => x.engine === 'Hash DB');
+  const shaHits = d.detections.filter(x => x.engine === 'SHA256 Hash DB');
+  const md5Hits = d.detections.filter(x => x.engine === 'MD5 Hash DB');
+  const hashHits = shaHits.concat(md5Hits);
+  const ftHits = d.detections.filter(x => x.engine === 'FileType');
   const verdictColor = hashHits.length ? 'detected' : 'scanning';
 
   banner.className = 'banner ' + verdictColor;
@@ -254,13 +257,15 @@ function renderPhase1(card, d) {
     banner.querySelector('.ring-wrap').style.display = 'none';
   }
 
-  /* 检测结果 tab: 哈希命中 + YARA pending */
+  /* 检测结果 tab: SHA256/MD5 哈希命中 + 类型可疑信号 + YARA pending */
   let rows = '';
-  rows += engRow('h', 'H', 'Hash DB', hashHits,
-    '<span class="spinner" style="width:14px;height:14px"></span> <span>YARA 规则匹配中…</span>');
+  const pendingHtml = '<span class="spinner" style="width:14px;height:14px"></span> <span>YARA 规则匹配中…</span>';
+  rows += engRow(...engineMeta('SHA256 Hash DB'), shaHits, pendingHtml);
+  rows += engRow(...engineMeta('MD5 Hash DB'), md5Hits);
+  if (ftHits.length) rows += engRow(...engineMeta('FileType'), ftHits);
   detPanel.innerHTML = '<div class="det-table">' + rows + '</div>' +
     '<div class="pending"><span class="spinner"></span>YARA 规则匹配 · 模糊哈希 · 查壳分析进行中…</div>';
-  card.querySelector('#detCnt').textContent = hashHits.length;
+  card.querySelector('#detCnt').textContent = hashHits.length + ftHits.length;
 
   /* 详细信息 tab: 类型 + 哈希立即可见 */
   detPanelD.innerHTML = ftypeRow(d) + '<div class="dsec"><div class="dsec-head">' + ICON_HASH + '文件哈希</div>' +
@@ -320,16 +325,33 @@ function addDetailLink(card, d) {
 }
 
 /* ================= 检测结果表 ================= */
+/* 引擎 → 显示元信息 [iconClass, 字母, 标签]: 哈希库结果按 SHA256/MD5/SSDeep/TLSH 分开展示 */
+function engineMeta(engine) {
+  const map = {
+    'SHA256 Hash DB': ['h', 'H', 'SHA256哈希库'],
+    'MD5 Hash DB':    ['h', 'H', 'MD5哈希库'],
+    'SSDeep Hash DB': ['s', 'S', 'SSDeep模糊哈希库'],
+    'TLSH Hash DB':   ['l', 'L', 'TLSH模糊哈希库'],
+    'Fuzzy Hash DB':  ['f', 'F', 'Fuzzy Hash DB'],
+    'YARA':           ['y', 'Y', 'YARA'],
+    'FileType':       ['t', 'T', 'FileType'],
+  };
+  return map[engine] || ['h', 'H', engine];
+}
+
 function engRow(iconCls, letter, label, hits, extraHtml) {
   const hasHits = hits && hits.length;
   let cell;
   if (hasHits) {
     cell = hits.map(x =>
       '<div style="padding:4px 0"><div class="det-name">' + esc(x.name) +
-      (x.engine === 'Hash DB' ? '<span class="badge">' + (x.detail && x.detail.startsWith('MD5') ? 'MD5' : 'SHA256') + '</span>' :
+      (x.engine === 'SSDeep Hash DB' && x.score != null ? '<span class="badge">' + x.score + '/100</span>' :
+       x.engine === 'TLSH Hash DB' && x.score != null ? '<span class="badge">距离 ' + x.score + '</span>' :
        x.engine === 'Fuzzy Hash DB' && x.fuzzy ? '<span class="badge">' + Object.keys(x.fuzzy).filter(k => x.fuzzy[k]).join('+') + '</span>' : '') + '</div>' +
       (x.detail ? '<div class="det-detail">' + esc(x.detail) + '</div>' : '') +
-      (x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') + '</div>').join('');
+      (x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') +
+      (x.engine === 'SSDeep Hash DB' && x.ssdeep ? '<div class="det-detail" style="color:var(--text-faint)">' + esc(x.ssdeep) + '</div>' : '') +
+      (x.engine === 'TLSH Hash DB' && x.tlsh ? '<div class="det-detail" style="color:var(--text-faint)">' + esc(x.tlsh) + '</div>' : '') + '</div>').join('');
   } else if (extraHtml) {
     cell = '<div class="det-verdict pending">' + extraHtml + '</div>';
   } else {
@@ -354,14 +376,22 @@ function fuzzySummary(fz) {
 function detectionsTable(d) {
   const dets = d.detections || [];
   const yaraAvailable = (d.scanners || []).some(s => /YARA/i.test(s));
-  const hashHits = dets.filter(x => x.engine === 'Hash DB');
-  const yaraHits = dets.filter(x => x.engine === 'YARA');
+  const shaHits   = dets.filter(x => x.engine === 'SHA256 Hash DB');
+  const md5Hits   = dets.filter(x => x.engine === 'MD5 Hash DB');
+  const ssHits    = dets.filter(x => x.engine === 'SSDeep Hash DB');
+  const tlshHits  = dets.filter(x => x.engine === 'TLSH Hash DB');
+  const yaraHits  = dets.filter(x => x.engine === 'YARA');
   const fuzzyHits = dets.filter(x => x.engine === 'Fuzzy Hash DB');
+  const ftHits    = dets.filter(x => x.engine === 'FileType');
 
   let html = '<div class="det-table">';
-  html += engRow('h', 'H', 'Hash DB', hashHits);
-  if (fuzzyHits.length) html += engRow('f', 'F', 'Fuzzy Hash DB', fuzzyHits);
-  if (yaraAvailable) html += engRow('y', 'Y', 'YARA', yaraHits);
+  html += engRow(...engineMeta('SHA256 Hash DB'), shaHits);
+  html += engRow(...engineMeta('MD5 Hash DB'), md5Hits);
+  html += engRow(...engineMeta('SSDeep Hash DB'), ssHits);
+  html += engRow(...engineMeta('TLSH Hash DB'), tlshHits);
+  if (fuzzyHits.length) html += engRow(...engineMeta('Fuzzy Hash DB'), fuzzyHits);
+  if (ftHits.length) html += engRow(...engineMeta('FileType'), ftHits);
+  if (yaraAvailable) html += engRow(...engineMeta('YARA'), yaraHits);
   /* 加壳启发 (辅助信息) */
   const pk = (d.static_info || {}).packer;
   if (pk && pk.detected && pk.packers && pk.packers.length) {
@@ -592,14 +622,15 @@ function lookupHashCard(raw, results, emptyHint, displayName) {
         card.querySelector('.panel-detections').innerHTML =
           '<div class="det-table">' + d.detections.map(x => {
             const isFuzzy = x.engine === 'Fuzzy Hash DB';
+            const meta = engineMeta(x.engine);
             const sizeInfo = (x.size != null && x.size !== '') ? ' · 大小: ' + fmtSize(x.size) : '';
             return '<div class="det-row hit" style="display:flex;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(242,85,93,.14)">' +
               '<div style="min-width:0"><div class="det-name">' + esc(x.name) +
               (isFuzzy && x.fuzzy ? '<span class="badge">' + Object.keys(x.fuzzy).filter(k => x.fuzzy[k]).join('+') + '</span>' : '') + '</div>' +
               '<div class="det-detail">' + esc(x.detail || '') + sizeInfo + '</div>' +
               (isFuzzy && x.fuzzy ? '<div class="det-detail" style="color:var(--text-faint)">' + fuzzySummary(x.fuzzy) + '</div>' : '') + '</div>' +
-              '<span class="engine-cell" style="flex:none"><span class="e-icon ' + (isFuzzy ? 'f' : 'h') + '">' + (isFuzzy ? 'F' : 'H') + '</span> ' +
-              (isFuzzy ? 'Fuzzy Hash DB' : 'Hash DB') + '<span class="badge">' + (isFuzzy ? '' : label) + '</span></span></div>';
+              '<span class="engine-cell" style="flex:none"><span class="e-icon ' + meta[0] + '">' + meta[1] + '</span> ' +
+              esc(meta[2]) + '<span class="badge">' + (isFuzzy ? '' : label) + '</span></span></div>';
           }).join('') +
           '</div>';
         card.querySelector('.ring-wrap').style.display = '';
@@ -645,6 +676,8 @@ function loadStats(onStats) {
   const hc = document.getElementById('hashCount'); if (hc) hc.textContent = fmtNum(s.hash_signatures);
   const mc = document.getElementById('md5Count'); if (mc) mc.textContent = s.md5_available ? fmtNum(s.md5_signatures) : 'N/A';
   const fc = document.getElementById('fuzzyCount'); if (fc) fc.textContent = s.fuzzy_available ? fmtNum(s.fuzzy_signatures) : 'N/A';
+  const sc = document.getElementById('ssdeepCount'); if (sc) sc.textContent = s.ssdeep_available ? fmtNum(s.ssdeep_entries) : 'N/A';
+  const lc = document.getElementById('tlshCount'); if (lc) lc.textContent = s.tlsh_available ? fmtNum(s.tlsh_entries) : 'N/A';
   const yc = document.getElementById('yaraCount'); if (yc) yc.textContent = s.yara_available ? fmtNum(s.yara_rules) : 'N/A';
   const pc = document.getElementById('pkCount'); if (pc) pc.textContent = s.packer_yara_available ? fmtNum(s.packer_yara_rules) : 'N/A';
     const st = s.storage || {};

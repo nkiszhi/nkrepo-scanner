@@ -4,6 +4,7 @@ NKAMG Scanner - Web 服务入口
 """
 import json
 import os
+import re
 import hashlib
 import hmac
 import threading
@@ -16,7 +17,7 @@ from flask import Flask, jsonify, render_template, request, redirect, url_for, a
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from scanner import (FuzzySignatureDB, HashSignatureDB, Scanner,
-                     YaraScanner, compute_hashes_bytes)
+                     SsdeepLibrary, TlshLibrary, YaraScanner, compute_hashes_bytes)
 import packer
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +49,7 @@ DEFAULT_CONFIG = {
         "host": "127.0.0.1",
         "port": 5000,
         "max_upload_mb": 10,
-        "uploads_dir": "uploads",  # 上传测试样本目录 (相对项目根目录或绝对路径), 启动时自动创建
+        "uploads_dir": "uploads",  # 上传样本目录: /scan 上传时按 SHA256 去重保存原始字节与扫描报告 (uploads/<sha256> 与 .json 同目录), 供"重新扫描"读取; 相对项目根目录或绝对路径, 启动时自动创建
         # 安全加固: 认证 / 限流 / 深度分析资源上限 (以下均为中危 DoS 缓解, 见 README「安全」章节)
         "api_token": "",            # 留空 = 匿名本地模式; 配置任意字符串后, /scan /api/task /api/stats
                                     # 需携带 Authorization: Bearer <token> 或 ?token=<token> (前端首次带 ?token= 访问即记住)
@@ -60,6 +61,11 @@ DEFAULT_CONFIG = {
     "packer": {
         "rules_dir": "packer_rules",      # 外部 YARA 扩展壳库目录 (相对项目根目录或绝对路径)
         "max_yara_bytes": 16777216,       # 外部规则匹配的样本大小上限 (16MB)
+    },
+    "tlsh": {
+        "threshold": 40,              # TLSH 距离阈值 (≤ threshold 视为相似; 0=完全相同)
+        "top_k": 10,                   # 返回距离最小的前 N 条
+        "max_entries": 50000,          # 自增长库容量上限 (超限淘汰最旧)
     },
     "admin": {},                          # 管理员凭据 (哈希管理页面登录); config.json 的 admin 节会合并进来
 }
@@ -101,10 +107,59 @@ fuzzycfg = cfg.get("fuzzy", {})
 _fuzzy_layout = str(fuzzycfg.get("layout", "hex")).strip()
 _fuzzy_max_open = int(fuzzycfg.get("max_open_shards", hcfg["max_open_shards"]))
 
-# 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建; 仅用于放置测试样本, /scan 不落盘
+# TLSH 自增长相似度库配置
+tlshcfg = cfg.get("tlsh", {})
+_tlsh_threshold = int(tlshcfg.get("threshold", 40))
+_tlsh_top_k = int(tlshcfg.get("top_k", 10))
+_tlsh_max_entries = int(tlshcfg.get("max_entries", 50000))
+
+# SSDeep 自增长相似度库配置
+ssdeepcfg = cfg.get("ssdeep", {})
+_ssdeep_threshold = int(ssdeepcfg.get("threshold", 50))
+_ssdeep_top_k = int(ssdeepcfg.get("top_k", 5))
+_ssdeep_max_entries = int(ssdeepcfg.get("max_entries", 50000))
+
+# 上传目录: 从配置读取 (server.uploads_dir), 不存在时动态创建。
+# /scan 上传时按 SHA256 去重保存样本原始字节 (uploads/<sha256>) 到该目录,
+# 供报告页 "重新扫描" 按钮读取重扫; 随缓存 LRU 一起清理 (2026-08-22 调整: 样本并入 uploads/)
 _uploads_cfg = str(scfg.get("uploads_dir", "uploads")).strip()
 UPLOAD_DIR = _uploads_cfg if os.path.isabs(_uploads_cfg) else os.path.join(BASE_DIR, _uploads_cfg)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+def _sample_path(sha256_hex):
+    """样本文件路径: uploads/<sha256> (小写十六进制)"""
+    return os.path.join(UPLOAD_DIR, str(sha256_hex).strip().lower())
+
+
+def _save_sample(sha256_hex, data):
+    """按 SHA256 去重保存样本字节 (原子写: 临时文件 + rename); 失败静默忽略"""
+    path = _sample_path(sha256_hex)
+    if os.path.isfile(path):
+        return
+    tmp = path + ".tmp." + uuid.uuid4().hex[:8]
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 - 样本保存失败不影响扫描主流程
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _remove_sample_for_cache(cache_json_path):
+    """缓存被 LRU 淘汰时同步删除同名样本 (uploads/<sha256>), 防目录无限增长"""
+    name = os.path.basename(cache_json_path)
+    if name.endswith(".json"):
+        try:
+            sample = _sample_path(name[:-5])
+            if os.path.isfile(sample):
+                os.remove(sample)
+        except OSError:
+            pass
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 
@@ -167,6 +222,24 @@ if os.path.isdir(_fuzzy_base + ".shards"):
     print(f"[NKAMG] 模糊哈希库就绪: {fuzzy_db.count:,} 条 ({fuzzy_db._counts})")
 else:
     print("[NKAMG] 未检测到模糊哈希分片库, 跳过 (运行 build_fuzzy_db.py 可构建)")
+# TLSH 自增长相似度库: 每次精确哈希命中的样本自动入库累积,
+# 后续扫描将文件 TLSH 与库内条目做距离比对 (纯 Python, 无预置数据)
+tlsh_library = TlshLibrary(
+    os.path.join(SIG_DIR, "tlsh_library.db"),
+    threshold=_tlsh_threshold,
+    top_k=_tlsh_top_k,
+    max_entries=_tlsh_max_entries,
+)
+print(f"[NKAMG] TLSH 自增长库就绪: {tlsh_library.count:,} 条 (阈值={_tlsh_threshold}, top_k={_tlsh_top_k})")
+# SSDeep 自增长相似度库: 单文件 SQLite, 无 bloom, 无分片;
+# 可从 hdb 文件预导入 + 每次精确哈希命中自增长入库
+ssdeep_library = SsdeepLibrary(
+    os.path.join(SIG_DIR, "ssdeep_library.db"),
+    threshold=_ssdeep_threshold,
+    top_k=_ssdeep_top_k,
+    max_entries=_ssdeep_max_entries,
+)
+print(f"[NKAMG] SSDeep 自增长库就绪: {ssdeep_library.count:,} 条 (阈值={_ssdeep_threshold}, top_k={_ssdeep_top_k})")
 yara_scanner = YaraScanner()
 
 for fname in sorted(os.listdir(SIG_DIR)):
@@ -221,7 +294,8 @@ if pk_engine.rule_count:
 for f, err in pk_engine.errors[:5]:
     print(f"[NKAMG] 壳库规则警告 [{f}]: {err}")
 
-scanner = Scanner(hash_db, yara_scanner, md5_db=md5_db, fuzzy_db=fuzzy_db)
+scanner = Scanner(hash_db, yara_scanner, md5_db=md5_db, fuzzy_db=fuzzy_db,
+                   tlsh_library=tlsh_library, ssdeep_library=ssdeep_library)
 
 # ---------- 安全加固: API 认证 / 限流 / 阶段2 资源上限 ----------
 # M1: api_token 非空则所有 API 需 Bearer/query token (401); 默认空 = 匿名本地模式
@@ -236,15 +310,34 @@ P2_MAX_MB = P2_MAX_BYTES // (1024 * 1024)
 P2_CONCURRENCY = max(1, int(scfg.get("phase2_concurrency", 4)))
 P2_SEM = threading.Semaphore(P2_CONCURRENCY)
 
-# ---------- 扫描结果缓存 (按文件 SHA256 命名的 JSON) ----------
+# ---------- 扫描结果缓存 (按文件 SHA256 命名的 JSON, 与样本同存 uploads/) ----------
 # 同一文件 (内容相同 → SHA256 相同) 重复扫描时直接返回缓存结果, 跳过两段式扫描;
 # 前端可通过 "重新扫描" 按钮 (rescan=1) 强制绕过缓存重新分析并覆盖缓存。
-RESULTS_CACHE_DIR = os.path.join(BASE_DIR, "scan_cache")
+# 报告文件: uploads/<sha256>.json; 样本文件: uploads/<sha256> (同目录并存, 无扩展名冲突)
+RESULTS_CACHE_DIR = UPLOAD_DIR
 os.makedirs(RESULTS_CACHE_DIR, exist_ok=True)
+
+# 一次性迁移: 旧的 scan_cache/ 报告迁入 uploads/, 保留既有报告链接 (仅移动 uploads/ 中尚未存在的)
+_LEGACY_CACHE_DIR = os.path.join(BASE_DIR, "scan_cache")
+if os.path.isdir(_LEGACY_CACHE_DIR):
+    for _name in os.listdir(_LEGACY_CACHE_DIR):
+        if not _name.endswith(".json"):
+            continue
+        _src = os.path.join(_LEGACY_CACHE_DIR, _name)
+        _dst = os.path.join(RESULTS_CACHE_DIR, _name)
+        if os.path.isfile(_src) and not os.path.exists(_dst):
+            try:
+                os.replace(_src, _dst)
+            except OSError:
+                pass
+    try:
+        os.rmdir(_LEGACY_CACHE_DIR)   # 迁移干净后空目录被删除; 仍含其它文件则保留
+    except OSError:
+        pass
 
 
 def _cache_path(sha256_hex):
-    """缓存文件路径: scan_cache/<sha256>.json (小写十六进制, 防大小写歧义)"""
+    """报告缓存文件路径: uploads/<sha256>.json (小写十六进制, 防大小写歧义)"""
     return os.path.join(RESULTS_CACHE_DIR, str(sha256_hex).strip().lower() + ".json")
 
 
@@ -350,6 +443,7 @@ def _cache_cleanup(force=False):
                 os.remove(path)
             except OSError:
                 pass
+            _remove_sample_for_cache(path)
         # 2) 超量时按 mtime 从旧到新淘汰 (保留最新 CACHE_MAX_FILES 个)
         if len(keep) > CACHE_MAX_FILES:
             keep.sort(key=lambda e: e[0])
@@ -358,8 +452,56 @@ def _cache_cleanup(force=False):
                     os.remove(path)
                 except OSError:
                     pass
+                _remove_sample_for_cache(path)
     except Exception:  # noqa: BLE001 - 清理失败不影响扫描主流程
         pass
+
+
+def _launch_phase2(scanner, task, data, filename, submitted_at,
+                   sha256_hex, hash_hit, hash_hit_name, history):
+    """后台执行阶段 2 (YARA + 静态信息/模糊哈希 + 查壳), 合并后覆盖写缓存, 标记任务完成。
+
+    - task["phase1"] 必须已就绪 (调用方先填充再启动);
+    - 合并结果写 uploads/<sha256>.json (重新扫描时即"更新对应的 json 报告");
+    - 大样本仅跑 YARA (超 P2_MAX_BYTES), 并发受 P2_SEM 信号量限制。
+    """
+    def _run():
+        with P2_SEM:
+            try:
+                _t0 = time.time()
+                if len(data) > P2_MAX_BYTES:
+                    yara_dets = list(scanner.yara_scanner.scan_data(data))
+                    p2 = {
+                        "detections": yara_dets,
+                        "static_info": None,
+                        "static_ms": 0.0,
+                        "elapsed_ms": round((time.time() - _t0) * 1000, 1),
+                        "scanners": (["YARA"] if scanner.yara_scanner.rules else []),
+                        "note": f"样本超过阶段2深度分析上限 ({P2_MAX_MB}MB), "
+                                f"已跳过模糊哈希/PE元数据/查壳, 仅执行 YARA 规则匹配",
+                    }
+                else:
+                    p2 = scanner.scan_phase2(data, filename=filename,
+                                             hash_hit=hash_hit,
+                                             sha256=sha256_hex,
+                                             hash_hit_name=hash_hit_name)
+                # C2 修复: 先合并+写缓存, 再标记 done (消除 gap 期 /api/file 404 窗口)
+                try:
+                    merged = scanner.merge_phases(task["phase1"], p2)
+                    if p2.get("note"):
+                        merged["phase2_note"] = p2["note"]
+                    merged["submitted_at"] = submitted_at
+                    merged["history"] = history
+                    merged["scanned_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                    _save_cached_result(sha256_hex, merged)
+                except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
+                    pass
+                task["phase2"] = p2
+                task["status"] = "done"
+            except Exception as e:  # noqa: BLE001 - 后台异常记录到任务, 由轮询端呈现
+                task["error"] = str(e)
+                task["status"] = "error"
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _require_auth():
@@ -474,6 +616,10 @@ def stats():
         "md5_available": md5_db is not None,
         "fuzzy_signatures": fuzzy_db.count if fuzzy_db else 0,
         "fuzzy_available": fuzzy_db is not None,
+        "tlsh_entries": tlsh_library.count,
+        "tlsh_available": tlsh_library is not None,
+        "ssdeep_entries": ssdeep_library.count,
+        "ssdeep_available": ssdeep_library is not None,
         "yara_rules": yara_scanner.rule_count,
         "yara_available": yara_scanner.rules is not None,
         "yara_error": yara_scanner.error,
@@ -487,6 +633,8 @@ def stats():
         "storage": hash_db.stats(),
         "md5_storage": md5_db.stats() if md5_db else None,
         "fuzzy_storage": fuzzy_db.stats() if fuzzy_db else None,
+        "tlsh_storage": tlsh_library.stats() if tlsh_library else None,
+        "ssdeep_storage": ssdeep_library.stats() if ssdeep_library else None,
         "max_upload_mb": int(scfg["max_upload_mb"]),  # 前端据此本地预检超限, 给出明确提示
     })
 
@@ -555,6 +703,9 @@ def scan():
     # P0-2: 一次性计算全部哈希 (供缓存 key + scanner 复用, 不再重算 SHA256)
     md5_hex, sha1_hex, sha256_hex = compute_hashes_bytes(data)
 
+    # 重新扫描支持: 按 SHA256 去重保存样本原始字节 (供报告页"重新扫描"按钮读取); 后台写盘不阻塞响应
+    threading.Thread(target=_save_sample, args=(sha256_hex, data), daemon=True).start()
+
     # C3: 惰性触发缓存清理 (带 1 小时节流, 避免高频上传时反复遍历目录)
     threading.Thread(target=_cache_cleanup, daemon=True).start()
 
@@ -600,6 +751,17 @@ def scan():
     phase1 = scanner.scan_phase1(data, filename=f.filename,
                                  hashes=(md5_hex, sha1_hex, sha256_hex))
     phase1["submitted_at"] = submitted_at   # 提交时间随阶段1结果下发/合并
+    # 是否命中 SHA256/MD5 精确哈希: 不再作为 ssdeep/TLSH 检测门控
+    # (SSDeep/TLSH 相似度检测始终执行, 与 SHA256/MD5 精确哈希并行),
+    # 仅控制 ssdeep/TLSH 自增长库入库 (保持库内仅累积已知恶意样本)
+    hash_hit = any(d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB")
+                   for d in phase1["detections"])
+    # 获取哈希命中名称 (用于 ssdeep/TLSH 库入库标注)
+    _hash_hit_name = None
+    for d in phase1["detections"]:
+        if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
+            _hash_hit_name = d.get("name")
+            break
     task = {
         "id": task_id,
         "ts": time.time(),
@@ -614,44 +776,73 @@ def scan():
 
     # 阶段 2: YARA 规则 + 静态信息/模糊哈希 + 查壳 → 后台线程, 不阻塞上传响应
     # (闭包持有的 data 在线程结束后自动释放, 任务记录中不保留大缓冲)
-    # M3: 超过 phase2_max_mb 的样本仅执行 YARA (10s 超时), 跳过纯 Python 深度分析;
-    #     并发上限由信号量控制, 超限排队, 防止 CPU 峰值打满
-    def _run_phase2():
-        with P2_SEM:
-            try:
-                _t0 = time.time()
-                if len(data) > P2_MAX_BYTES:
-                    yara_dets = list(scanner.yara_scanner.scan_data(data))
-                    p2 = {
-                        "detections": yara_dets,
-                        "static_info": None,
-                        "static_ms": 0.0,
-                        "elapsed_ms": round((time.time() - _t0) * 1000, 1),
-                        "scanners": (["YARA"] if scanner.yara_scanner.rules else []),
-                        "note": f"样本超过阶段2深度分析上限 ({P2_MAX_MB}MB), "
-                                f"已跳过模糊哈希/PE元数据/查壳, 仅执行 YARA 规则匹配",
-                    }
-                else:
-                    p2 = scanner.scan_phase2(data, filename=f.filename)
-                # C2 修复: 先合并+写缓存, 再标记 done (消除 gap 期 /api/file 404 窗口)
-                try:
-                    merged = scanner.merge_phases(task["phase1"], p2)
-                    if p2.get("note"):
-                        merged["phase2_note"] = p2["note"]
-                    merged["submitted_at"] = submitted_at
-                    merged["history"] = history
-                    merged["scanned_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    _save_cached_result(sha256_hex, merged)
-                except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
-                    pass
-                task["phase2"] = p2
-                task["status"] = "done"
-            except Exception as e:  # noqa: BLE001 - 后台异常记录到任务, 由轮询端呈现
-                task["error"] = str(e)
-                task["status"] = "error"
-
-    threading.Thread(target=_run_phase2, daemon=True).start()
+    _launch_phase2(scanner, task, data, f.filename, submitted_at, sha256_hex,
+                   hash_hit, _hash_hit_name, history)
     return jsonify({"task_id": task_id, "status": "phase2", "result": phase1})
+
+
+@app.route("/api/rescan/<path:sha256_hex>", methods=["POST"])
+def api_rescan(sha256_hex):
+    """重新扫描: 读取已保存的样本原始字节重跑完整扫描, 覆盖更新 uploads/<sha256>.json 报告
+
+    供报告页 "重新扫描" 按钮调用; 返回两段式 task (阶段2 后台执行), 前端轮询
+    /api/task/<id> 后以新结果重新渲染报告。
+    """
+    if auth_err := _require_auth():
+        return auth_err
+    if _rate_limited():
+        return jsonify({"error": "请求过于频繁, 请稍后再试 (限流)"}), 429
+    sha = str(sha256_hex).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return jsonify({"error": "非法 SHA256 格式"}), 400
+    sample_path = _sample_path(sha)
+    if not os.path.isfile(sample_path):
+        return jsonify({
+            "error": "该样本的原始文件未被保留（样本自保存功能启用起才留存），"
+                     "请到扫描页重新上传后再重新扫描"
+        }), 404
+    try:
+        with open(sample_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return jsonify({"error": "样本文件读取失败"}), 500
+
+    # 沿用既有缓存中的文件名与提交历史, 追加本次重扫记录
+    old = _load_cached_result(sha)
+    filename = (old or {}).get("filename") or "unknown.bin"
+    history = []
+    if old and isinstance(old.get("history"), list):
+        history = list(old["history"])[-HISTORY_MAX:]
+    submitted_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    history.append({"filename": filename, "submitted_at": submitted_at})
+
+    md5_hex, sha1_hex, sha256_hex2 = compute_hashes_bytes(data)
+    phase1 = scanner.scan_phase1(data, filename=filename, hashes=(md5_hex, sha1_hex, sha256_hex2))
+    phase1["submitted_at"] = submitted_at
+    hash_hit = any(d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB")
+                   for d in phase1["detections"])
+    _hash_hit_name = None
+    for d in phase1["detections"]:
+        if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
+            _hash_hit_name = d.get("name")
+            break
+
+    _task_cleanup()
+    task_id = uuid.uuid4().hex[:12]
+    task = {
+        "id": task_id,
+        "ts": time.time(),
+        "history": history,
+        "phase1": phase1,
+        "phase2": None,
+        "status": "phase2",
+        "error": None,
+    }
+    with _tasks_lock:
+        _tasks[task_id] = task
+    _launch_phase2(scanner, task, data, filename, submitted_at, sha,
+                   hash_hit, _hash_hit_name, history)
+    return jsonify({"task_id": task_id, "status": "phase2", "result": phase1, "rescanned": True})
 
 
 @app.route("/api/task/<task_id>")
@@ -695,7 +886,7 @@ def file_page(file_hash):
 
 @app.route("/api/file/<file_hash>")
 def file_report(file_hash):
-    """按 SHA256 读取缓存中的扫描报告 (scan_cache/<sha256>.json); 未扫描过返回 404"""
+    """按 SHA256 读取缓存中的扫描报告 (uploads/<sha256>.json); 未扫描过返回 404"""
     auth_err = _require_auth()
     if auth_err:
         return auth_err
@@ -794,6 +985,100 @@ def admin_hash_delete(hash):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     return jsonify({"hash": hash, "hash_algo": algo, "deleted": deleted, "total": db.count})
+
+
+# ============================================================
+# 模糊哈希管理: SSDeep / TLSH (自增长库)
+# ============================================================
+_SSDEEP_RE = re.compile(r"^\d+[:|-][A-Za-z0-9+/]+[:|-][A-Za-z0-9+/]+$")
+_TLSH_RE = re.compile(r"^[0-9a-fA-F]{70}$")
+# Trend Micro 官方 libtlsh 原始格式: "T1" + 70 位 hex = 72 字符
+# (VirusTotal / MalwareBazaar 存量数据为无前缀 70 位 hex, 本项目同; 校验时兼容并归一化)
+# 注意: 值已先 lower(), 故前缀用小写 t 匹配
+_TLSH_TM_RE = re.compile(r"^t[0-9a-f][0-9a-f]{70}$")
+
+
+def _validate_fuzzy(kind, value):
+    """校验模糊哈希值格式; 返回 (value, error)"""
+    if kind == "ssdeep":
+        v = value.strip()
+        if not _SSDEEP_RE.match(v):
+            return None, "SSDeep 格式无效: 需 <块大小>:<hash1>:<hash2> (或 ClamAV 短横线分隔)"
+        return v, None
+    if kind == "tlsh":
+        v = value.strip().lower()
+        if _TLSH_TM_RE.match(v):
+            v = v[2:]  # 去掉 T1 前缀 → 70 位 hex (与本项目/VT 存储格式一致)
+        if not _TLSH_RE.match(v):
+            return None, "TLSH 格式无效: 需 70 位十六进制 (兼容 T1 前缀格式, 如 T1A8...)"
+        return v, None
+    return None, "未知哈希类型"
+
+
+@app.route("/api/admin/fuzzy/<kind>/<path:value>")
+@admin_required
+def admin_fuzzy_lookup(kind, value):
+    """查询 SSDeep/TLSH 模糊哈希 (精确匹配); 命中与否均 200"""
+    v, err = _validate_fuzzy(kind, value)
+    if err:
+        return jsonify({"error": err}), 400
+    if kind == "ssdeep":
+        if ssdeep_library is None:
+            return jsonify({"error": "SSDeep 库未构建"}), 503
+        hits = ssdeep_library.check_exact(v)
+        total = ssdeep_library.count
+    else:
+        if tlsh_library is None:
+            return jsonify({"error": "TLSH 库未构建"}), 503
+        hits = tlsh_library.check_exact(v)
+        total = tlsh_library.count
+    return jsonify({"kind": kind, "value": v, "hit": bool(hits), "total": total, "detections": hits})
+
+
+@app.route("/api/admin/fuzzy/<kind>", methods=["POST"])
+@admin_required
+def admin_fuzzy_add(kind):
+    """新增一条 SSDeep/TLSH 模糊哈希 {value, sha256, name, size}"""
+    data = request.get_json(silent=True) or {}
+    v, err = _validate_fuzzy(kind, data.get("value") or "")
+    if err:
+        return jsonify({"error": err}), 400
+    sha256 = (data.get("sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+        return jsonify({"error": "SHA256 需 64 位十六进制"}), 400
+    name = (data.get("name") or "").strip() or "unknown"
+    size = data.get("size")
+    if kind == "ssdeep":
+        if ssdeep_library is None:
+            return jsonify({"error": "SSDeep 库未构建"}), 503
+        ssdeep_library.insert(v, sha256, name, size)
+        total = ssdeep_library.count
+    else:
+        if tlsh_library is None:
+            return jsonify({"error": "TLSH 库未构建"}), 503
+        tlsh_library.insert(v, sha256, name, size)
+        total = tlsh_library.count
+    return jsonify({"kind": kind, "value": v, "added": 1, "total": total})
+
+
+@app.route("/api/admin/fuzzy/<kind>/<path:value>", methods=["DELETE"])
+@admin_required
+def admin_fuzzy_delete(kind, value):
+    """删除一条 SSDeep/TLSH 模糊哈希; 返回删除条数"""
+    v, err = _validate_fuzzy(kind, value)
+    if err:
+        return jsonify({"error": err}), 400
+    if kind == "ssdeep":
+        if ssdeep_library is None:
+            return jsonify({"error": "SSDeep 库未构建"}), 503
+        deleted = ssdeep_library.delete(v)
+        total = ssdeep_library.count
+    else:
+        if tlsh_library is None:
+            return jsonify({"error": "TLSH 库未构建"}), 503
+        deleted = tlsh_library.delete(v)
+        total = tlsh_library.count
+    return jsonify({"kind": kind, "value": v, "deleted": deleted, "total": total})
 
 
 @app.route("/api/admin/import", methods=["POST"])

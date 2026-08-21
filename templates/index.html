@@ -22,8 +22,6 @@
     </a>
     <div class="nav-links">
       <a href="/" class="active">搜索</a>
-      <a href="/scan">扫描</a>
-      <a href="#stats">统计</a>
       <a href="/admin/hash">管理</a>
     </div>
     <div class="nav-right">
@@ -48,7 +46,7 @@
              placeholder="输入哈希查询签名库（MD5 32 位 / SHA256 64 位十六进制），或下方拖拽文件扫描…">
       <button id="lookupBtn">查询</button>
     </div>
-    <div class="search-hint">支持粘贴 VirusTotal / ClamAV 等场景的 MD5 或 SHA256 哈希，快速判断该样本是否已在签名库中</div>
+    <div class="search-hint">支持粘贴文件的MD5或SHA256哈希，快速判断该样本是否已在签名库中。</div>
 
     <div class="upload-wrap">
       <div class="dropzone" id="dz">
@@ -59,24 +57,26 @@
           </svg>
         </div>
         <div class="dz-main">拖拽文件到此处，或点击选择</div>
-        <div class="dz-hint">支持任意类型 · 单文件最大 <b id="maxMb">10</b> MB · 可多选 · 全程内存扫描不落盘 · <a href="/scan" style="color:var(--accent)">前往扫描页</a></div>
-        <input type="file" id="fi" multiple hidden>
+        <div class="dz-hint">支持任意类型 · 单文件最大 <b id="maxMb">10</b> MB · 全程内存扫描不落盘 · <a href="/scan" style="color:var(--accent)">前往扫描页</a></div>
+        <input type="file" id="fi" hidden>
       </div>
     </div>
   </section>
 
   <!-- ================= 统计 ================= -->
   <section class="stats" id="stats">
-    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名（SHA256）</div></div>
-    <div class="stat"><div class="num" id="md5Count">-</div><div class="lbl">哈希签名（MD5）</div></div>
+    <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">SHA256哈希库</div></div>
+    <div class="stat"><div class="num" id="md5Count">-</div><div class="lbl">MD5哈希库</div></div>
     <div class="stat"><div class="num" id="fuzzyCount">-</div><div class="lbl">模糊哈希增强</div></div>
+    <div class="stat"><div class="num" id="ssdeepCount">-</div><div class="lbl">SSDEEP模糊哈希库</div></div>
+    <div class="stat"><div class="num" id="tlshCount">-</div><div class="lbl">TLSH模糊哈希库</div></div>
     <div class="stat"><div class="num" id="yaraCount">-</div><div class="lbl">YARA 规则</div></div>
     <div class="stat"><div class="num" id="pkCount">-</div><div class="lbl">壳库扩展规则</div></div>
     <div class="stat"><div class="num" id="dbSize">-</div><div class="lbl">签名库存储</div></div>
   </section>
 
-  <!-- ================= 结果区 (哈希查询结果展示; 文件扫描结果在扫描页) ================= -->
-  <div class="results-empty" id="emptyHint">哈希查询结果将显示在这里 · 提交文件后将自动跳转到扫描页查看扫描结果</div>
+  <!-- ================= 结果区 (哈希查询与文件扫描结果展示) ================= -->
+  <div class="results-empty" id="emptyHint">哈希查询与文件扫描结果将显示在这里</div>
   <section class="results" id="results"></section>
 
   <footer>
@@ -93,58 +93,47 @@ const fi = document.getElementById('fi');
 const results = document.getElementById('results');
 const emptyHint = document.getElementById('emptyHint');
 
-/* 上传事件: 首页不展示扫描结果, 提交后自动跳转到 /scan 显示扫描结果 */
-function goScanErr(msg) { location.href = '/scan?err=' + encodeURIComponent(msg); }
-
-function uploadThenGo(files) {
-  const arr = [...files];
-  if (!arr.length) return;
-  const limit = MAX_UPLOAD_MB * 1024 * 1024;
-  for (const f of arr) {
-    if (f.size > limit) {
-      goScanErr('文件过大: "' + f.name + '" 为 ' + fmtSize(f.size) +
-        ', 超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试');
-      return;
-    }
+/* 上传事件: 提交后直接跳转文件扫描报告页 (/file/<sha256>), 首页不再展示检测结果 */
+function uploadFile(file) {
+  const limitBytes = MAX_UPLOAD_MB * 1024 * 1024;
+  if (file.size > limitBytes) {
+    pushCard(mkErrCard('文件过大', '"' + file.name + '" 为 ' + fmtSize(file.size) + ', 超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试'), results, emptyHint);
+    return;
   }
-  const tasks = [];
-  let pending = arr.length;
-  arr.forEach(f => {
-    const fd = new FormData();
-    fd.append('file', f);
-    fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
-      .then(r => r.json()
-        .then(d => ({ ok: r.ok, status: r.status, d }))
-        .catch(() => ({ ok: false, status: r.status, d: null })))
-      .then(({ ok, status, d }) => {
-        if (!ok) {
-          goScanErr(status === 413
-            ? '文件超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试'
-            : ((d && d.error) || ('请求失败 (HTTP ' + status + '), 请稍后重试')));
-          return;
-        }
-        if (d.error) { goScanErr(d.error); return; }
-        tasks.push(d.task_id);
-        if (--pending === 0) {
-          const params = 'task=' + tasks.join(',') +
-            (tasks.length === 1
-              ? '&name=' + encodeURIComponent(arr[0].name) + '&size=' + arr[0].size
-              : '');
-          location.href = '/scan?' + params;
-        }
-      })
-      .catch(e => goScanErr('网络错误: ' + e.message));
-  });
+  /* 跳转前给出"正在扫描"反馈卡片 */
+  const card = mkScanCard(file, 'scan');
+  pushCard(card, results, emptyHint);
+  card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+
+  const fd = new FormData();
+  fd.append('file', file);
+  fetch('/scan', { method: 'POST', headers: authHeaders(), body: fd })
+    .then(r => r.json().then(d => ({ ok: r.ok, status: r.status, d }))
+      .catch(() => ({ ok: false, status: r.status, d: null })))
+    .then(({ ok, status, d }) => {
+      if (!ok) {
+        if (status === 413) renderErr(card, '文件超过上传上限 ' + MAX_UPLOAD_MB + 'MB, 请压缩后重试', '文件过大');
+        else if (d && d.error) renderErr(card, d.error);
+        else renderErr(card, '请求失败 (HTTP ' + status + '), 请稍后重试');
+        return;
+      }
+      if (d.error) { renderErr(card, d.error); return; }
+      const sha256 = (d.result || {}).sha256;
+      if (!sha256) { renderErr(card, '扫描未返回文件标识 (SHA256), 请重试'); return; }
+      /* 直接跳转报告详情页; 阶段2 仍在后台时带 ?task=, 由报告页轮询直至完成 */
+      location.href = '/file/' + sha256 + (d.task_id ? ('?task=' + d.task_id) : '');
+    })
+    .catch(e => renderErr(card, '网络错误: ' + e.message));
 }
 
-dz.addEventListener('click', () => fi.click());
+dz.addEventListener('click', e => { if (e.target.id !== 'fi') fi.click(); });
 dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('over'); });
 dz.addEventListener('dragleave', () => dz.classList.remove('over'));
 dz.addEventListener('drop', e => {
   e.preventDefault(); dz.classList.remove('over');
-  uploadThenGo(e.dataTransfer.files);
+  if (e.dataTransfer.files && e.dataTransfer.files[0]) uploadFile(e.dataTransfer.files[0]);
 });
-fi.addEventListener('change', () => { uploadThenGo(fi.files); fi.value = ''; });
+fi.addEventListener('change', () => { if (fi.files && fi.files[0]) uploadFile(fi.files[0]); fi.value = ''; });
 
 /* 哈希搜索 (VT 大搜索框) */
 const hashInput = document.getElementById('hashInput');

@@ -8,13 +8,34 @@ ClamAV 的判断机制:
        - type 1: 带通配符的模式搜索 (?? / * / {n-m} / (aa|bb)), offset 为 * 或 start,max
   2. 匹配缓冲区: 文件头 1024 字节 (CL_FILE_MBUFF_SIZE)
   3. 魔数未命中 → cli_texttype() 文本编码检测 (ASCII/UTF-8/UTF-16)
-  4. 命中 ZIP → 解析 local file header 条目名细分 OOXML (Word/Excel/PPT/HWP)
+  4. 命中 ZIP → 解析条目名细分 OOXML (Word/Excel/PPT/HWP)
   5. 命中 BINARY_DATA → is_tar() 兜底; MBR 用偏移 510 的 55AA
 
-本模块按同样思路实现, 返回结构化类型信息 (名称 / CL_TYPE_* 码 / 分类 / 判定方法)。
+本模块在 ClamAV 思路上的增强:
+  A. ZIP 细分改用 End of Central Directory 定位的中央目录解析 (传入完整 data 时):
+     条目名集中存放于文件尾, 不受前 1024 字节截断限制, 覆盖全部条目,
+     大型 OOXML/JAR 归档识别准确率显著提升; 解析失败自动退回 local header 方案。
+  B. PE 命中后追加轻量结构校验 (e_lfanew 指向 / PE 签名 / Machine / 可选头 magic):
+     校验失败 → 结果带 suspect 字段, 由扫描层转为可疑信号。
+  C. check_extension_mismatch(): 扩展名与魔数识别结果交叉校验,
+     "图片扩展名 + PE 内容" 等伪装场景 → 可疑信号。
+  D. libmagic 兜底层 (python-magic 可选依赖, 缺失时静默降级):
+     魔数链落入 generic binary 时借用 libmagic 描述丰富类型名。
+
+返回结构化类型信息 (名称 / CL_TYPE_* 码 / 分类 / 判定方法 / 可疑说明)。
 """
+import os
 import re
 import struct
+
+# ------------------------------------------------------------
+# libmagic 兜底层 (可选依赖: pip install python-magic 或 python-magic-bin)
+# 缺失 / DLL 不可用时静默降级, 与 pefile/ppdeep 的降级模式一致
+# ------------------------------------------------------------
+try:
+    import magic as _libmagic
+except Exception:  # ImportError 或 DLL 加载失败
+    _libmagic = None
 
 MAGIC_BUFFER_SIZE = 1024  # ClamAV CL_FILE_MBUFF_SIZE
 
@@ -153,7 +174,11 @@ OOXML_WEAK = [
 
 
 def _zip_entry_names(head):
-    """提取 head 中所有 ZIP local file header 的条目名 (ClamAV: 遍历前 1024 字节内的 lhdr)"""
+    """提取 head 中所有 ZIP local file header 的条目名 (ClamAV: 遍历前 1024 字节内的 lhdr)
+
+    仅作为中央目录不可用时的退回方案: 局限在文件头 1024 字节内,
+    大型归档后半部分条目 (如深层 word/ 目录) 会漏识别。
+    """
     names = []
     pos = head.find(b"PK\x03\x04")
     while pos != -1 and len(names) < 16:
@@ -170,13 +195,61 @@ def _zip_entry_names(head):
     return names
 
 
-def _detect_ooxml(head):
-    """ZIP 命中后解析条目名细分 OOXML 类型 (对应 ClamAV ooxml_detect)
+def _zip_central_dir_names(data, max_entries=64):
+    """从 End of Central Directory 定位中央目录, 提取全部条目名 (增强 A)
 
-    与 ClamAV 一致: 遍历前 1024 字节内所有 local file header 的条目名,
-    强类型前缀 (word/ xl/ ppt/ ...) 优先于通用条目 ([Content_Types].xml 等)。
+    相比 local header 方案的优势:
+      · 条目名集中存放在文件尾的中央目录中, 不受前 1024 字节截断限制
+      · 覆盖全部条目 (local 方案最多 16 个且要求头 1024 字节内出现)
+    返回条目名列表; 解析失败 (无 EOCD / ZIP64 / 布局异常) 返回 None,
+    调用方退回 _zip_entry_names。
     """
-    names = _zip_entry_names(head)
+    if not data or len(data) < 22:
+        return None
+    # EOCD 位于文件尾 (含最多 65535 字节 comment): 反向搜索 PK\x05\x06,
+    # 并校验 comment_len 与文件尾对齐, 排除 comment 数据中伪造的签名
+    scan_start = max(0, len(data) - 22 - 65535)
+    pos = data.rfind(b"PK\x05\x06", scan_start)
+    while pos != -1:
+        try:
+            comment_len = struct.unpack_from("<H", data, pos + 20)[0]
+            if pos + 22 + comment_len == len(data):
+                break  # 尾部对齐 → 可信 EOCD
+        except struct.error:
+            pass  # 记录不完整 (签名贴近文件尾) → 继续向前找
+        pos = data.rfind(b"PK\x05\x06", scan_start, pos)
+    if pos == -1:
+        return None
+    try:
+        (_sig, _disk, _cd_disk, _n_disk, n_total,
+         cd_size, cd_offset, _clen) = struct.unpack_from("<IHHHHIIH", data, pos)
+    except struct.error:
+        return None
+    # ZIP64 占位值 (0xFFFF/0xFFFFFFFF): 普通布局无法定位, 退回 local header 方案
+    if cd_offset == 0xFFFFFFFF or n_total == 0xFFFF:
+        return None
+    names = []
+    p = cd_offset
+    for _ in range(min(n_total, max_entries)):
+        # 中央目录头: 46 字节定长 + 文件名(nlen) + 扩展(elen) + 注释(clen)
+        if p < 0 or p + 46 > len(data) or data[p:p + 4] != b"PK\x01\x02":
+            break
+        nlen, elen, clen = struct.unpack_from("<HHH", data, p + 28)
+        start = p + 46
+        if start + nlen > len(data):
+            break
+        names.append(data[start:start + nlen])
+        p = start + nlen + elen + clen
+    return names
+
+
+def _detect_ooxml(names):
+    """ZIP 条目名 → OOXML 细分类型 (对应 ClamAV ooxml_detect)
+
+    names 来源: 中央目录解析 (优先, 全量条目) 或 local file header (退回方案)。
+    与 ClamAV 一致: 强类型前缀 (word/ xl/ ppt/ ...) 优先于通用条目
+    ([Content_Types].xml 等)。
+    """
     # 第一遍: 强类型前缀
     for prefix, tname, cl_type, category in OOXML_STRONG:
         for name in names:
@@ -215,12 +288,145 @@ def _detect_text(head):
     return "二进制数据", "CL_TYPE_BINARY_DATA", "binary"
 
 
-def detect_file_type(head, tail=b"", filename=None):
+# ------------------------------------------------------------
+# PE 结构校验 (增强 B): 零依赖轻量校验, 不引入 pefile
+#   e_lfanew 指向合法 → PE\0\0 签名 → 已知 Machine → 可选头 magic
+# ------------------------------------------------------------
+PE_KNOWN_MACHINES = {
+    0x014c: "i386", 0x8664: "x86-64", 0x01c0: "ARM", 0x01c4: "ARMNT",
+    0xaa64: "ARM64", 0x0200: "IA64", 0x5064: "RISCV64", 0x0ebc: "EFI BC",
+}
+PE_OPT_MAGICS = (0x10B, 0x20B, 0x107)  # PE32 / PE32+ / ROM
+
+
+def _validate_pe_structure(head, data=None):
+    """轻量 PE 头结构校验 (增强 B)
+
+    head: 文件头缓冲 (≥1024B 或整文件); data: 完整数据 (可选, e_lfanew 超出
+    head 范围时用它继续校验)。返回 (state, reason):
+      state="ok"      结构合法, reason=架构名 (如 "x86-64")
+      state="anomaly" 结构异常 (伪装/损坏), reason=异常描述
+      state="unknown" 缓冲不足无法判定 (不产生信号, 保持原结果)
+    """
+    src = data if data is not None else head
+    if len(src) < 0x40 or src[:2] != b"MZ":
+        return "unknown", None
+    e_lfanew = struct.unpack_from("<I", src, 0x3C)[0]
+    # e_lfanew 合理范围: ≥0x40 (DOS 头之后), 且 PE 签名+COFF 头须在缓冲内
+    if e_lfanew + 24 > len(src):
+        if data is None and e_lfanew >= len(head):
+            return "unknown", None  # 大 DOS stub 超出头缓冲: 无法判定
+        return "anomaly", f"e_lfanew=0x{e_lfanew:X} 越界 (文件大小 0x{len(src):X})"
+    if e_lfanew < 0x40:
+        return "anomaly", f"e_lfanew=0x{e_lfanew:X} 小于 DOS 头长度"
+    if src[e_lfanew:e_lfanew + 4] != b"PE\x00\x00":
+        return "anomaly", f"e_lfanew=0x{e_lfanew:X} 处无 PE 签名"
+    machine = struct.unpack_from("<H", src, e_lfanew + 4)[0]
+    if machine not in PE_KNOWN_MACHINES:
+        return "anomaly", f"未知 Machine=0x{machine:04X}"
+    opt_magic = struct.unpack_from("<H", src, e_lfanew + 24)[0]
+    if opt_magic not in PE_OPT_MAGICS:
+        return "anomaly", f"可选头 magic=0x{opt_magic:04X} 异常"
+    return "ok", PE_KNOWN_MACHINES[machine]
+
+
+# ------------------------------------------------------------
+# 扩展名/魔数交叉校验 (增强 C)
+# ------------------------------------------------------------
+# 可执行内容的 CL_TYPE 集合 (扩展名伪装检测的高危判定)
+EXECUTABLE_CL_TYPES = {
+    "CL_TYPE_MSEXE", "CL_TYPE_ELF", "CL_TYPE_MACHO", "CL_TYPE_MACHO_UNIBIN",
+    "CL_TYPE_JAVA", "CL_TYPE_SWF", "CL_TYPE_PYTHON_COMPILED", "CL_TYPE_AUTOIT",
+    "CL_TYPE_NULSFT", "CL_TYPE_ZIPSFX", "CL_TYPE_RARSFX", "CL_TYPE_7ZSFX",
+    "CL_TYPE_CABSFX",
+}
+# 本身即声明可执行的扩展名 (内容可执行属正常)
+EXECUTABLE_EXTS = {".exe", ".dll", ".sys", ".scr", ".cpl", ".ocx", ".ax",
+                   ".efi", ".jar", ".pyc", ".swf"}
+# 扩展名 → 期望的 CL_TYPE 集合 (未列出的扩展名不做校验, 避免误报)
+EXT_EXPECTED_TYPES = {
+    # 可执行族 (exe 也可能是 SFX 自解压安装包)
+    ".exe": {"CL_TYPE_MSEXE", "CL_TYPE_ZIPSFX", "CL_TYPE_RARSFX",
+             "CL_TYPE_7ZSFX", "CL_TYPE_CABSFX", "CL_TYPE_AUTOIT", "CL_TYPE_NULSFT"},
+    ".dll": {"CL_TYPE_MSEXE"}, ".sys": {"CL_TYPE_MSEXE"},
+    ".scr": {"CL_TYPE_MSEXE"}, ".cpl": {"CL_TYPE_MSEXE"},
+    # 文档
+    ".pdf": {"CL_TYPE_PDF"},
+    ".doc": {"CL_TYPE_MSOLE2"}, ".xls": {"CL_TYPE_MSOLE2"}, ".ppt": {"CL_TYPE_MSOLE2"},
+    ".docx": {"CL_TYPE_OOXML_WORD", "CL_TYPE_ZIP", "CL_TYPE_ZIPSFX"},
+    ".xlsx": {"CL_TYPE_OOXML_XL", "CL_TYPE_ZIP", "CL_TYPE_ZIPSFX"},
+    ".pptx": {"CL_TYPE_OOXML_PPT", "CL_TYPE_ZIP", "CL_TYPE_ZIPSFX"},
+    ".hwp": {"CL_TYPE_HWP3", "CL_TYPE_HWPOLE2", "CL_TYPE_OOXML_HWP",
+             "CL_TYPE_ZIP", "CL_TYPE_ZIPSFX", "CL_TYPE_MSOLE2"},
+    ".rtf": {"CL_TYPE_RTF"},
+    ".jar": {"CL_TYPE_JAVA", "CL_TYPE_ZIP", "CL_TYPE_ZIPSFX"},
+    ".msi": {"CL_TYPE_MSOLE2", "CL_TYPE_MSCAB"},
+    # 图形
+    ".png": {"CL_TYPE_PNG"}, ".gif": {"CL_TYPE_GIF"},
+    ".jpg": {"CL_TYPE_JPEG"}, ".jpeg": {"CL_TYPE_JPEG"},
+    ".bmp": {"CL_TYPE_GRAPHICS"}, ".ico": {"CL_TYPE_GRAPHICS"},
+    ".tif": {"CL_TYPE_TIFF"}, ".tiff": {"CL_TYPE_TIFF"},
+    ".webp": {"CL_TYPE_RIFF"},
+    # 压缩包
+    ".zip": {"CL_TYPE_ZIP", "CL_TYPE_ZIPSFX", "CL_TYPE_OOXML_WORD",
+             "CL_TYPE_OOXML_XL", "CL_TYPE_OOXML_PPT", "CL_TYPE_OOXML_HWP",
+             "CL_TYPE_JAVA"},
+    ".rar": {"CL_TYPE_RAR", "CL_TYPE_RARSFX"},
+    ".7z": {"CL_TYPE_7Z", "CL_TYPE_7ZSFX"},
+    ".gz": {"CL_TYPE_GZ"}, ".bz2": {"CL_TYPE_BZ"}, ".xz": {"CL_TYPE_XZ"},
+    ".cab": {"CL_TYPE_MSCAB", "CL_TYPE_CABSFX"},
+    # 网页
+    ".html": {"CL_TYPE_HTML"}, ".htm": {"CL_TYPE_HTML"},
+}
+
+
+def check_extension_mismatch(filename, ftype):
+    """扩展名与魔数识别结果交叉校验 (增强 C)
+
+    返回可疑信号描述字符串; 一致 / 扩展名未登记 / 无法判定时返回 None。
+    高危场景 (图片/文档扩展名 + 可执行内容) 给出"疑似伪装"措辞。
+    """
+    if not filename or not isinstance(ftype, dict):
+        return None
+    cl = ftype.get("cl_type")
+    if not cl or cl == "CL_TYPE_ANY":
+        return None
+    ext = os.path.splitext(filename)[1].lower()
+    expected = EXT_EXPECTED_TYPES.get(ext)
+    if not expected or cl in expected:
+        return None
+    content = ftype.get("name") or cl
+    if cl in EXECUTABLE_CL_TYPES and ext not in EXECUTABLE_EXTS:
+        return (f"扩展名 {ext} 与内容不符: 实际为可执行文件 ({content}), "
+                f"疑似伪装扩展名")
+    return f"扩展名 {ext} 与内容不符: 实际为 {content}"
+
+
+def _libmagic_describe(head):
+    """libmagic 兜底描述 (增强 D): python-magic 可选依赖, 失败静默降级"""
+    if _libmagic is None:
+        return None
+    try:
+        desc = _libmagic.from_buffer(head)
+    except Exception:
+        return None
+    if not desc:
+        return None
+    desc = desc.strip()
+    if not desc or desc.lower() in ("data", "empty"):
+        return None
+    return desc
+
+
+def detect_file_type(head, tail=b"", filename=None, data=None):
     """主入口: 模拟 ClamAV cli_compare_ftm_file + cli_determine_fmap_type
 
     head: 文件头 (至少 MAGIC_BUFFER_SIZE=1024 字节, 不足则整文件)
     tail: 文件末尾 (用于 DMG 'koly' 尾部魔数, 可选)
-    返回 dict: name / cl_type / category / method
+    filename: 文件名 (供扩展名交叉校验等调用方使用, 此处仅透传)
+    data: 完整文件数据 (可选增强): ZIP 中央目录解析 + PE 结构校验
+          在完整数据上执行; 未提供时自动退回头尾缓冲方案
+    返回 dict: name / cl_type / category / method / suspect(可选, 可疑说明)
     """
     if not head:
         return {"name": "空文件", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "empty"}
@@ -230,15 +436,35 @@ def detect_file_type(head, tail=b"", filename=None):
         if head[offset:offset + len(magic)] == magic:
             # ZIP → 尝试 OOXML 细分 (ClamAV cli_determine_fmap_type 的 ooxml 分支)
             if cl_type == "CL_TYPE_ZIP" and head[:4] == b"PK\x03\x04":
-                ooxml = _detect_ooxml(head)
+                # 增强 A: 优先中央目录 (全量条目, 不受 1024B 截断), 失败退回 local header
+                cd_used = False
+                names = _zip_central_dir_names(data) if data is not None else None
+                if names:
+                    cd_used = True
+                else:
+                    names = _zip_entry_names(head)
+                ooxml = _detect_ooxml(names)
                 if ooxml:
-                    return {"name": ooxml[0], "cl_type": ooxml[1], "category": ooxml[2], "method": "magic+ooxml"}
+                    return {"name": ooxml[0], "cl_type": ooxml[1],
+                            "category": ooxml[2],
+                            "method": "magic+ooxml-cd" if cd_used else "magic+ooxml"}
             return {"name": tname, "cl_type": cl_type, "category": category, "method": "magic"}
 
     # --- 第 2 层: 模式搜索 (type-1 FTM: PE / SFX / HTML) ---
     for regex, tname, cl_type, category in PATTERN_SIGS:
         if regex.search(head):
-            return {"name": tname, "cl_type": cl_type, "category": category, "method": "pattern"}
+            result = {"name": tname, "cl_type": cl_type, "category": category, "method": "pattern"}
+            # 增强 B: PE 命中 → 轻量结构校验 (e_lfanew / PE 签名 / Machine / 可选头)
+            if cl_type == "CL_TYPE_MSEXE":
+                state, reason = _validate_pe_structure(head, data)
+                if state == "ok":
+                    result["method"] = "pattern+pe-verify"
+                    result["pe_arch"] = reason
+                elif state == "anomaly":
+                    result["name"] = "PE 可执行文件 (头部结构异常)"
+                    result["method"] = "pattern+pe-verify"
+                    result["suspect"] = f"PE 头部结构校验失败: {reason}"
+            return result
 
     # --- 第 3 层: 尾部魔数 (DMG 'koly' @ EOF-512, ClamAV: "1:EOF-512:6b6f6c79") ---
     if tail and b"koly" in tail:
@@ -246,15 +472,19 @@ def detect_file_type(head, tail=b"", filename=None):
 
     # --- 第 4 层: 文本编码检测兜底 (cli_texttype) ---
     tname, cl_type, category = _detect_text(head)
-    method = "text-detect" if category == "text" else "fallback"
-    return {"name": tname, "cl_type": cl_type, "category": category, "method": method}
+    if category == "text":
+        return {"name": tname, "cl_type": cl_type, "category": category, "method": "text-detect"}
+    # 增强 D: generic binary → libmagic 兜底 (可选依赖, 失败静默降级为原结果)
+    lm_desc = _libmagic_describe(head)
+    if lm_desc:
+        return {"name": lm_desc, "cl_type": cl_type, "category": category, "method": "libmagic"}
+    return {"name": tname, "cl_type": cl_type, "category": category, "method": "fallback"}
 
 
 def read_head_tail(file_path, head_size=MAGIC_BUFFER_SIZE, tail_size=512):
     """读取文件头 + 尾部 (尾部用于 DMG 检测, 小于 head+tail 的文件只读一次)"""
     size = 0
     try:
-        import os
         size = os.path.getsize(file_path)
     except OSError:
         pass

@@ -23,9 +23,7 @@
     </a>
     <div class="nav-links">
       <a href="/">搜索</a>
-      <a href="/scan">扫描</a>
       <a href="/admin/hash" class="active">管理</a>
-      <a href="/#stats">统计</a>
     </div>
     <div class="nav-right">
       <span class="engine-pill" id="enginePill"><span class="dot"></span><span id="engineText">引擎加载中…</span></span>
@@ -47,6 +45,8 @@
     <div class="stat"><div class="num" id="hashCount">-</div><div class="lbl">哈希签名（SHA256）</div></div>
     <div class="stat"><div class="num" id="md5Count">-</div><div class="lbl">哈希签名（MD5）</div></div>
     <div class="stat"><div class="num" id="fuzzyCount">-</div><div class="lbl">模糊哈希增强</div></div>
+    <div class="stat"><div class="num" id="ssdeepCount">-</div><div class="lbl">SSDeep 模糊库</div></div>
+    <div class="stat"><div class="num" id="tlshCount">-</div><div class="lbl">TLSH 模糊库</div></div>
     <div class="stat"><div class="num" id="yaraCount">-</div><div class="lbl">YARA 规则</div></div>
     <div class="stat"><div class="num" id="pkCount">-</div><div class="lbl">壳库扩展规则</div></div>
     <div class="stat"><div class="num" id="dbSize">-</div><div class="lbl">签名库存储</div></div>
@@ -84,6 +84,46 @@
         <button class="btn btn-danger" id="delBtn">删除</button>
       </div>
       <div class="result-box" id="qResult"></div>
+    </div>
+
+    <!-- 添加 SSDeep / TLSH 模糊哈希 -->
+    <div class="mgmt-card">
+      <h2>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+        添加模糊哈希（SSDeep / TLSH）
+      </h2>
+      <div class="desc">手动录入 SSDeep / TLSH 模糊哈希，关联文件 SHA256 后立即生效，可参与相似度检测</div>
+      <div class="field-row">
+        <div class="field"><label>类型</label>
+          <select id="addFKind"><option value="ssdeep">SSDeep</option><option value="tlsh">TLSH</option></select>
+        </div>
+        <div class="field grow"><label>哈希值</label><input id="addFValue" placeholder="SSDeep: 块大小:hash1:hash2（或短横线） / TLSH: 70位hex"></div>
+      </div>
+      <div class="field-row">
+        <div class="field grow"><label>SHA256（关联文件）</label><input id="addFSha" placeholder="64 位 SHA256（必填）"></div>
+        <div class="field size-field"><label>大小(可选)</label><input id="addFSize" placeholder="* 或字节数"></div>
+        <div class="field"><label>名称</label><input id="addFName" placeholder="如 Trojan.Generic"></div>
+        <button class="btn btn-primary" id="addFBtn">添加</button>
+      </div>
+      <div class="result-box" id="addFResult"></div>
+    </div>
+
+    <!-- 查询 / 删除 SSDeep / TLSH -->
+    <div class="mgmt-card">
+      <h2>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="16.5" y1="16.5" x2="21" y2="21"/></svg>
+        查询 / 删除模糊哈希（SSDeep / TLSH）
+      </h2>
+      <div class="desc">按 SSDeep / TLSH 值精确查询关联信息，或从库中删除单条记录</div>
+      <div class="field-row">
+        <div class="field"><label>类型</label>
+          <select id="qFKind"><option value="ssdeep">SSDeep</option><option value="tlsh">TLSH</option></select>
+        </div>
+        <div class="field grow"><label>哈希值</label><input id="qFValue" placeholder="SSDeep: 块大小:hash1:hash2（或短横线） / TLSH: 70位hex"></div>
+        <button class="btn btn-ghost" id="qFLookupBtn">查询</button>
+        <button class="btn btn-danger" id="qFDelBtn">删除</button>
+      </div>
+      <div class="result-box" id="qFResult"></div>
     </div>
 
     <!-- 批量导入 -->

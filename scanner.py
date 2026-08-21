@@ -25,12 +25,23 @@ from collections import OrderedDict
 
 import filetype as ft
 import staticinfo
+import tlsh as tlsh_module
 
 try:
     import yara
     YARA_AVAILABLE = True
 except ImportError:
     YARA_AVAILABLE = False
+
+try:
+    import ppdeep
+    SSDEEP_AVAILABLE = True
+except ImportError:
+    SSDEEP_AVAILABLE = False
+
+# TLSH 模块为纯 Python 自研, 始终可用
+TLSH_AVAILABLE = True
+tlsh_diff = tlsh_module.diff  # 距离计算函数 (越小越相似)
 
 CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
 
@@ -70,8 +81,9 @@ def _sigs_row(sha256_digest, size, name):
 
 
 def compute_hashes(file_path):
-    """一次性分块计算文件的 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5)"""
+    """一次性分块计算文件的 MD5 / SHA1 / SHA256 (SHA1 供 Web 文件哈希展示)"""
     md5 = hashlib.md5()
+    sha1 = hashlib.sha1()
     sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         while True:
@@ -79,15 +91,17 @@ def compute_hashes(file_path):
             if not chunk:
                 break
             md5.update(chunk)
+            sha1.update(chunk)
             sha256.update(chunk)
-    return md5.hexdigest(), None, sha256.hexdigest()
+    return md5.hexdigest(), sha1.hexdigest(), sha256.hexdigest()
 
 
 def compute_hashes_bytes(data):
-    """从内存缓冲一次性计算 MD5 / SHA256 (SHA1 跳过: 签名库仅存 SHA256+MD5, 省 ~33% 哈希 CPU)"""
+    """从内存缓冲一次性计算 MD5 / SHA1 / SHA256 (SHA1 供 Web 文件哈希展示)"""
     md5 = hashlib.md5(data).hexdigest()
+    sha1 = hashlib.sha1(data).hexdigest()
     sha256 = hashlib.sha256(data).hexdigest()
-    return md5, None, sha256
+    return md5, sha1, sha256
 
 
 def guess_file_type(file_path):
@@ -101,6 +115,35 @@ def guess_file_type(file_path):
         return ft.detect_file_type(head, tail)["name"]
     except OSError:
         return "未知"
+
+
+def _type_suspicion_signals(filename, ftype):
+    """文件类型可疑信号 → detections 条目 (接入检测表展示)
+
+    两类信号 (均不影响原有哈希/YARA 判定, 独立成行):
+      · PE 头部结构校验失败 (伪装/损坏的 PE, filetype 增强返回 suspect 字段)
+      · 扩展名与魔数识别结果不一致 (如 .jpg 扩展名 + PE 内容, 疑似伪装)
+    """
+    signals = []
+    if not isinstance(ftype, dict):
+        return signals
+    suspect = ftype.get("suspect")
+    if suspect:
+        signals.append({
+            "engine": "FileType",
+            "type": "suspicious",
+            "name": "文件结构异常",
+            "detail": suspect,
+        })
+    mismatch = ft.check_extension_mismatch(filename, ftype)
+    if mismatch:
+        signals.append({
+            "engine": "FileType",
+            "type": "suspicious",
+            "name": "扩展名与内容不一致",
+            "detail": mismatch,
+        })
+    return signals
 
 
 # ============================================================
@@ -947,7 +990,7 @@ class HashSignatureDB:
         if file_size is not None and sig_size is not None and sig_size != file_size:
             return hits
         hits.append({
-            "engine": "Hash DB",
+            "engine": "MD5 Hash DB",
             "type": "hash",
             "name": name,
             "size": sig_size,
@@ -988,7 +1031,7 @@ class HashSignatureDB:
         if file_size is not None and sig_size is not None and sig_size != file_size:
             return hits
         hits.append({
-            "engine": "Hash DB",
+            "engine": "SHA256 Hash DB",
             "type": "hash",
             "name": name,
             "size": sig_size,
@@ -1061,19 +1104,10 @@ class HashSignatureDB:
 # 每种 fuzzy hash 独立成表, 以 fuzzy hash 本身为主键 (不再是 sha256)
 # 数据源 ClamAV 8 字段 hdb 行: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
 # ============================================================
-FUZZY_TYPES = ["ssdeep", "vhash", "authentihash", "imphash", "rich_header_hash"]
+FUZZY_TYPES = ["vhash", "authentihash", "imphash", "rich_header_hash"]
 
 # 每种 fuzzy hash 的表定义: 表名 / 列名 / SQL 类型 / DDL / INSERT / SELECT 列
 FUZZY_TABLE_SPECS = {
-    "ssdeep": {
-        "col": "ssdeep", "sql_type": "TEXT", "label": "SSDeep",
-        "table": "sigs_ssdeep",
-        "ddl": "CREATE TABLE IF NOT EXISTS sigs_ssdeep("
-               " ssdeep TEXT PRIMARY KEY, size INTEGER, name TEXT, sha256 BLOB)"
-               " WITHOUT ROWID",
-        "insert": "INSERT OR IGNORE INTO sigs_ssdeep(ssdeep,size,name,sha256) VALUES(?,?,?,?)",
-        "cols": "ssdeep,size,name,sha256",
-    },
     "vhash": {
         "col": "vhash", "sql_type": "BLOB", "label": "VHash",
         "table": "sigs_vhash",
@@ -1124,16 +1158,16 @@ def _hex_to_blob(s):
 
 
 class FuzzySignatureDB:
-    """5 表模糊哈希签名库 (每种 fuzzy hash 独立成表, 以 fuzzy hash 为主键)。
+    """4 表模糊哈希签名库 (每种 fuzzy hash 独立成表, 以 fuzzy hash 为主键)。
 
-    每个 hex 分片文件 (00.db ~ ff.db) 包含 5 张表:
-      sigs_ssdeep(ssdeep TEXT PK, size, name, sha256 BLOB)
+    每个 hex 分片文件 (00.db ~ ff.db) 包含 4 张表:
       sigs_vhash(vhash BLOB PK, size, name, sha256 BLOB)
       sigs_authentihash(authentihash BLOB PK, size, name, sha256 BLOB)
       sigs_imphash(imphash BLOB PK, size, name, sha256 BLOB)
       sigs_rich_header_hash(rich_header_hash BLOB PK, size, name, sha256 BLOB)
 
-    路由: BLOB 类型取首字节, ssdeep 取 sha256(string) 首字节 → 00~ff 分片。
+    注意: ssdeep 已独立到 SsdeepLibrary (单文件 SQLite, 无 bloom, 无分片)。
+    路由: BLOB 类型取首字节 → 00~ff 分片。
     Bloom 按类型 × 分片: {shard}_{type}.bloom, 懒加载 + LRU 缓存。
     数据源: ClamAV 8 字段 hdb 行, 每个非空 fuzzy 字段独立写入对应表。
     """
@@ -1202,15 +1236,11 @@ class FuzzySignatureDB:
 
     # ---------- 路由 ----------
     def _route(self, fuzzy_type, value):
-        """Route fuzzy hash value → shard_id (0-255). ssdeep: sha256(str)[0]; BLOB: blob[0]"""
-        if fuzzy_type == "ssdeep":
-            return hashlib.sha256(value.encode("utf-8")).digest()[0]
+        """Route fuzzy hash value → shard_id (0-255). BLOB: blob[0]"""
         return value[0]
 
     def _bloom_key(self, fuzzy_type, value):
-        """Bloom 用的字节: ssdeep → sha256(str); BLOB → 原始字节"""
-        if fuzzy_type == "ssdeep":
-            return hashlib.sha256(value.encode("utf-8")).digest()
+        """Bloom 用的字节: BLOB → 原始字节"""
         return value
 
     def _shard_name(self, shard_id):
@@ -1395,14 +1425,12 @@ class FuzzySignatureDB:
                     except ValueError:
                         size = None
                     name = parts[2].strip()
-                    ssdeep_val = parts[3].strip() or None
                     vhash_blob = _hex_to_blob(parts[4])
                     auth_blob = _hex_to_blob(parts[5])
                     imp_blob = _hex_to_blob(parts[6])
                     rich_blob = _hex_to_blob(parts[7])
-                    # 分发到 5 个表
+                    # 分发到 4 个表 (ssdeep 已独立到 SsdeepLibrary)
                     fuzzy_values = {
-                        "ssdeep": ssdeep_val,
                         "vhash": vhash_blob,
                         "authentihash": auth_blob,
                         "imphash": imp_blob,
@@ -1524,12 +1552,11 @@ class FuzzySignatureDB:
         })
         return hits
 
-    def check_by_computed_hashes(self, ssdeep=None, imphash_hex=None,
-                                  authentihash_hex=None, file_size=None):
-        """批量查询: 用 staticinfo 计算出的 fuzzy hash 查各表, 返回命中列表"""
+    def check_by_computed_hashes(self, imphash_hex=None,
+                                 authentihash_hex=None, file_size=None):
+        """批量查询: 用 staticinfo 计算出的 fuzzy hash 查各表, 返回命中列表
+        (ssdeep 精确匹配由 SsdeepLibrary.check_exact 处理, 不在此查询)"""
         hits = []
-        if ssdeep:
-            hits.extend(self.check_fuzzy("ssdeep", ssdeep, file_size))
         if imphash_hex:
             try:
                 hits.extend(self.check_fuzzy("imphash", bytes.fromhex(imphash_hex), file_size))
@@ -1602,6 +1629,626 @@ class FuzzySignatureDB:
                 except sqlite3.Error:
                     pass
             self.meta.close()
+
+
+# ============================================================
+# TLSH 自增长相似度库 (纯 Python, 单文件 SQLite)
+# ============================================================
+class TlshLibrary:
+    """TLSH 自增长相似度检索库
+
+    数据来源: 每次精确哈希命中 (SHA256/MD5) 的样本自动入库累积;
+    无预置 TLSH 数据 (hdb 中不含 TLSH 字段)。
+    检索: 将查询 TLSH 与库内全部 TLSH 逐一做 diff (纯 Python, 距离越小越相似),
+          返回距离 ≤ threshold 的 top_k 条 (按距离升序)。
+
+    表结构: tlsh (主键) / sha256 (BLOB 二进制, 32 字节) / size / name — 仅 4 字段,
+    sha256 存储格式与 ssdeep 库一致。
+    线程安全: 写入 (insert) 用 threading.Lock 保护; 读取 (search) 用只读连接,
+    与写入连接隔离, 无锁竞争。
+    """
+
+    TLSH_SIM_THRESHOLD = 40    # 距离阈值 (≤ threshold 视为相似; 0=完全相同)
+    TLSH_SIM_TOP_K = 10        # 返回距离最小的前 N 条
+    TLSH_MAX_ENTRIES = 50000   # 库容量上限 (自增长, 超限淘汰最旧)
+
+    def __init__(self, db_path, threshold=None, top_k=None, max_entries=None):
+        self.db_path = db_path
+        self.threshold = self.TLSH_SIM_THRESHOLD if threshold is None else threshold
+        self.top_k = self.TLSH_SIM_TOP_K if top_k is None else top_k
+        self.max_entries = self.TLSH_MAX_ENTRIES if max_entries is None else max_entries
+        self._lock = threading.Lock()
+        self._conn = None
+        self._count = -1  # -1 = 未加载
+        self._init_db()
+
+    def _init_db(self):
+        """创建数据库与表 (首次启动自动建表; 旧表结构自动迁移)"""
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+
+        # 旧表迁移: 含旧字段 (first_seen/hit_count) 或 sha256 非 BLOB 列 → 删除重建
+        cols = self._conn.execute("PRAGMA table_info(tlsh_entries)").fetchall()
+        if cols:
+            col_types = {c[1]: c[2] for c in cols}
+            if ("first_seen" in col_types or "hit_count" in col_types
+                    or col_types.get("sha256") != "BLOB"):
+                self._conn.execute("DROP TABLE tlsh_entries")
+
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS tlsh_entries (
+                tlsh       TEXT PRIMARY KEY,
+                sha256     BLOB,
+                size       INTEGER,
+                name       TEXT
+            )
+        """)
+        self._conn.commit()
+        self._count = self._conn.execute(
+            "SELECT COUNT(*) FROM tlsh_entries"
+        ).fetchone()[0]
+
+    @property
+    def count(self):
+        if self._count < 0:
+            return 0
+        return self._count
+
+    def insert(self, tlsh_hex, sha256_hex, name, size):
+        """插入/更新一条 TLSH 记录 (自增长, 线程安全)
+
+        已存在 (同 tlsh) → 更新 sha256/size/name; 不存在 → 新增。
+        超过 max_entries 时淘汰 ROWID 最旧 (最先插入) 的条目。
+        """
+        if not tlsh_hex or not sha256_hex:
+            return
+        # hex → BLOB (32 字节 vs 64 字符, 节省 50% 空间, 与 ssdeep 库一致)
+        try:
+            sha256_blob = bytes.fromhex(sha256_hex)
+        except (ValueError, TypeError):
+            sha256_blob = None
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT 1 FROM tlsh_entries WHERE tlsh = ?", (tlsh_hex,)
+                )
+                if cur.fetchone():
+                    # 已存在 → 更新关联信息
+                    self._conn.execute(
+                        "UPDATE tlsh_entries SET sha256 = ?, size = ?, name = ? "
+                        "WHERE tlsh = ?",
+                        (sha256_blob, size, name or "unknown", tlsh_hex),
+                    )
+                else:
+                    # 新条目 → 插入
+                    self._conn.execute(
+                        "INSERT INTO tlsh_entries (tlsh, sha256, size, name) "
+                        "VALUES (?, ?, ?, ?)",
+                        (tlsh_hex, sha256_blob, size, name or "unknown"),
+                    )
+                    self._count += 1
+                    # 淘汰最旧条目 (ROWID 最小 = 最先插入)
+                    if self._count > self.max_entries:
+                        self._conn.execute(
+                            "DELETE FROM tlsh_entries WHERE rowid = "
+                            "(SELECT MIN(rowid) FROM tlsh_entries)"
+                        )
+                        self._count -= 1
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+
+    def check_exact(self, tlsh_hex):
+        """精确匹配 TLSH 签名 (主键查询, 走索引)"""
+        if not tlsh_hex:
+            return []
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+        )
+        try:
+            row = conn.execute(
+                "SELECT size, name, LOWER(hex(sha256)) FROM tlsh_entries WHERE tlsh = ?",
+                (tlsh_hex,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return []
+        sig_size, name, sha256_hex = row
+        return [{
+            "engine": "TLSH Hash DB",
+            "type": "fuzzy",
+            "name": name,
+            "size": sig_size,
+            "detail": "TLSH 命中",
+            "fuzzy_type": "tlsh",
+            "sha256": sha256_hex,
+        }]
+
+    def delete(self, tlsh_hex):
+        """删除一条 TLSH 记录; 返回删除条数 (0/1)"""
+        if not tlsh_hex:
+            return 0
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "DELETE FROM tlsh_entries WHERE tlsh = ?", (tlsh_hex,)
+                )
+                self._conn.commit()
+                deleted = cur.rowcount
+                if deleted:
+                    self._count = max(self._count - 1, 0)
+                return deleted
+            except sqlite3.Error:
+                return 0
+
+    def search(self, query_tlsh, threshold=None, top_k=None):
+        """检索与 query_tlsh 距离 ≤ threshold 的库内条目, 按距离升序取 top_k
+
+        返回 [{engine, type, name, size, sha256, score, tlsh, detail}, ...]
+        其中 score = TLSH 距离 (越小越相似, 与 ssdeep score 语义相反)。
+        """
+        if not query_tlsh:
+            return []
+        threshold = self.threshold if threshold is None else threshold
+        top_k = self.top_k if top_k is None else top_k
+
+        # 用只读连接 (与写入连接隔离, 无锁竞争)
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+        )
+        try:
+            rows = conn.execute(
+                "SELECT tlsh, LOWER(hex(sha256)), size, name FROM tlsh_entries"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        if not rows:
+            return []
+
+        scored = []
+        for lib_tlsh, lib_sha256, lib_size, lib_name in rows:
+            if lib_tlsh == query_tlsh:
+                continue  # 跳过自身 (刚入库的条目)
+            distance = tlsh_diff(query_tlsh, lib_tlsh)
+            if distance < 0:
+                continue  # 无效 TLSH, 跳过
+            if distance <= threshold:
+                scored.append((distance, {
+                    "engine": "TLSH Hash DB",
+                    "type": "fuzzy-similar",
+                    "name": lib_name or "unknown",
+                    "size": lib_size,
+                    "sha256": lib_sha256 or "",
+                    "score": distance,
+                    "tlsh": lib_tlsh,
+                    "detail": f"TLSH 距离 {distance} (越小越相似)",
+                }))
+        scored.sort(key=lambda x: x[0])
+        return [hit for _, hit in scored[:top_k]]
+
+    def stats(self):
+        """返回库统计信息"""
+        return {
+            "count": self.count,
+            "threshold": self.threshold,
+            "top_k": self.top_k,
+            "max_entries": self.max_entries,
+        }
+
+    def close(self):
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
+
+
+# ============================================================
+# SSDeep 自增长相似度检索库 (单文件 SQLite, 无 bloom, 无分片)
+# ============================================================
+class SsdeepLibrary:
+    """SSDeep 自增长相似度检索库
+
+    数据来源:
+      1. 从 hdb 文件批量导入 (build_ssdeep_db.py / build_fuzzy_db.py)
+      2. 每次精确哈希命中 (SHA256/MD5) 的样本自动入库累积 (自增长)
+    检索: 与库内 ssdeep 签名做 ppdeep.compare 模糊匹配 (得分 0-100, 越高越相似)。
+
+    表结构: ssdeep (主键) / sha256 (BLOB 二进制, 32 字节) / size / name — 仅 4 字段。
+    不使用分片 Bloom filter — ssdeep 为变长 TEXT 主键, 精确查询走主键索引;
+    相似度检索走 GLOB 前缀 + 7-gram 预过滤 + ppdeep.compare, 无需 Bloom 预筛。
+    线程安全: 写入 (insert/import_hdb) 用 threading.Lock 保护;
+    读取 (search/check_exact) 用只读连接, 与写入连接隔离, 无锁竞争。
+    """
+
+    SSDEEP_SIM_THRESHOLD = 50   # 相似度阈值 (0-100, ssdeep 官方: >=50 高度可能相关)
+    SSDEEP_SIM_TOP_K = 5        # 返回得分最高的前 N 条
+    SSDEEP_SIM_LIMIT = 500      # 每候选块大小最多取多少行
+    SSDEEP_MAX_ENTRIES = 50000 # 库容量上限 (自增长, 超限淘汰最旧)
+
+    def __init__(self, db_path, threshold=None, top_k=None, max_entries=None):
+        self.db_path = db_path
+        self.threshold = self.SSDEEP_SIM_THRESHOLD if threshold is None else threshold
+        self.top_k = self.SSDEEP_SIM_TOP_K if top_k is None else top_k
+        self.max_entries = self.SSDEEP_MAX_ENTRIES if max_entries is None else max_entries
+        self._lock = threading.Lock()
+        self._conn = None
+        self._count = -1  # -1 = 未加载
+        self._imported_files = set()
+        self._init_db()
+
+    def _init_db(self):
+        """创建数据库与表 (首次启动自动建表; 旧表结构自动迁移)"""
+        os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
+        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # 旧表迁移: 如果存在含 first_seen/hit_count 列的旧表, 删除重建
+        cols = self._conn.execute("PRAGMA table_info(ssdeep_entries)").fetchall()
+        if cols:
+            col_names = {c[1] for c in cols}
+            if "first_seen" in col_names or "hit_count" in col_names:
+                self._conn.execute("DROP TABLE ssdeep_entries")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS ssdeep_entries (
+                ssdeep     TEXT PRIMARY KEY,
+                sha256     BLOB,
+                size       INTEGER,
+                name       TEXT
+            )
+        """)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)"
+        )
+        self._conn.commit()
+        self._count = self._conn.execute(
+            "SELECT COUNT(*) FROM ssdeep_entries"
+        ).fetchone()[0]
+        self._imported_files = {
+            r[0] for r in self._conn.execute(
+                "SELECT name FROM imported_files"
+            ).fetchall()
+        }
+
+    @property
+    def count(self):
+        if self._count < 0:
+            return 0
+        return self._count
+
+    @property
+    def source_files(self):
+        return sorted(self._imported_files)
+
+    def already_imported(self, basename):
+        return basename in self._imported_files
+
+    # ---------- ssdeep 格式辅助 ----------
+
+    @staticmethod
+    def _ssdeep_to_standard(value):
+        """归一化为标准 ssdeep 格式 (块大小:hash1:hash2, 冒号分隔)。
+        接受两种输入:
+          · 标准格式 (ppdeep.hash 输出, 冒号分隔) —— 直接返回
+          · ClamAV 格式 (12-hash1-hash2, 短横线分隔) —— 前两个 '-' 替换为 ':'
+        ssdeep hash 字符集不含 '-'/':', 分隔符可安全识别; 非法返回 None。"""
+        if not value:
+            return None
+        if ":" in value:
+            parts = value.split(":")
+            if len(parts) >= 3 and parts[0].isdigit():
+                return f"{parts[0]}:{parts[1]}:{parts[2]}"
+            return None
+        parts = value.split("-")
+        if len(parts) < 3:
+            return None
+        block = parts[0]
+        if not block.isdigit():
+            return None
+        return f"{block}:{parts[1]}:{parts[2]}"
+
+    @staticmethod
+    def _ssdeep_strip(s):
+        """压缩连续重复字符 (与 ppdeep._strip_sequences 语义一致)"""
+        if len(s) <= 3:
+            return s
+        out = [s[0], s[1], s[2]]
+        for i in range(3, len(s)):
+            if s[i] != s[i - 1] or s[i] != s[i - 2] or s[i] != s[i - 3]:
+                out.append(s[i])
+        return "".join(out)
+
+    @staticmethod
+    def _ssdeep_grams7(s):
+        """7-gram 集合 (ppdeep._common_substring 的 ROLL_WINDOW=7); 长度 <7 返回空集"""
+        if len(s) < 7:
+            return set()
+        return {s[i:i + 7] for i in range(len(s) - 6)}
+
+    # ---------- 导入 ----------
+
+    def import_hdb(self, filepath, batch=50_000):
+        """从 ClamAV 8 字段 hdb 文件导入 ssdeep 签名。
+
+        行格式: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
+        仅提取 ssdeep 字段 (parts[3]); sha256 存为 BLOB 二进制 (32 字节)。
+        INSERT OR IGNORE 去重, 幂等可续导。
+        """
+        basename = os.path.basename(filepath)
+        if self.already_imported(basename):
+            return 0
+        pending = []
+        with open(filepath, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":")
+                if len(parts) < 8:
+                    continue
+                h = parts[0].strip().lower()
+                if len(h) != 64:
+                    continue
+                try:
+                    sha256_blob = bytes.fromhex(h)
+                except ValueError:
+                    continue
+                size_field = parts[1].strip()
+                try:
+                    size = None if size_field in ("*", "0") else int(size_field)
+                except ValueError:
+                    size = None
+                name = parts[2].strip()
+                ssdeep_val = parts[3].strip() or None
+                if ssdeep_val:
+                    # 归一化为标准格式 (冒号分隔), 与 insert() 保持一致
+                    std = self._ssdeep_to_standard(ssdeep_val)
+                    if std:
+                        ssdeep_val = std
+                    pending.append((ssdeep_val, sha256_blob, size, name))
+
+        inserted = 0
+        with self._lock:
+            for i in range(0, len(pending), batch):
+                chunk = pending[i:i + batch]
+                before = self._conn.total_changes
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO ssdeep_entries(ssdeep, sha256, size, name) "
+                    "VALUES(?,?,?,?)",
+                    chunk,
+                )
+                self._conn.commit()
+                inserted += self._conn.total_changes - before
+            self._count = self._conn.execute(
+                "SELECT COUNT(*) FROM ssdeep_entries"
+            ).fetchone()[0]
+            self._conn.execute(
+                "INSERT OR IGNORE INTO imported_files(name) VALUES(?)", (basename,))
+            self._conn.commit()
+            self._imported_files.add(basename)
+        return inserted
+
+    # ---------- 写入 (自增长) ----------
+
+    def insert(self, ssdeep_val, sha256_hex, name, size):
+        """插入/更新一条 ssdeep 记录 (自增长, 线程安全)
+
+        sha256_hex: 64 位 hex 字符串, 内部转为 BLOB 二进制存储 (节省 50% 空间)。
+        ssdeep_val 归一化为标准格式 (块大小:hash1:hash2, 冒号分隔) 后存储,
+        确保 insert (ppdeep 标准格式) 与 import_hdb (ClamAV 短横线格式) 数据一致,
+        精确匹配与 GLOB 前缀检索均能命中。
+        已存在 (同 ssdeep) → 更新 sha256/size/name; 不存在 → 新增。
+        超过 max_entries 时淘汰 ROWID 最旧 (最先插入) 的条目。
+        """
+        if not ssdeep_val or not sha256_hex:
+            return
+        # 归一化为标准格式 (冒号分隔), 统一存储格式
+        std = self._ssdeep_to_standard(ssdeep_val)
+        if std:
+            ssdeep_val = std
+        # hex → BLOB (32 字节 vs 64 字符, 节省 50% 空间)
+        try:
+            sha256_blob = bytes.fromhex(sha256_hex)
+        except (ValueError, TypeError):
+            sha256_blob = None
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "SELECT 1 FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
+                )
+                if cur.fetchone():
+                    self._conn.execute(
+                        "UPDATE ssdeep_entries SET sha256 = ?, size = ?, name = ? "
+                        "WHERE ssdeep = ?",
+                        (sha256_blob, size, name or "unknown", ssdeep_val),
+                    )
+                else:
+                    self._conn.execute(
+                        "INSERT INTO ssdeep_entries (ssdeep, sha256, size, name) "
+                        "VALUES (?, ?, ?, ?)",
+                        (ssdeep_val, sha256_blob, size, name or "unknown"),
+                    )
+                    self._count += 1
+                    if self._count > self.max_entries:
+                        self._conn.execute(
+                            "DELETE FROM ssdeep_entries WHERE rowid = "
+                            "(SELECT MIN(rowid) FROM ssdeep_entries)"
+                        )
+                        self._count -= 1
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+
+    # ---------- 精确匹配 ----------
+
+    def check_exact(self, ssdeep_value, file_size=None):
+        """精确匹配 ssdeep 签名 (主键查询, 走索引)"""
+        if not ssdeep_value:
+            return []
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+        )
+        try:
+            row = conn.execute(
+                "SELECT size, name, LOWER(hex(sha256)) FROM ssdeep_entries WHERE ssdeep = ?",
+                (ssdeep_value,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return []
+        sig_size, name, sha256_hex = row
+        if file_size is not None and sig_size is not None and sig_size != file_size:
+            return []
+        return [{
+            "engine": "SSDeep Hash DB",
+            "type": "fuzzy",
+            "name": name,
+            "size": sig_size,
+            "detail": "SSDeep 命中",
+            "fuzzy_type": "ssdeep",
+            "sha256": sha256_hex,
+        }]
+
+    def delete(self, ssdeep_val):
+        """删除一条 ssdeep 记录 (按归一化后的标准格式匹配); 返回删除条数 (0/1)"""
+        if not ssdeep_val:
+            return 0
+        std = self._ssdeep_to_standard(ssdeep_val)
+        if std:
+            ssdeep_val = std
+        with self._lock:
+            try:
+                cur = self._conn.execute(
+                    "DELETE FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
+                )
+                self._conn.commit()
+                deleted = cur.rowcount
+                if deleted:
+                    self._count = max(self._count - 1, 0)
+                return deleted
+            except sqlite3.Error:
+                return 0
+
+    # ---------- 相似度检索 ----------
+
+    def search(self, query_ssdeep, file_size=None, threshold=None, top_k=None):
+        """ssdeep 相似度检索: 与库中 ssdeep 签名做 ppdeep.compare 模糊匹配 (得分 0-100)。
+
+        候选筛选 (避免全库逐条比对, 控制检索量):
+          1. 解析查询块大小 B; 候选块大小 ∈ {B//2, B, B*2}
+          2. 文件大小 ±2 倍过滤
+          3. GLOB 'B:*' (ssdeep 主键前缀索引, 标准冒号格式) + size 过滤 + LIMIT
+          4. 7-gram 预过滤: 无公共 7 子串的候选 compare 必然得 0, 直接跳过
+        返回得分 >= threshold 的命中, 按得分降序取 top_k。
+        """
+        if not SSDEEP_AVAILABLE or not query_ssdeep:
+            return []
+        threshold = self.SSDEEP_SIM_THRESHOLD if threshold is None else threshold
+        top_k = self.SSDEEP_SIM_TOP_K if top_k is None else top_k
+
+        query_std = self._ssdeep_to_standard(query_ssdeep)
+        if query_std is None:
+            return []
+        try:
+            q_block = int(query_std.split(":", 1)[0])
+        except ValueError:
+            return []
+        _qb, _qh1, _qh2 = query_std.split(":", 2)
+        q_s1 = self._ssdeep_strip(_qh1)
+        q_s2 = self._ssdeep_strip(_qh2)
+        q_g1 = self._ssdeep_grams7(q_s1)
+        q_g2 = self._ssdeep_grams7(q_s2)
+        cand_blocks = sorted({b for b in (q_block, q_block // 2, q_block * 2) if b > 0})
+        if file_size is not None and file_size > 0:
+            size_lo, size_hi = file_size // 2, file_size * 2
+        else:
+            size_lo, size_hi = None, None
+
+        conn = sqlite3.connect(
+            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+        )
+        try:
+            scored = []
+            for bsize in cand_blocks:
+                sql = ("SELECT ssdeep, size, name, LOWER(hex(sha256)) FROM ssdeep_entries"
+                       " WHERE ssdeep GLOB ?")
+                params = [f"{bsize}:*"]
+                if size_lo is not None:
+                    sql += " AND (size IS NULL OR size BETWEEN ? AND ?)"
+                    params += [size_lo, size_hi]
+                sql += " LIMIT ?"
+                params.append(self.SSDEEP_SIM_LIMIT)
+                try:
+                    rows = conn.execute(sql, params).fetchall()
+                except sqlite3.Error:
+                    continue
+                for clam_val, sig_size, name, sha256_hex in rows:
+                    std = self._ssdeep_to_standard(clam_val)
+                    if std is None or std == query_std:
+                        continue
+                    try:
+                        c_block, c_h1, c_h2 = std.split(":", 2)
+                        c_block = int(c_block)
+                    except ValueError:
+                        continue
+                    # 7-gram 预过滤
+                    if c_block == q_block:
+                        if not (q_g1 & self._ssdeep_grams7(self._ssdeep_strip(c_h1))
+                                or q_g2 & self._ssdeep_grams7(self._ssdeep_strip(c_h2))):
+                            continue
+                    elif q_block == c_block * 2:
+                        if not (q_g1 & self._ssdeep_grams7(self._ssdeep_strip(c_h2))):
+                            continue
+                    elif c_block == q_block * 2:
+                        if not (q_g2 & self._ssdeep_grams7(self._ssdeep_strip(c_h1))):
+                            continue
+                    else:
+                        continue
+                    try:
+                        score = ppdeep.compare(query_std, std)
+                    except Exception:
+                        continue
+                    if score >= threshold:
+                        scored.append((score, {
+                            "engine": "SSDeep Hash DB",
+                            "type": "fuzzy-similar",
+                            "name": name or "unknown",
+                            "size": sig_size,
+                            "sha256": sha256_hex,
+                            "score": score,
+                            "ssdeep": clam_val,
+                            "detail": f"ssdeep 相似度 {score}/100",
+                        }))
+        finally:
+            conn.close()
+        scored.sort(key=lambda x: -x[0])
+        return [hit for _, hit in scored[:top_k]]
+
+    # ---------- 统计 ----------
+
+    def stats(self):
+        db_size = 0
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                db_size += os.path.getsize(self.db_path + suffix)
+            except OSError:
+                pass
+        return {
+            "count": self.count,
+            "threshold": self.threshold,
+            "top_k": self.top_k,
+            "max_entries": self.max_entries,
+            "db_size_mb": round(db_size / 1048576, 2),
+            "sources": len(self._imported_files),
+        }
+
+    def close(self):
+        with self._lock:
+            if self._conn:
+                self._conn.close()
+                self._conn = None
 
 
 # ============================================================
@@ -1777,11 +2424,14 @@ class Scanner:
     # 一次性读入内存的上限: 超过则退回分块+路径扫描, 防大文件占满内存
     INLINE_LIMIT = 64 * 1024 * 1024
 
-    def __init__(self, hash_db, yara_scanner, md5_db=None, fuzzy_db=None):
+    def __init__(self, hash_db, yara_scanner, md5_db=None, fuzzy_db=None,
+                 tlsh_library=None, ssdeep_library=None):
         self.hash_db = hash_db
         self.yara_scanner = yara_scanner
         self.md5_db = md5_db  # 独立 MD5 分片库 (可选); 命中并入 detections
-        self.fuzzy_db = fuzzy_db  # 模糊哈希库 (可选); phase2 用计算的 fuzzy hash 按值查 5 张表
+        self.fuzzy_db = fuzzy_db  # 模糊哈希库 (4 表: vhash/authentihash/imphash/rich_header_hash)
+        self.tlsh_library = tlsh_library  # TLSH 自增长相似度库 (可选); 检测始终执行, hash_hit 时入库
+        self.ssdeep_library = ssdeep_library  # SSDeep 自增长相似度库 (可选); 检测始终执行, hash_hit 时入库
 
     def scan_file(self, file_path, filename=None):
         """扫描单个文件 (兼容接口)。
@@ -1809,9 +2459,16 @@ class Scanner:
         """
         return self._phase1(data, filename or "unnamed", hashes=hashes)
 
-    def scan_phase2(self, data, filename=None):
-        """两段式扫描·阶段2 (Web 上传, 后台线程): YARA 规则 + 静态信息/模糊哈希 + 查壳"""
-        return self._phase2(data, filename or "unnamed")
+    def scan_phase2(self, data, filename=None, hash_hit=False,
+                     sha256=None, hash_hit_name=None):
+        """两段式扫描·阶段2 (Web 上传, 后台线程): YARA 规则 + 静态信息/模糊哈希 + 查壳
+
+        hash_hit: 阶段1 是否命中 SHA256/MD5 哈希签名 (仅控制 ssdeep/TLSH 自增长入库, 不控制检测)。
+        sha256: 阶段1 计算的 SHA256 (用于 ssdeep/TLSH 库入库关联; 不传则 phase2 内部重算)。
+        hash_hit_name: 哈希命中对应的恶意名称 (用于 ssdeep/TLSH 库入库标注; 可选)。
+        """
+        return self._phase2(data, filename or "unnamed", hash_hit=hash_hit,
+                            sha256=sha256, hash_hit_name=hash_hit_name)
 
     def merge_phases(self, p1, p2):
         """两段式扫描·合并: 阶段1 + 阶段2 → 完整扫描结果 (供轮询接口拼装)"""
@@ -1824,7 +2481,16 @@ class Scanner:
         Web 上传路径改用 scanner.scan_phase1 / scan_phase2 两段式 (哈希先返回, 深度分析动态更新)。
         """
         p1 = self._phase1(data, filename)
-        p2 = self._phase2(data, filename)
+        hash_hit = any(d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB")
+                       for d in p1["detections"])
+        # 获取哈希命中名称 (用于 ssdeep/TLSH 库入库标注)
+        hit_name = None
+        for d in p1["detections"]:
+            if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
+                hit_name = d.get("name")
+                break
+        p2 = self._phase2(data, filename, hash_hit=hash_hit,
+                          sha256=p1.get("sha256"), hash_hit_name=hit_name)
         return self._merge_phases(p1, p2)
 
     def _phase1(self, data, filename, hashes=None):
@@ -1842,17 +2508,24 @@ class Scanner:
         file_size = len(data)
 
         # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
+        # 增强: ZIP 中央目录解析 / PE 结构校验 / libmagic 兜底 (data 传入完整缓冲)
         ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
         try:
             head = data[:ft.MAGIC_BUFFER_SIZE]
             tail = (data[-512:] if len(data) > ft.MAGIC_BUFFER_SIZE + 512 else b"")
-            ftype = ft.detect_file_type(head, tail, filename)
+            ftype = ft.detect_file_type(head, tail, filename, data=data)
         except Exception:
             pass
+
+        # 文件类型可疑信号 → 接入 detections:
+        #   · PE 头结构校验失败 (伪装/损坏的 PE)
+        #   · 扩展名与魔数识别结果不一致 (如 .jpg 扩展名 + PE 内容)
+        type_signals = _type_suspicion_signals(filename, ftype)
 
         detections = list(self.hash_db.check(None, file_size, md5, sha1, sha256))
         if self.md5_db is not None:
             detections.extend(self.md5_db.check_hash(md5, file_size))
+        detections.extend(type_signals)
         # 模糊哈希查询移至 phase2: 需先计算 ssdeep/imphash/authentihash 才能按值查询
         elapsed_ms = round((time.time() - start) * 1000, 1)
         return {
@@ -1860,24 +2533,28 @@ class Scanner:
             "size": file_size,
             "size_human": _human_size(file_size),
             "file_type": ftype["name"],          # 显示名 (向后兼容)
-            "file_type_info": ftype,             # 结构化: name/cl_type/category/method
+            "file_type_info": ftype,             # 结构化: name/cl_type/category/method[/suspect]
             "md5": md5,
             "sha1": sha1,
             "sha256": sha256,
-            "detections": detections,            # 仅 Hash DB 命中
+            "detections": detections,            # Hash DB 命中 + 文件类型可疑信号
             "clean": len(detections) == 0,
             "verdict": "CLEAN" if not detections else "DETECTED",
-            "scanners": ["Hash DB (md5/sha1/sha256)"],
+            "scanners": ["SHA256 Hash DB", "MD5 Hash DB"] + (["FileType Analysis"] if type_signals else []),
             "elapsed_ms": elapsed_ms,            # 阶段1耗时
             "static_info": None,
             "static_ms": 0.0,
             "phase": "hash",
         }
 
-    def _phase2(self, data, filename):
+    def _phase2(self, data, filename, hash_hit=False, sha256=None, hash_hit_name=None):
         """阶段 2 (深度, 后台执行): YARA 规则匹配 + 静态信息/模糊哈希 + 查壳
 
-        返回合并阶段 1 所需的补充字段: detections(YARA + Fuzzy Hash) / static_info / static_ms / elapsed_ms / scanners。
+        返回合并阶段 1 所需的补充字段: detections(YARA + Fuzzy Hash + SSDeep + TLSH) / static_info / static_ms / elapsed_ms / scanners。
+        hash_hit: 阶段1 是否命中 SHA256/MD5 哈希签名; 仅控制 ssdeep/TLSH 自增长入库,
+        不影响检测——SSDeep 相似度检索与 TLSH 相似度检测始终执行 (与 SHA256/MD5 精确哈希并行)。
+        sha256: 阶段1 的 SHA256 (用于 ssdeep/TLSH 库入库关联; 不传则内部重算)。
+        hash_hit_name: 哈希命中名称 (用于 ssdeep/TLSH 库入库标注)。
         """
         start = time.time()
         detections = list(self.yara_scanner.scan_data(data))
@@ -1887,26 +2564,62 @@ class Scanner:
         static_info = staticinfo.compute_static_info(data)
         static_ms = round((time.time() - static_start) * 1000, 1)
 
-        # 模糊哈希签名库查询: 用 staticinfo 计算出的 ssdeep/imphash/authentihash 查各表
+        fuzzy_info = static_info.get("fuzzy", {}) if static_info else {}
+
+        # 模糊哈希签名库查询: imphash/authentihash 查 FuzzySignatureDB 4 表
         if self.fuzzy_db is not None:
-            fuzzy_info = static_info.get("fuzzy", {}) if static_info else {}
             fuzzy_hits = self.fuzzy_db.check_by_computed_hashes(
-                ssdeep=fuzzy_info.get("ssdeep"),
                 imphash_hex=fuzzy_info.get("imphash"),
                 authentihash_hex=fuzzy_info.get("authentihash"),
                 file_size=len(data),
             )
             detections.extend(fuzzy_hits)
 
+        # SSDeep 检测 (精确匹配 + 相似度检索) + 自增长入库 (独立库, 无 bloom, 无分片)
+        # 检测始终执行, 与 SHA256/MD5 精确哈希并行, 不再由哈希命中结果决定是否启动;
+        # 自增长入库仅在精确哈希命中时执行, 保持库内仅累积已知恶意样本
+        ssdeep_val = fuzzy_info.get("ssdeep")
+        if ssdeep_val and self.ssdeep_library is not None:
+            # 精确匹配 (主键索引, O(1))
+            exact_hits = self.ssdeep_library.check_exact(ssdeep_val, file_size=len(data))
+            detections.extend(exact_hits)
+            # 相似度检索 (始终执行)
+            sim_hits = self.ssdeep_library.search(
+                ssdeep_val, file_size=len(data))
+            detections.extend(sim_hits)
+            # 入库 (自增长): 仅在精确哈希命中时
+            if hash_hit:
+                _sha = sha256
+                if not _sha:
+                    _sha = hashlib.sha256(data).hexdigest()
+                self.ssdeep_library.insert(
+                    ssdeep_val, _sha, hash_hit_name or "unknown", len(data)
+                )
+
+        # TLSH 相似度检测 (始终执行) + 自增长入库 (仅在精确哈希命中时)
+        tlsh_val = fuzzy_info.get("tlsh")
+        if tlsh_val and self.tlsh_library is not None:
+            tlsh_hits = self.tlsh_library.search(tlsh_val)
+            detections.extend(tlsh_hits)
+            if hash_hit:
+                _sha = sha256
+                if not _sha:
+                    _sha = hashlib.sha256(data).hexdigest()
+                self.tlsh_library.insert(
+                    tlsh_val, _sha, hash_hit_name or "unknown", len(data)
+                )
+
         elapsed_ms = round((time.time() - start) * 1000, 1)
         scanners = (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else [])
-        if self.fuzzy_db is not None:
-            scanners.append("Fuzzy Hash DB")
+        if self.ssdeep_library is not None and ssdeep_val:
+            scanners.append("SSDeep Hash DB")
+        if self.tlsh_library is not None and tlsh_val:
+            scanners.append("TLSH Hash DB")
         return {
-            "detections": detections,            # YARA + Fuzzy Hash 命中
+            "detections": detections,
             "static_info": static_info,
             "static_ms": static_ms,
-            "elapsed_ms": elapsed_ms,            # 阶段2耗时
+            "elapsed_ms": elapsed_ms,
             "scanners": scanners,
         }
 
@@ -1939,6 +2652,7 @@ class Scanner:
         md5, sha1, sha256 = compute_hashes(file_path)
 
         # 文件类型识别 (ClamAV FTM 机制: 魔数 → 模式 → 尾部魔数 → 文本检测)
+        # 大文件路径仅头尾缓冲: ZIP 中央目录/PE 深度校验自动退回, 扩展名校验仍生效
         ftype = {"name": "未知", "cl_type": "CL_TYPE_ANY", "category": "other", "method": "n/a"}
         try:
             head, tail = ft.read_head_tail(file_path)
@@ -1946,11 +2660,15 @@ class Scanner:
         except OSError:
             pass
 
+        # 文件类型可疑信号 (扩展名不一致 / 头缓冲内可校验的 PE 异常)
+        type_signals = _type_suspicion_signals(filename, ftype)
+
         detections = []
         detections.extend(self.hash_db.check(file_path, file_size, md5, sha1, sha256))
         if self.md5_db is not None:
             detections.extend(self.md5_db.check_hash(md5, file_size))
         detections.extend(self.yara_scanner.scan(file_path))
+        detections.extend(type_signals)
 
         # 大文件路径: 不计算模糊哈希/静态信息 (避免超大文件纯 Python 计算失控)
         static_info = None
@@ -1972,8 +2690,9 @@ class Scanner:
             "verdict": "CLEAN" if not detections else "DETECTED",
             "detections": detections,
             "elapsed_ms": elapsed_ms,
-            "scanners": ["Hash DB (md5/sha1/sha256)"]
-                         + (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else []),
+            "scanners": ["SHA256 Hash DB", "MD5 Hash DB"]
+                         + (["YARA"] if YARA_AVAILABLE and self.yara_scanner.rules else [])
+                         + (["FileType Analysis"] if type_signals else []),
         }
 
 
