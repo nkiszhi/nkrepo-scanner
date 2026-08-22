@@ -316,11 +316,19 @@ nkrepo-scanner/
 
 移植官方 trendmicro/tlsh 的 `js_ext/tlsh.js`，输出 70 位大写 hex（无 T1 前缀，兼容 VirusTotal/MalwareBazaar 格式）。
 
-- 滑动窗口 5 字节（`SLIDING_WND_SIZE` L38），每字节经 `_b_mapping`（L55-61，4 次 `V_TABLE` 查表链）更新校验和 + 6 组桶计数
-- `_find_quartile`（L109-180）对 128 有效桶 quickselect 求 q1/q2/q3
-- `final()`（L241-274）：长度 ≥50 且非零桶过半（防复杂度不足），每 4 桶编码为 2bit 分位数码
-- 对外接口：`hash_bytes(data)`（L292-298），失败返回 None
-- 已与官方 JS 实现交叉验证（9 类用例输出完全一致）
+- 滑动窗口 5 字节（`SLIDING_WND_SIZE` L38），每字节经预计算 Q 表（salt×i×j 二级查表，7×256×256 ≈ 458KB，替代 7 次链式 `V_TABLE` 查表）更新校验和 + 6 组桶计数
+- `_find_quartile` 对 128 有效桶求 q1/q2/q3（v2: 改用 `sorted()` 取索引 31/63/95，与 quickselect 顺序统计量完全等价）
+- `final()`：长度 ≥50 且非零桶过半（防复杂度不足），每 4 桶编码为 2bit 分位数码
+- 对外接口：`hash_bytes(data)` 失败返回 None；已与官方 JS 实现交叉验证（9 类用例输出完全一致）
+- **生成端 v2 优化（2026-08-22）**：`hash_bytes` 在安装 numpy 且输入 ≥2KB（`_NP_MIN_LEN`）时走 `_hash_bytes_np()`——6 组桶计数对全输入 2D gather + `bincount` 一次统计（桶索引只依赖滑窗字节，无顺序依赖），校验和保持逐字节链式循环（顺序依赖无法向量化）；`hexdigest` 用 `bytes.hex().upper()`。实测 1MB 1498ms→222ms（~7×），小文件纯 Python 路径 ~4×；输出与纯 Python 路径逐字节一致（含 Lvalue 分段边界用例）
+
+**距离计算（v2 优化，面向千万级库检索）**：
+
+- `byte_dist_table()`：懒构建 65536 项字节对距离表（`_BYTE_DIST[x*256+y]`），把每字节 4 次"移位 + 查 4×4 权重矩阵"合并为一次查表
+- `to_binary(h)` / `binary_to_hex(b)` / `header_fields(b)`：hex↔35 字节二进制互转（兼容 T1 前缀与大小写）与 `(lv, q1, q2)` 头部字段提取
+- `diff_bin(b1, b2, threshold=None)`：二进制版距离计算，语义与 `diff()` 完全一致；给出 threshold 时超阈值提前终止（返回值仅用于淘汰判断）
+- `diff(h1, h2)`：保持原 API，内部走 `to_binary` + `diff_bin`
+- 实测：单次比较 19µs → 3.7µs（5.1×）；与改造前算法在数百对真实哈希上逐位一致
 
 ---
 
@@ -359,6 +367,23 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);              -- 通用 KV
 
 `uploads/<sha256>.json`：扫描报告缓存（与样本 `uploads/<sha256>` 同目录），原子写入、LRU 淘汰（10000 个 / 30 天）、内含 `history` 提交历史（上限 100 条）。
 
+### 6.5 TLSH 相似度库（`signatures/tlsh_library.db`，v2）
+
+`scanner.TlshLibrary`：单文件自增长库（精确哈希命中时入库累积），v2 面向千万级检索优化：
+
+```sql
+CREATE TABLE tlsh_entries (
+    tlsh BLOB PRIMARY KEY,      -- 35 字节原始二进制 (统一大写, 大小写不敏感)
+    lv INTEGER NOT NULL,        -- Lvalue 派生列 (检索剪枝用, 有索引 idx_tlsh_lv)
+    q1 INTEGER NOT NULL, q2 INTEGER NOT NULL,   -- Q 比率派生列 (剪枝用)
+    sha256 BLOB, size INTEGER, name TEXT
+);
+```
+
+- **检索流水线**（与全表暴力 diff 结果逐位一致，零召回损失）：查询只解析一次 → SQL 剪枝下推（threshold=40 时 ldiff≥4 / qdiff≥5 必淘汰，lv 走索引范围扫描，模意义环绕拆 1-2 个闭区间）→ 幸存候选 `fetchmany` 分块流式打分（`diff_bin` 提前终止；候选块 ≥2048 且 numpy 可用时自动切向量化 `_score_numpy`）→ top-K
+- **存储/写入**：`INSERT OR IGNORE` + UPDATE 合并 upsert；WAL + synchronous=NORMAL；rowid 即插入序供容量淘汰；v1 TEXT 表首启动自动迁移（大小写混存去重、无效条目丢弃）
+- **实测**（2 万条库）：单查询 858ms → 48ms（纯 Python，18×）/ 32ms（numpy，27×）；插入 2 万条 26s → 4.8s
+
 ---
 
 ## 7. 依赖关系
@@ -371,8 +396,9 @@ CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT);              -- 通用 KV
 | yara-python | ≥4.3 | YARA 规则引擎 | `YARA_AVAILABLE=False`，扫描跳过 YARA |
 | pefile | ≥2023.2.7 | PE 静态分析 | imphash/authentihash/PE 元数据/壳识别返回 None + note |
 | ppdeep | ≥20200505 | ssdeep 模糊哈希 | ssdeep 返回 None + note |
+| numpy | ≥1.24 | TLSH 大库检索向量化加速（可选） | 自动回退纯 Python `diff_bin` 逐行打分 |
 
-> TLSH 为项目内置纯 Python 移植（`tlsh.py`，仅依赖标准库 math），无需额外安装。
+> TLSH 为项目内置纯 Python 移植（`tlsh.py`，仅依赖标准库 math），无需额外安装。numpy 为可选加速项，缺失不影响功能与正确性。
 
 ### 7.2 模块间依赖
 

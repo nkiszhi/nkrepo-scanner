@@ -11,7 +11,7 @@
 | YARA    | 字节模式 + 规则逻辑                | 标准 `.yar` 规则语法                                |
 | 模糊哈希  | ssdeep / TLSH / imphash / authentihash | 见「静态信息与模糊哈希」章节            |
 | SSDeep Hash DB | 与独立 SSDeep 库中签名做 **0-100 模糊匹配**（2026-08-21 新增, 2026-08-22 独立为单文件库, 非精确哈希比对） | 详见「ssdeep 相似度检测」章节          |
-| TLSH Hash DB | 基于 TLSH 局部敏感哈希的相似度检测，**自增长库**（每次精确哈希命中的样本自动入库累积，2026-08-22 新增） | 详见「TLSH 哈希相似度检测」章节        |
+| TLSH Hash DB | 基于 TLSH 局部敏感哈希的相似度检测，**自增长库**（每次精确哈希命中的样本自动入库累积，2026-08-22 新增；同日 **v2 千万级优化**：BLOB 主键 + lv 索引剪枝 + numpy 向量化，检索 ~18-27×、哈希生成 ~7× 加速） | 详见「TLSH 哈希相似度检测」章节        |
 | 查壳     | 多特征融合识别（DIE 特征体系 + PEiD 经典库 + 外部 YARA 扩展规则） | 精确特征（magic/EP 字节/节名/外部规则）+ 启发特征（节熵/导入/RWX/EP 位置） |
 
 另附 **文件类型识别**（`filetype.py`，ClamAV FTM 机制移植 + 4 项结构化校验增强，2026-08-20）：扫描结果中展示类型名称、`CL_TYPE_*` 码、分类与判定方法；新增 ZIP 中央目录解析、PE 头结构校验、扩展名/魔数不一致可疑信号、libmagic 兜底层。详见「文件类型识别」章节。
@@ -288,19 +288,48 @@ sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
 
 **数据来源——自增长库**：hdb 签名库不含 TLSH 字段，因此 TLSH 库 **无预置数据**，采用自增长策略——每次精确哈希命中（SHA256/MD5）的样本，其 TLSH 自动入库累积（`signatures/tlsh_library.db`），后续扫描将文件 TLSH 与库内已有条目做距离比对。库容量上限 50000 条，超限自动淘汰最先插入的条目。
 
-**表结构**（`tlsh_entries` 表，4 字段精简设计）：
+**表结构 v2**（`tlsh_entries` 表，2026-08-22 千万级优化重构，**旧 TEXT 表启动时自动迁移**）：
 
 | 字段 | 类型 | 说明 |
 | ---- | ---- | ---- |
-| `tlsh` | TEXT PRIMARY KEY | TLSH 哈希值（70 hex），主键 |
+| `tlsh` | BLOB PRIMARY KEY | TLSH 原始 35 字节二进制（1 校验和 + 1 Lvalue + 1 Q + 32 body code），统一大写规范化，`WITHOUT ROWID` |
+| `lv` | INTEGER | 反 swap 后的 Lvalue 派生列（0-255），建 `idx_tlsh_lv` 索引供检索剪枝 |
+| `q1` / `q2` | INTEGER | Q 比率派生列（0-15），阈值裁剪用 |
 | `sha256` | BLOB | 样本 SHA256（关联精确哈希命中记录；BLOB 二进制 32 字节，与 ssdeep 库一致） |
 | `size` | INTEGER | 样本文件大小（字节） |
 | `name` | TEXT | 恶意名称（来自哈希签名库的命中名称） |
 
+**检索流水线 v2**（原「全表 fetchall + 逐行纯 Python diff」暴力扫描已重构为四层加速）：
+
+1. **SQL 剪枝下推**（零召回损失）：距离 ≤ threshold 时 Lvalue/Q 贡献非负，可反推必要条件——threshold=40 时 `ldiff≥4`（≥48 分）或 `qdiff≥5`（≥48 分）必淘汰；构造 `lv BETWEEN ...` 范围条件（模 256 环绕拆区间）走 `idx_tlsh_lv` 索引，砍掉 60-90% 候选
+2. **分块流式打分**：`fetchmany` 分块迭代（杜绝全表 fetchall 物化），查询哈希只解析一次（`tlsh.to_binary`），候选逐块用 `diff_bin()` 比对，超过阈值**早退**
+3. **numpy 向量化**（**可选依赖**，候选块 ≥2048 条时启用）：35 字节镜像矩阵 + 65536 字节对距离表 2D gather 一次算整块；未安装 numpy 自动回退纯 Python
+4. **连接复用**：线程局部持久只读连接（WAL 模式，读写不阻塞），不再每次查询新建连接
+
+**性能实测**（2 万条库，2026-08-22）：
+
+| 指标 | 优化前 | 优化后 |
+| ---- | ---- | ---- |
+| 单次距离计算 | ~19µs（逐四分位循环） | ~3.7µs（65536 字节对距离表查表；早退 1.3µs） |
+| 检索（纯 Python 路径） | 858ms | 48ms（**18×**） |
+| 检索（numpy 路径） | — | 32ms（**27×**） |
+| 批量写入 2 万条 | ~26s | ~4.8s（WAL + `INSERT OR IGNORE` + upsert，**~5×**） |
+| 哈希生成 1MB（numpy 路径） | ~1500ms | ~220ms（**~7×**） |
+| 哈希生成小文件（纯 Python 路径，5KB） | ~5.8ms | ~1.6ms（**~4×**） |
+
+千万级外推单次全扫约 1-3s（numpy），满足阶段 2 后台模糊匹配场景；EXPLAIN QUERY PLAN 已确认剪枝查询走 `idx_tlsh_lv` 索引范围扫描。
+
+**哈希生成算法优化**（`tlsh.py`，2026-08-22，输出与官方算法逐字节一致，含 Lvalue 分段边界 656/3199 用例验证）：
+
+- **滑窗查表内联**：`update()` 热循环内 7 次 `_b_mapping` 链式查表（每次 4 连查）预合成为 7 张 256×256 二级 Q 表（`Q[s][i][j] = V_TABLE[V_TABLE[V_TABLE[s]^i]^j]`），每字节降至 1 次查表
+- **numpy 向量化路径**（**可选依赖**，输入 ≥2KB 时启用，缺失或异常自动回退纯 Python）：6 组桶计数对整个输入一次性 2D gather + `bincount` 统计（桶索引只依赖滑窗字节，无顺序依赖）；校验和为顺序链式依赖，保持逐字节循环但已预取 Q0 查表结果
+- **分位数求取**：`_find_quartile` 由 quickselect 移植改为 `sorted()` 直接取索引 31/63/95（确定性顺序统计量，输出完全等价，128 元素排序远快于多轮分区）
+- **hex 编码**：`hexdigest()` 改用 `bytes.hex().upper()`（替代逐字节 f-string 拼接）
+
 **检测流程**：
 
 1. 文件上传 → 阶段 1 计算 SHA256/MD5 → 精确哈希签名库查询
-2. 阶段 2 计算 TLSH → **始终**与自增长库内全部条目逐一做 `tlsh.diff()` 距离比对（与 SHA256/MD5 精确哈希并行，不再由哈希命中结果决定是否启动）→ 距离 ≤ 阈值（默认 40）的条目按距离升序取 top_k（默认 10）→ 命中条目以 `engine="TLSH Hash DB"` 进入 `detections`
+2. 阶段 2 计算 TLSH → **始终**与自增长库做相似度检索（v2 流水线：lv 索引剪枝 → 分块流式 `diff_bin` 早退 → 大块 numpy 向量化；与 SHA256/MD5 精确哈希并行，不再由哈希命中结果决定是否启动）→ 距离 ≤ 阈值（默认 40）的条目按距离升序取 top_k（默认 10）→ 命中条目以 `engine="TLSH Hash DB"` 进入 `detections`
 3. 自增长入库：**仅在精确哈希命中**时当前样本 TLSH 才加入库（保持库内仅累积已知恶意样本）
 
 **TLSH 距离算法**（移植自官方 trendmicro/tlsh `lsh_bin_totalDiff`，纯 Python 实现）：
@@ -309,7 +338,7 @@ sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
 - 校验和差异：不同则 +1
 - 长度差异（`mod_diff` 循环距离）：`ldiff==0→+0, ldiff==1→+1, else +ldiff×12`
 - Q 比率差异（Q1/Q2 各一）：`qdiff≤1→+qdiff, else +(qdiff-1)×12`
-- body code 逐字节：4 个 2-bit 四分位对差异之和，权重矩阵 `d(0,3)=d(3,0)=6`（极端差异加重惩罚），对角线为 0
+- body code 逐字节：4 个 2-bit 四分位对差异之和，权重矩阵 `d(0,3)=d(3,0)=6`（极端差异加重惩罚），对角线为 0；v2 起预合成 **65536 字节对距离表**（`tlsh.byte_dist_table()`，懒构建），`diff_bin()` 直接查表并支持超阈值早退
 - 距离语义：**0=完全相同，越小越相似**（与 ssdeep score 语义相反）
 
 **参数与返回**（`TlshLibrary.search`）：
@@ -417,7 +446,7 @@ venv\Scripts\python app.py
 
 打开 <http://127.0.0.1:5000>
 
-依赖：`flask` + `yara-python` + `pefile` + `ppdeep`（Windows 下 pip 均有预编译 wheel 或纯 Python 实现；TLSH 为项目内置纯 Python 移植 `tlsh.py`，无需额外依赖）。**可选依赖**：`python-magic-bin`（启用文件类型识别 libmagic 兜底层，缺失时静默降级；安装命令 `pip install python-magic-bin`）。
+依赖：`flask` + `yara-python` + `pefile` + `ppdeep`（Windows 下 pip 均有预编译 wheel 或纯 Python 实现；TLSH 为项目内置纯 Python 移植 `tlsh.py`，无需额外依赖）。**可选依赖**：`numpy`（TLSH 大库检索向量化加速，2 万条以上库实测 ~1.5× 额外提速，缺失时自动回退纯 Python 路径，功能不受影响）、`python-magic-bin`（启用文件类型识别 libmagic 兜底层，缺失时静默降级；安装命令 `pip install python-magic-bin`）。
 
 ### 并发与 IO 说明（P0 优化）
 
@@ -460,7 +489,7 @@ nkrepo-scanner/
 ├── packer_rules/                 # 外部 YARA 扩展壳库（.yar 规则 + README.md 编写约定）
 ├── yara_sources/                 # 第三方 YARA 规则库（Neo23x0/signature-base, Yara-Rules/rules, ATR, InQuest；.gitignore 忽略，fetch_yara.py 拉取）
 ├── fetch_yara.py                 # 第三方 YARA 规则库下载脚本（GitHub tarball → yara_sources/）
-├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植，无第三方依赖）
+├── tlsh.py                       # TLSH 纯 Python 实现（官方 C 算法 JS 移植 + v2 优化: 生成端 Q 表内联/numpy 桶计数向量化 + 比对端 65536 字节对距离表/diff_bin 早退, numpy 可选）
 ├── filetype.py                   # 文件类型识别（ClamAV FTM 移植 + 4 项增强：ZIP 中央目录/PE 结构校验/扩展名不一致可疑信号/libmagic 兜底）
 ├── test_filetype.py              # 文件类型识别验证脚本（27 类基础 + 16 类增强用例）
 ├── static/
@@ -487,7 +516,7 @@ nkrepo-scanner/
 │   ├── fuzzy.db.shards/          # 模糊哈希库分片（hex 布局 256 片，每分片含 4 张表：sigs_vhash/sigs_authentihash/sigs_imphash/sigs_rich_header_hash）
 │   ├── fuzzy.db.bloom/           # 模糊哈希库分片 Bloom 位图（{shard}_{type}.bloom，4×256=1024 文件）
 │   ├── ssdeep_library.db         # SSDeep 自增长相似度库（单文件 SQLite，无 bloom，sha256 存 BLOB 二进制；从 hdb 导入 + 精确命中自增长入库）
-│   ├── tlsh_library.db           # TLSH 自增长相似度库（单文件 SQLite，精确哈希命中时自动入库累积）
+│   ├── tlsh_library.db           # TLSH 自增长相似度库（单文件 SQLite, v2 BLOB schema + lv 索引剪枝; 精确哈希命中时自动入库累积; 旧 TEXT 表启动自动迁移）
 │   └── *.legacy / *.migrated     # 旧布局/旧版单库备份（自动迁移时生成）
 ├── extracted/                    # CVD 解包产物（hdb/hsb/mdb/ndb/ldb/fp...）
 ├── cvd/                          # 下载的 main.cvd / daily.cvd

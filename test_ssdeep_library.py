@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""SsdeepLibrary 综合功能测试
+"""SsdeepLibrary 综合功能测试 (Tier 1/2/3 加速版)
 
 验证项:
-  1. 初始化 (空库建表)
-  2. insert() — BLOB 存储、重复更新、淘汰策略
+  1. 初始化 (空库建表, 6 字段新 schema + ssdeep_gram 倒排表 + 复合索引)
+  2. insert() — BLOB 存储、重复更新、淘汰策略、gram 级联删除
   3. check_exact() — 精确匹配
-  4. search() — 相似度检索
-  5. import_hdb() — 从 hdb 文件导入
+  4. search() — 相似度检索 (Tier 2 gram 倒排探针 + Tier 3 并行)
+  4b. Tier 2 倒排索引与召回率 (含跨块大小 B*2 探针)
+  5. import_hdb() — 从 hdb 文件导入 (含 gram 回填)
   6. stats() — 统计信息
   7. Scanner 集成 — ssdeep_library 传入与调用路径
-  8. 旧表迁移
+  8. 旧表迁移 (first_seen/hit_count → 重建)
+  8b. 旧 4 列 schema 迁移 (ssdeep TEXT PK → 新 schema + gram 回填)
   9. 并发安全
 """
 import os
@@ -72,16 +74,16 @@ def test_init(tmpdir):
     else:
         fail(f"空库 count=0", f"实际 count={lib.count}")
 
-    # 验证表结构
+    # 验证表结构 (Tier 1/2 新 schema)
     cols = lib._conn.execute("PRAGMA table_info(ssdeep_entries)").fetchall()
     col_names = [c[1] for c in cols]
     col_types = {c[1]: c[2] for c in cols}
 
-    expected_cols = ["ssdeep", "sha256", "size", "name"]
+    expected_cols = ["id", "blocksize", "ssdeep", "sha256", "size", "name"]
     if col_names == expected_cols:
-        ok(f"表结构 4 字段: {col_names}")
+        ok(f"表结构 6 字段 (Tier 1): {col_names}")
     else:
-        fail(f"表结构 4 字段", f"期望 {expected_cols}, 实际 {col_names}")
+        fail(f"表结构 6 字段", f"期望 {expected_cols}, 实际 {col_names}")
 
     if col_types.get("sha256") == "BLOB":
         ok(f"sha256 字段类型 = BLOB")
@@ -89,9 +91,30 @@ def test_init(tmpdir):
         fail(f"sha256 字段类型 = BLOB", f"实际 = {col_types.get('sha256')}")
 
     if col_types.get("ssdeep") == "TEXT":
-        ok(f"ssdeep 字段类型 = TEXT (主键)")
+        ok(f"ssdeep 字段类型 = TEXT (UNIQUE)")
     else:
         fail(f"ssdeep 字段类型 = TEXT", f"实际 = {col_types.get('ssdeep')}")
+
+    if col_types.get("blocksize") == "INTEGER":
+        ok(f"blocksize 字段类型 = INTEGER (Tier 1 归一化列)")
+    else:
+        fail(f"blocksize 字段类型 = INTEGER", f"实际 = {col_types.get('blocksize')}")
+
+    # Tier 2 倒排索引表
+    gram_tables = [r[0] for r in lib._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ssdeep_gram'"
+    ).fetchall()]
+    if "ssdeep_gram" in gram_tables:
+        ok(f"ssdeep_gram 倒排表已创建 (Tier 2)")
+    else:
+        fail(f"ssdeep_gram 倒排表已创建")
+
+    # (blocksize, size) 复合索引 (Tier 1)
+    idx = [r[1] for r in lib._conn.execute("PRAGMA index_list(ssdeep_entries)").fetchall()]
+    if "idx_ssdeep_bs_size" in idx:
+        ok(f"idx_ssdeep_bs_size 复合索引已创建 (Tier 1)")
+    else:
+        fail(f"idx_ssdeep_bs_size 复合索引已创建", f"实际索引 = {idx}")
 
     return lib
 
@@ -200,6 +223,25 @@ def test_insert(lib, tmpdir):
         ok(f"淘汰策略: 淘汰 file_0 和 file_1 (最旧)")
     else:
         fail(f"淘汰策略: 淘汰最旧", f"剩余 = {names}")
+
+    # 淘汰需级联删除 gram 索引, 否则倒排表残留孤儿 entry_id
+    orphan = small_lib._conn.execute(
+        "SELECT COUNT(*) FROM ssdeep_gram g"
+        " LEFT JOIN ssdeep_entries e ON e.id = g.entry_id"
+        " WHERE e.id IS NULL"
+    ).fetchone()[0]
+    if orphan == 0:
+        ok(f"淘汰级联删除 gram: 无孤儿 entry_id")
+    else:
+        fail(f"淘汰级联删除 gram", f"孤儿 {orphan} 条")
+
+    # 剩余 5 条的 gram 索引应完整 (每条约 6+ 个 7-gram)
+    gram_cnt = small_lib._conn.execute(
+        "SELECT COUNT(*) FROM ssdeep_gram").fetchone()[0]
+    if gram_cnt >= 5:
+        ok(f"淘汰后 gram 索引完整: {gram_cnt} 条 (每条 >=1)")
+    else:
+        fail(f"淘汰后 gram 索引完整", f"gram_cnt={gram_cnt}")
 
 # ============================================================
 # 3. check_exact() 测试
@@ -333,6 +375,95 @@ def test_search(lib, tmpdir):
         fail(f"空查询 -> 0 条", f"实际 {len(hits_empty)} 条")
 
 # ============================================================
+# 4b. Tier 2 倒排索引与召回率测试
+# ============================================================
+def test_gram_index_recall(tmpdir):
+    section("4b. Tier 2 倒排索引 + 召回率")
+
+    if not SSDEEP_AVAILABLE:
+        print("  [SKIP] ppdeep 不可用, 跳过")
+        return
+
+    db_path = os.path.join(tmpdir, "ssdeep_gram.db")
+    lib = SsdeepLibrary(db_path)
+    libs_to_close.append(lib)
+
+    # 内容族: 同源变体 (同块大小) + 跨块大小成员
+    base = b"AbCdEf1234567890 xyz pattern pattern "
+    q     = base * 20                    # 查询 (~740B)
+    e0    = base * 9 + b"XXXXXXXXXX" + base * 10  # 相似变体 (同源, 中段替换)
+    e2x   = base * 32                    # 更长家族成员 (~1184B, 块大小 2 倍)
+    e0_sha = "a" * 64
+    e2x_sha = "b" * 64
+
+    sq = make_ssdeep(q)
+    se0 = make_ssdeep(e0)
+    se2x = make_ssdeep(e2x)
+    q_bs = int(sq.split(":", 1)[0])
+    e0_bs = int(se0.split(":", 1)[0])
+    e2x_bs = int(se2x.split(":", 1)[0])
+
+    # 前置条件自检: 变体同 bs, 长成员 bs = q_bs*2 (B*2 探针路径)
+    if q_bs == e0_bs and e2x_bs == q_bs * 2:
+        ok(f"块大小关系: q_bs={q_bs}, e0_bs={e0_bs}, e2x_bs={e2x_bs} (B*2 路径)")
+    else:
+        fail(f"块大小关系", f"q_bs={q_bs}, e0_bs={e0_bs}, e2x_bs={e2x_bs}")
+        return
+
+    lib.insert(sq,   e0_sha,   "query.exe",   len(q))
+    lib.insert(se0,  e0_sha,   "variant.exe", len(e0))
+    lib.insert(se2x, e2x_sha,  "family_2x.exe", len(e2x))
+
+    # 填充随机干扰条目 (让 gram 稀有度评估有意义)
+    import random
+    random.seed(42)
+    for i in range(150):
+        rnd = bytes(random.randrange(256) for _ in range(700))
+        lib.insert(make_ssdeep(rnd), f"{i:064x}", f"noise_{i}.exe", 700)
+
+    if lib.count >= 150:
+        ok(f"插入干扰集 -> count={lib.count} (>=150)")
+    else:
+        fail(f"插入干扰集", f"count={lib.count}")
+
+    # Tier 2 倒排索引已回填
+    gram_cnt = lib._conn.execute("SELECT COUNT(*) FROM ssdeep_gram").fetchone()[0]
+    if gram_cnt > 1000:
+        ok(f"Tier 2 倒排索引回填: ssdeep_gram 共 {gram_cnt} 条")
+    else:
+        fail(f"Tier 2 倒排索引回填", f"gram_cnt={gram_cnt}")
+
+    # 召回: 查询 q -> 找到同 bs 相似变体 variant.exe (bs=12 路径)
+    hits = lib.search(sq, file_size=len(q), threshold=50)
+    names = {h["name"] for h in hits}
+    if "variant.exe" in names:
+        ok(f"召回: 同块大小相似变体被找到")
+    else:
+        fail(f"召回: 同块大小相似变体", f"hits={names}")
+
+    var_score = next((h["score"] for h in hits if h["name"] == "variant.exe"), None)
+    if var_score is not None and var_score >= 90:
+        ok(f"召回: variant.exe score={var_score} (>=90)")
+    else:
+        fail(f"召回: variant.exe score>=90", f"score={var_score}")
+
+    # 跨块大小召回: q (bs=B) 应通过 B*2 探针找到 family_2x.exe (bs=B*2)
+    hits2 = lib.search(sq, file_size=len(q), threshold=0)
+    fam_names = {h["name"] for h in hits2}
+    if "family_2x.exe" in fam_names:
+        ok(f"跨块大小召回: family_2x.exe (bs={e2x_bs}) 经 B*2 探针命中")
+    else:
+        fail(f"跨块大小召回: family_2x.exe", f"hits={fam_names}")
+
+    # 低阈值下噪声条目不得误报为高分: 最高相似度应来自同源族
+    if hits2:
+        top = hits2[0]
+        if top["name"] in ("variant.exe", "family_2x.exe", "query.exe"):
+            ok(f"最高分命中为同源族: {top['name']} score={top['score']}")
+        else:
+            fail(f"最高分命中为同源族", f"实际 {top['name']} score={top['score']}")
+
+# ============================================================
 # 5. import_hdb() 测试
 # ============================================================
 def test_import_hdb(tmpdir):
@@ -372,6 +503,32 @@ def test_import_hdb(tmpdir):
         ok(f"import 后 count=3")
     else:
         fail(f"import 后 count=3", f"实际 count={lib.count}")
+
+    # 导入条目需回填 gram 倒排 (Tier 2)
+    gram_cnt = lib._conn.execute("SELECT COUNT(*) FROM ssdeep_gram").fetchone()[0]
+    if gram_cnt >= 3:
+        ok(f"导入回填 gram: ssdeep_gram 共 {gram_cnt} 条")
+    else:
+        fail(f"导入回填 gram", f"gram_cnt={gram_cnt}")
+
+    # 归一化 blocksize 列已填充 (与 ssdeep 前缀块大小一致)
+    bs_ok = lib._conn.execute(
+        "SELECT COUNT(*) FROM ssdeep_entries WHERE blocksize > 0"
+    ).fetchone()[0]
+    if bs_ok == 3:
+        ok(f"blocksize 归一化列已填充 (Tier 1)")
+    else:
+        fail(f"blocksize 归一化列", f"blocksize>0 共 {bs_ok} 条")
+
+    # 导入的条目可被相似度检索命中 (走倒排探针; 用变异版避免精确命中被跳过)
+    if SSDEEP_AVAILABLE:
+        probe = data1[:220] + b"ZZZZZZZ" + data1[227:]  # 与 Malware.A 高度相似
+        probe_hits = lib.search(make_ssdeep(probe), file_size=500, threshold=50)
+        probe_names = {h["name"] for h in probe_hits}
+        if "Malware.A" in probe_names:
+            ok(f"导入条目可被相似度检索命中 (Malware.A)")
+        else:
+            fail(f"导入条目可被相似度检索命中", f"hits={probe_names}")
 
     # 验证 sha256 存为 BLOB
     rows = lib._conn.execute(
@@ -560,16 +717,89 @@ def test_old_table_migration(tmpdir):
     else:
         fail(f"旧表迁移: 移除旧字段", f"当前列 = {col_names}")
 
-    if col_names == ["ssdeep", "sha256", "size", "name"]:
-        ok(f"新表结构 = 4 字段: {col_names}")
+    if col_names == ["id", "blocksize", "ssdeep", "sha256", "size", "name"]:
+        ok(f"新表结构 = 6 字段: {col_names}")
     else:
-        fail(f"新表结构 = 4 字段", f"实际 = {col_names}")
+        fail(f"新表结构 = 6 字段", f"实际 = {col_names}")
 
     # 旧数据应被清除 (DROP + CREATE)
     if lib.count == 0:
         ok(f"旧表迁移后 count=0 (旧数据已清除)")
     else:
         fail(f"旧表迁移后 count=0", f"实际 count={lib.count}")
+
+# ============================================================
+# 8b. 旧 4 列 schema 迁移 + gram 回填
+# ============================================================
+def test_old4col_migration(tmpdir):
+    section("8b. 旧 4 列 schema 迁移 (ssdeep TEXT PK → 新 schema + gram 回填)")
+
+    db_path = os.path.join(tmpdir, "ssdeep_old4col.db")
+
+    # 旧生产 schema: ssdeep TEXT PK, sha256 BLOB, 无 id/blocksize
+    data1 = b"migration test data one. " * 30
+    data2 = b"migration test data two. " * 30
+    sd1 = make_ssdeep(data1)
+    sd2 = make_ssdeep(data2)
+
+    conn = sqlite3.connect(db_path)
+    conn.execute("""
+        CREATE TABLE ssdeep_entries (
+            ssdeep     TEXT PRIMARY KEY,
+            sha256     BLOB,
+            size       INTEGER,
+            name       TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT INTO ssdeep_entries VALUES (?, ?, ?, ?)",
+        (sd1, bytes.fromhex("a" * 64), 100, "Migrated.One")
+    )
+    conn.execute(
+        "INSERT INTO ssdeep_entries VALUES (?, ?, ?, ?)",
+        (sd2, bytes.fromhex("b" * 64), 200, "Migrated.Two")
+    )
+    conn.commit()
+    conn.close()
+
+    lib = SsdeepLibrary(db_path)
+    libs_to_close.append(lib)
+
+    cols = lib._conn.execute("PRAGMA table_info(ssdeep_entries)").fetchall()
+    col_names = [c[1] for c in cols]
+    if col_names == ["id", "blocksize", "ssdeep", "sha256", "size", "name"]:
+        ok(f"迁移到 6 字段新 schema: {col_names}")
+    else:
+        fail(f"迁移到 6 字段新 schema", f"实际 = {col_names}")
+
+    if lib.count == 2:
+        ok(f"迁移保留数据: count=2")
+    else:
+        fail(f"迁移保留数据: count=2", f"实际 count={lib.count}")
+
+    # blocksize 归一化 + gram 回填
+    bs = lib._conn.execute(
+        "SELECT blocksize FROM ssdeep_entries WHERE name='Migrated.One'"
+    ).fetchone()[0]
+    if isinstance(bs, int) and bs > 0:
+        ok(f"迁移回填 blocksize = {bs}")
+    else:
+        fail(f"迁移回填 blocksize", f"实际 {bs}")
+
+    gram_cnt = lib._conn.execute("SELECT COUNT(*) FROM ssdeep_gram").fetchone()[0]
+    if gram_cnt >= 2:
+        ok(f"迁移回填 gram: ssdeep_gram 共 {gram_cnt} 条")
+    else:
+        fail(f"迁移回填 gram", f"gram_cnt={gram_cnt}")
+
+    # 迁移后的条目仍可被检索 (倒排探针; 用变异版避免精确命中被跳过)
+    if SSDEEP_AVAILABLE:
+        probe = data1[:200] + b"XXXXX" + data1[205:]
+        hits = lib.search(make_ssdeep(probe), file_size=100, threshold=50)
+        if any(h["name"] == "Migrated.One" for h in hits):
+            ok(f"迁移条目可被相似度检索命中 (Migrated.One)")
+        else:
+            fail(f"迁移条目可被检索", f"hits={[h['name'] for h in hits]}")
 
 # ============================================================
 # 9. 并发安全测试
@@ -638,6 +868,9 @@ def main():
         # 4. search
         test_search(lib, tmpdir)
 
+        # 4b. Tier 2 倒排索引 + 召回率
+        test_gram_index_recall(tmpdir)
+
         # 5. import_hdb
         test_import_hdb(tmpdir)
 
@@ -649,6 +882,9 @@ def main():
 
         # 8. 旧表迁移
         test_old_table_migration(tmpdir)
+
+        # 8b. 旧 4 列 schema 迁移 + gram 回填
+        test_old4col_migration(tmpdir)
 
         # 9. 并发安全
         test_thread_safety(tmpdir)

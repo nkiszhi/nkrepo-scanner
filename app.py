@@ -135,31 +135,45 @@ def _sample_path(sha256_hex):
 def _save_sample(sha256_hex, data):
     """按 SHA256 去重保存样本字节 (原子写: 临时文件 + rename); 失败静默忽略"""
     path = _sample_path(sha256_hex)
-    if os.path.isfile(path):
-        return
-    tmp = path + ".tmp." + uuid.uuid4().hex[:8]
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    except Exception:  # noqa: BLE001 - 样本保存失败不影响扫描主流程
+    # 持 _fs_lock 写样本, 与 _cache_cleanup 删除样本互斥, 防止刚落盘的样本被并发清理误删
+    with _fs_lock:
+        if os.path.isfile(path):
+            return
+        tmp = path + ".tmp." + uuid.uuid4().hex[:8]
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 - 样本保存失败不影响扫描主流程
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
 
-def _remove_sample_for_cache(cache_json_path):
-    """缓存被 LRU 淘汰时同步删除同名样本 (uploads/<sha256>), 防目录无限增长"""
+def _remove_sample_for_cache(cache_json_path, report_mtime=None):
+    """缓存被 LRU 淘汰时同步删除同名样本 (uploads/<sha256>), 防目录无限增长。
+
+    带 mtime 保护: 若样本比被淘汰的报告更新 (说明有扫描刚重新落盘样本、报告即将被
+    阶段2 刷新), 则跳过删除 —— 避免把在飞扫描/重扫的数据源删掉 (重扫将 404/500)。
+    """
     name = os.path.basename(cache_json_path)
-    if name.endswith(".json"):
-        try:
-            sample = _sample_path(name[:-5])
-            if os.path.isfile(sample):
-                os.remove(sample)
-        except OSError:
-            pass
+    if not name.endswith(".json"):
+        return
+    sample = _sample_path(name[:-5])
+    try:
+        if not os.path.isfile(sample):
+            return
+        if report_mtime is not None:
+            try:
+                if os.path.getmtime(sample) > report_mtime:
+                    return
+            except OSError:
+                pass
+        os.remove(sample)
+    except OSError:
+        pass
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = int(scfg["max_upload_mb"]) * 1024 * 1024
 
@@ -317,6 +331,13 @@ P2_SEM = threading.Semaphore(P2_CONCURRENCY)
 RESULTS_CACHE_DIR = UPLOAD_DIR
 os.makedirs(RESULTS_CACHE_DIR, exist_ok=True)
 
+# 上传目录文件系统互斥锁 (RLock): 串行化样本保存 / 报告写回 / 缓存清理 / 重扫读样本。
+# 修复并发竞态 (2026-08-22):
+#   1) _cache_cleanup 删除样本时不再与 _save_sample / /api/rescan 读取竞争 (样本被误删 → 重扫 404/500);
+#   2) 同一 SHA256 并发扫描/重扫写报告时, 读-改-写串行化, 提交历史不再互相覆盖丢失。
+# 注意: 本锁定义在缓存区段, _save_sample 等早先定义的函数在运行期解析该全局, 故不受定义顺序影响。
+_fs_lock = threading.RLock()
+
 # 一次性迁移: 旧的 scan_cache/ 报告迁入 uploads/, 保留既有报告链接 (仅移动 uploads/ 中尚未存在的)
 _LEGACY_CACHE_DIR = os.path.join(BASE_DIR, "scan_cache")
 if os.path.isdir(_LEGACY_CACHE_DIR):
@@ -377,34 +398,73 @@ def _append_history(result, filename, submitted_at):
     return result
 
 
+def _hist_key(h):
+    """提交历史条目的去重键 (filename + submitted_at)"""
+    if not isinstance(h, dict):
+        return ("", str(h))
+    return (h.get("filename"), h.get("submitted_at"))
+
+
+def _merge_cached_history(path, result):
+    """把 result.history 与磁盘缓存中现有 history 合并去重, 防止并发写回互相覆盖丢失提交历史。
+
+    仅在 result/磁盘都含 history 列表时合并: 磁盘历史在前, 追加 result 中新增的条目,
+    按 (filename, submitted_at) 去重, 最后裁剪到 HISTORY_MAX。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            disk = json.load(f)
+    except (OSError, ValueError):
+        return result
+    disk_hist = disk.get("history") if isinstance(disk, dict) else None
+    new_hist = result.get("history") if isinstance(result, dict) else None
+    if not isinstance(disk_hist, list) or not isinstance(new_hist, list):
+        return result
+    merged = list(disk_hist)
+    seen = {_hist_key(h) for h in merged}
+    for h in new_hist:
+        key = _hist_key(h)
+        if key not in seen:
+            merged.append(h)
+            seen.add(key)
+    result = dict(result)
+    result["history"] = merged[-HISTORY_MAX:]
+    return result
+
+
 def _save_cached_result(sha256_hex, result):
     """写入缓存结果 (临时文件 + 原子替换, 防并发写坏文件)
 
+    整个读-改-写持 _fs_lock:
+    - 与 _cache_cleanup 删除报告/样本互斥 (清理不会在写盘中途删掉目标);
+    - 同一 SHA256 的并发写回串行化, 且与磁盘已有 history 合并去重 (防提交历史丢失)。
     Windows 下目标文件被并发读取时 os.replace 可能抛 PermissionError (共享冲突),
     此处短暂重试; 仍失败则退回直接覆写 (非原子但内容完整)。
     """
     path = _cache_path(sha256_hex)
-    tmp = path + ".tmp." + uuid.uuid4().hex[:8]
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        for i in range(5):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                time.sleep(0.05 * (i + 1))
-        # 重试仍失败: 直接覆写目标文件
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-    except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
-        pass
-    finally:
+    with _fs_lock:
+        result = _merge_cached_history(path, result)
+        tmp = path + ".tmp." + uuid.uuid4().hex[:8]
         try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            for i in range(5):
+                try:
+                    os.replace(tmp, path)
+                    return
+                except PermissionError:
+                    time.sleep(0.05 * (i + 1))
+            # 重试仍失败: 直接覆写目标文件
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001 - 缓存写入失败不影响扫描结果
             pass
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
 
 def _cache_cleanup(force=False):
@@ -421,40 +481,43 @@ def _cache_cleanup(force=False):
             if now - _cache_last_cleanup < _cache_cleanup_interval:
                 return
             _cache_last_cleanup = now
-    try:
-        entries = []
-        for name in os.listdir(RESULTS_CACHE_DIR):
-            if not name.endswith(".json"):
-                continue
-            path = os.path.join(RESULTS_CACHE_DIR, name)
-            try:
-                mtime = os.path.getmtime(path)
-            except OSError:
-                continue
-            entries.append((mtime, path))
-        if not entries:
-            return
-        # 1) 删除超过 max age 的过期缓存
-        stale_cutoff = now - CACHE_MAX_AGE_DAYS * 86400.0
-        keep = [(m, p) for m, p in entries if m >= stale_cutoff]
-        expired = [p for m, p in entries if m < stale_cutoff]
-        for path in expired:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-            _remove_sample_for_cache(path)
-        # 2) 超量时按 mtime 从旧到新淘汰 (保留最新 CACHE_MAX_FILES 个)
-        if len(keep) > CACHE_MAX_FILES:
-            keep.sort(key=lambda e: e[0])
-            for _, path in keep[:-CACHE_MAX_FILES]:
+    # 整个 listdir + 删除持 _fs_lock: 与 _save_sample/_save_cached_result/重扫读样本互斥,
+    # 清理不会在半途删掉刚落盘或正在读取的文件 (防样本丢失 → 重扫 404/500)。
+    with _fs_lock:
+        try:
+            entries = []
+            for name in os.listdir(RESULTS_CACHE_DIR):
+                if not name.endswith(".json"):
+                    continue
+                path = os.path.join(RESULTS_CACHE_DIR, name)
+                try:
+                    mtime = os.path.getmtime(path)
+                except OSError:
+                    continue
+                entries.append((mtime, path))
+            if not entries:
+                return
+            # 1) 删除超过 max age 的过期缓存
+            stale_cutoff = now - CACHE_MAX_AGE_DAYS * 86400.0
+            keep = [(m, p) for m, p in entries if m >= stale_cutoff]
+            expired = [(m, p) for m, p in entries if m < stale_cutoff]
+            for mtime, path in expired:
                 try:
                     os.remove(path)
                 except OSError:
                     pass
-                _remove_sample_for_cache(path)
-    except Exception:  # noqa: BLE001 - 清理失败不影响扫描主流程
-        pass
+                _remove_sample_for_cache(path, report_mtime=mtime)
+            # 2) 超量时按 mtime 从旧到新淘汰 (保留最新 CACHE_MAX_FILES 个)
+            if len(keep) > CACHE_MAX_FILES:
+                keep.sort(key=lambda e: e[0])
+                for mtime, path in keep[:-CACHE_MAX_FILES]:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                    _remove_sample_for_cache(path, report_mtime=mtime)
+        except Exception:  # noqa: BLE001 - 清理失败不影响扫描主流程
+            pass
 
 
 def _launch_phase2(scanner, task, data, filename, submitted_at,
@@ -502,6 +565,60 @@ def _launch_phase2(scanner, task, data, filename, submitted_at,
                 task["error"] = str(e)
                 task["status"] = "error"
     threading.Thread(target=_run, daemon=True).start()
+
+
+def _hash_hit_info(phase1):
+    """阶段1检测结果中 SHA256/MD5 哈希签名命中 → (是否命中, 命中名称)。
+
+    仅用于控制 ssdeep/TLSH 自增长库入库 (保持库内仅累积已知恶意样本);
+    SSDeep/TLSH 相似度检测始终执行, 不受此结果门控。
+    """
+    hash_hit = False
+    hit_name = None
+    for d in phase1["detections"]:
+        if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
+            hash_hit = True
+            if hit_name is None:
+                hit_name = d.get("name")
+    return hash_hit, hit_name
+
+
+def _start_scan_task(scanner, data, filename, submitted_at, sha256_hex, history,
+                     hashes=None):
+    """两段式扫描公共尾部: 阶段1 (哈希/文件类型/签名库命中) → 建任务 → 后台启动阶段2。
+
+    供 /scan 上传与 /api/rescan 重扫共用; hashes 为已预计算的 (md5, sha1, sha256),
+    避免重复全量哈希; 返回 (task_id, phase1)。
+    """
+    if hashes:
+        md5_hex, sha1_hex, sha256_hex2 = hashes
+    else:
+        md5_hex, sha1_hex, sha256_hex2 = compute_hashes_bytes(data)
+    _task_cleanup()
+    task_id = uuid.uuid4().hex[:12]
+
+    # 阶段 1: 哈希 + 文件类型 + 哈希签名库命中 → 立即返回 (毫秒级)
+    phase1 = scanner.scan_phase1(data, filename=filename,
+                                 hashes=(md5_hex, sha1_hex, sha256_hex2))
+    phase1["submitted_at"] = submitted_at   # 提交时间随阶段1结果下发/合并
+    hash_hit, hash_hit_name = _hash_hit_info(phase1)
+    task = {
+        "id": task_id,
+        "ts": time.time(),
+        "history": history,                 # 提交历史 (含本次提交), 随合并结果返回/入缓存
+        "phase1": phase1,
+        "phase2": None,
+        "status": "phase2",   # 阶段 2 后台执行中
+        "error": None,
+    }
+    with _tasks_lock:
+        _tasks[task_id] = task
+
+    # 阶段 2: YARA 规则 + 静态信息/模糊哈希 + 查壳 → 后台线程, 不阻塞上传响应
+    # (闭包持有的 data 在线程结束后自动释放, 任务记录中不保留大缓冲)
+    _launch_phase2(scanner, task, data, filename, submitted_at, sha256_hex,
+                   hash_hit, hash_hit_name, history)
+    return task_id, phase1
 
 
 def _require_auth():
@@ -743,41 +860,10 @@ def scan():
             history = list(old["history"])[-HISTORY_MAX:]
     history.append({"filename": f.filename, "submitted_at": submitted_at})
 
-    _task_cleanup()
-    task_id = uuid.uuid4().hex[:12]
-
-    # 阶段 1: 哈希 + 文件类型 + 哈希签名库命中 → 立即返回 (毫秒级)
-    # P0-2: 传入预计算哈希, scanner 不再重算
-    phase1 = scanner.scan_phase1(data, filename=f.filename,
-                                 hashes=(md5_hex, sha1_hex, sha256_hex))
-    phase1["submitted_at"] = submitted_at   # 提交时间随阶段1结果下发/合并
-    # 是否命中 SHA256/MD5 精确哈希: 不再作为 ssdeep/TLSH 检测门控
-    # (SSDeep/TLSH 相似度检测始终执行, 与 SHA256/MD5 精确哈希并行),
-    # 仅控制 ssdeep/TLSH 自增长库入库 (保持库内仅累积已知恶意样本)
-    hash_hit = any(d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB")
-                   for d in phase1["detections"])
-    # 获取哈希命中名称 (用于 ssdeep/TLSH 库入库标注)
-    _hash_hit_name = None
-    for d in phase1["detections"]:
-        if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
-            _hash_hit_name = d.get("name")
-            break
-    task = {
-        "id": task_id,
-        "ts": time.time(),
-        "history": history,                 # 提交历史 (含本次提交), 随合并结果返回/入缓存
-        "phase1": phase1,
-        "phase2": None,
-        "status": "phase2",   # 阶段 2 后台执行中
-        "error": None,
-    }
-    with _tasks_lock:
-        _tasks[task_id] = task
-
-    # 阶段 2: YARA 规则 + 静态信息/模糊哈希 + 查壳 → 后台线程, 不阻塞上传响应
-    # (闭包持有的 data 在线程结束后自动释放, 任务记录中不保留大缓冲)
-    _launch_phase2(scanner, task, data, f.filename, submitted_at, sha256_hex,
-                   hash_hit, _hash_hit_name, history)
+    # 两段式扫描公共尾部: 阶段1 立即返回 (毫秒级), 阶段2 (YARA/静态信息/模糊哈希) 后台执行
+    task_id, phase1 = _start_scan_task(
+        scanner, data, f.filename, submitted_at, sha256_hex, history,
+        hashes=(md5_hex, sha1_hex, sha256_hex))
     return jsonify({"task_id": task_id, "status": "phase2", "result": phase1})
 
 
@@ -796,16 +882,19 @@ def api_rescan(sha256_hex):
     if not re.fullmatch(r"[0-9a-f]{64}", sha):
         return jsonify({"error": "非法 SHA256 格式"}), 400
     sample_path = _sample_path(sha)
-    if not os.path.isfile(sample_path):
-        return jsonify({
-            "error": "该样本的原始文件未被保留（样本自保存功能启用起才留存），"
-                     "请到扫描页重新上传后再重新扫描"
-        }), 404
-    try:
-        with open(sample_path, "rb") as f:
-            data = f.read()
-    except OSError:
-        return jsonify({"error": "样本文件读取失败"}), 500
+    # 持 _fs_lock 做"检查存在 → 读取"两步: 与 _cache_cleanup 删除样本互斥, 避免
+    # 检查通过后、读取前样本被并发清理删掉 (否则抛 OSError → 500)。
+    with _fs_lock:
+        if not os.path.isfile(sample_path):
+            return jsonify({
+                "error": "该样本的原始文件未被保留（样本自保存功能启用起才留存），"
+                         "请到扫描页重新上传后再重新扫描"
+            }), 404
+        try:
+            with open(sample_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return jsonify({"error": "样本文件读取失败"}), 500
 
     # 沿用既有缓存中的文件名与提交历史, 追加本次重扫记录
     old = _load_cached_result(sha)
@@ -817,31 +906,11 @@ def api_rescan(sha256_hex):
     history.append({"filename": filename, "submitted_at": submitted_at})
 
     md5_hex, sha1_hex, sha256_hex2 = compute_hashes_bytes(data)
-    phase1 = scanner.scan_phase1(data, filename=filename, hashes=(md5_hex, sha1_hex, sha256_hex2))
-    phase1["submitted_at"] = submitted_at
-    hash_hit = any(d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB")
-                   for d in phase1["detections"])
-    _hash_hit_name = None
-    for d in phase1["detections"]:
-        if d.get("engine") in ("SHA256 Hash DB", "MD5 Hash DB"):
-            _hash_hit_name = d.get("name")
-            break
 
-    _task_cleanup()
-    task_id = uuid.uuid4().hex[:12]
-    task = {
-        "id": task_id,
-        "ts": time.time(),
-        "history": history,
-        "phase1": phase1,
-        "phase2": None,
-        "status": "phase2",
-        "error": None,
-    }
-    with _tasks_lock:
-        _tasks[task_id] = task
-    _launch_phase2(scanner, task, data, filename, submitted_at, sha,
-                   hash_hit, _hash_hit_name, history)
+    # 两段式扫描公共尾部: 阶段1 立即返回, 阶段2 后台执行 (沿用既有文件名与提交历史)
+    task_id, phase1 = _start_scan_task(
+        scanner, data, filename, submitted_at, sha, history,
+        hashes=(md5_hex, sha1_hex, sha256_hex2))
     return jsonify({"task_id": task_id, "status": "phase2", "result": phase1, "rescanned": True})
 
 

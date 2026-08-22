@@ -19,8 +19,10 @@ import math
 import os
 import sqlite3
 import struct
+import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import OrderedDict
 
 import filetype as ft
@@ -37,11 +39,41 @@ try:
     import ppdeep
     SSDEEP_AVAILABLE = True
 except ImportError:
-    SSDEEP_AVAILABLE = False
+    # ppdeep 以本地 _vendor 依赖提供 (pip 安装受环境限制); site-packages 缺失时补充路径
+    _vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_vendor")
+    if os.path.isdir(_vendor_dir) and _vendor_dir not in sys.path:
+        sys.path.insert(0, _vendor_dir)
+    try:
+        import ppdeep
+        SSDEEP_AVAILABLE = True
+    except ImportError:
+        SSDEEP_AVAILABLE = False
 
 # TLSH 模块为纯 Python 自研, 始终可用
 TLSH_AVAILABLE = True
 tlsh_diff = tlsh_module.diff  # 距离计算函数 (越小越相似)
+tlsh_to_binary = tlsh_module.to_binary          # hex → 35B 二进制 (统一大小写/T1 前缀)
+tlsh_diff_bin = tlsh_module.diff_bin            # 二进制版距离计算 (支持提前终止)
+tlsh_header_fields = tlsh_module.header_fields  # (lv, q1, q2) 派生列提取
+tlsh_binary_to_hex = tlsh_module.binary_to_hex
+
+# numpy 为可选依赖: TLSH 大库检索的向量化加速; 缺失时自动回退纯 Python 逐行打分
+try:
+    import numpy as _tlsb_np
+except ImportError:
+    _tlsb_np = None
+
+_TLSH_NP_TABLES = {}  # numpy 辅助表缓存 (swap 表 / 字节对距离矩阵)
+
+
+def _tlsh_np_tables():
+    """懒构建 numpy 辅助表: (swap 表 (256,), 字节对距离矩阵 (256,256))"""
+    if "dist" not in _TLSH_NP_TABLES:
+        _TLSH_NP_TABLES["swap"] = _tlsb_np.array(
+            [tlsh_module._swap_byte(i) for i in range(256)], dtype=_tlsb_np.uint8)
+        _TLSH_NP_TABLES["dist"] = _tlsb_np.frombuffer(
+            tlsh_module.byte_dist_table(), dtype=_tlsb_np.uint8).reshape(256, 256)
+    return _TLSH_NP_TABLES["swap"], _TLSH_NP_TABLES["dist"]
 
 CHUNK_SIZE = 1024 * 1024  # 1MB 分块读取, 支持大文件
 
@@ -1632,25 +1664,54 @@ class FuzzySignatureDB:
 
 
 # ============================================================
-# TLSH 自增长相似度库 (纯 Python, 单文件 SQLite)
+# TLSH 自增长相似度库 (v2: BLOB 存储 + lv/q 派生列 + SQL 剪枝, 面向千万级)
 # ============================================================
+# v2 表结构 (自动从 v1 TEXT 表迁移):
+#   tlsh   BLOB PRIMARY KEY  — 35 字节原始二进制 (统一大写规范化, 大小写不敏感)
+#   lv/q1/q2 INTEGER         — 头部派生列: Lvalue 与 Q 比率, 用于检索前剪枝 (见 search)
+#   sha256  BLOB             — 32 字节二进制 (与 ssdeep 库一致)
+# 保留 rowid 表 (非 WITHOUT ROWID): rowid 即插入序, 供容量淘汰取 MIN(rowid)。
 class TlshLibrary:
-    """TLSH 自增长相似度检索库
+    """TLSH 自增长相似度检索库 (千万级可扩展)
 
     数据来源: 每次精确哈希命中 (SHA256/MD5) 的样本自动入库累积;
     无预置 TLSH 数据 (hdb 中不含 TLSH 字段)。
-    检索: 将查询 TLSH 与库内全部 TLSH 逐一做 diff (纯 Python, 距离越小越相似),
-          返回距离 ≤ threshold 的 top_k 条 (按距离升序)。
 
-    表结构: tlsh (主键) / sha256 (BLOB 二进制, 32 字节) / size / name — 仅 4 字段,
-    sha256 存储格式与 ssdeep 库一致。
-    线程安全: 写入 (insert) 用 threading.Lock 保护; 读取 (search) 用只读连接,
-    与写入连接隔离, 无锁竞争。
+    检索流水线 (v2 优化, 与全表暴力 diff 结果逐位一致 — 零召回损失):
+      1. 查询 TLSH 仅解析一次 (hex → 35B 二进制, 提取 lv/q1/q2);
+      2. SQL 剪枝下推: 距离 ≤ threshold 时 Lvalue 差 (ldiff≥2 贡献 ldiff×12)
+         与 Q 比率差 (qdiff≥2 贡献 (qdiff-1)×12) 均有上界, 不满足的行
+         由 lv 索引范围扫描直接排除 (模意义环绕拆 1-2 个闭区间);
+      3. 幸存候选分块流式打分 (fetchmany, 不全表物化): 纯 Python diff_bin
+         (65536 字节对距离表 + 超阈值提前终止); 候选块较大且 numpy 可用时
+         自动切换向量化批量打分;
+      4. 距离 ≤ threshold 的条目按距离升序取 top_k。
+
+    大小写规范: 入库/查询统一转大写 (修复 v1 中 app 传小写与 scanner 传大写
+    混存导致 check_exact 漏配的问题); 输出统一 70 位大写 hex。
+
+    线程安全: 写入 (insert/delete) 用 threading.Lock 保护; 读取 (search/
+    check_exact) 用线程局部只读连接, 与写入连接隔离, WAL 模式下无锁竞争。
     """
 
     TLSH_SIM_THRESHOLD = 40    # 距离阈值 (≤ threshold 视为相似; 0=完全相同)
     TLSH_SIM_TOP_K = 10        # 返回距离最小的前 N 条
     TLSH_MAX_ENTRIES = 50000   # 库容量上限 (自增长, 超限淘汰最旧)
+
+    _CHUNK_ROWS = 4096       # 检索分块行数 (流式迭代, 峰值内存 O(块大小))
+    _NP_MIN_ROWS = 2048      # 候选块 ≥ 此行数才启用 numpy 向量化 (小走纯 Python)
+
+    _ENTRIES_DDL = """
+        CREATE TABLE IF NOT EXISTS tlsh_entries (
+            tlsh   BLOB PRIMARY KEY,
+            lv     INTEGER NOT NULL,
+            q1     INTEGER NOT NULL,
+            q2     INTEGER NOT NULL,
+            sha256 BLOB,
+            size   INTEGER,
+            name   TEXT
+        )
+    """
 
     def __init__(self, db_path, threshold=None, top_k=None, max_entries=None):
         self.db_path = db_path
@@ -1659,34 +1720,72 @@ class TlshLibrary:
         self.max_entries = self.TLSH_MAX_ENTRIES if max_entries is None else max_entries
         self._lock = threading.Lock()
         self._conn = None
+        self._tls = threading.local()  # 线程局部只读连接 (search/check_exact)
         self._count = -1  # -1 = 未加载
         self._init_db()
 
     def _init_db(self):
-        """创建数据库与表 (首次启动自动建表; 旧表结构自动迁移)"""
+        """创建数据库与表 (首次启动自动建表; v1 旧表结构自动迁移到 v2)"""
         os.makedirs(os.path.dirname(self.db_path) or ".", exist_ok=True)
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        try:
+            # WAL: 读写连接隔离, 检索期间写入不阻塞
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            # NORMAL + WAL: 去掉每次 commit 的 fsync (官方推荐组合);
+            # 自增长缓存库可接受掉电丢最后一次 commit, 写入吞吐显著提升
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.Error:
+            pass
 
-        # 旧表迁移: 含旧字段 (first_seen/hit_count) 或 sha256 非 BLOB 列 → 删除重建
+        # v1 → v2 迁移: tlsh 为 TEXT / 缺 lv,q1,q2 派生列 (含更早的
+        # first_seen/hit_count 旧列变体 — 4 个基础列在两种 v1 变体中均存在)
         cols = self._conn.execute("PRAGMA table_info(tlsh_entries)").fetchall()
         if cols:
-            col_types = {c[1]: c[2] for c in cols}
-            if ("first_seen" in col_types or "hit_count" in col_types
-                    or col_types.get("sha256") != "BLOB"):
-                self._conn.execute("DROP TABLE tlsh_entries")
+            types = {c[1]: (c[2] or "").upper() for c in cols}
+            names = {c[1] for c in cols}
+            if ("lv" not in names or "q1" not in names or "q2" not in names
+                    or types.get("tlsh") != "BLOB"):
+                self._migrate_v1_v2()
 
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS tlsh_entries (
-                tlsh       TEXT PRIMARY KEY,
-                sha256     BLOB,
-                size       INTEGER,
-                name       TEXT
-            )
-        """)
+        self._conn.execute(self._ENTRIES_DDL)
+        # lv 索引: search 的 Lvalue 范围剪枝走索引扫描而非全表
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tlsh_lv ON tlsh_entries(lv)")
         self._conn.commit()
         self._count = self._conn.execute(
             "SELECT COUNT(*) FROM tlsh_entries"
         ).fetchone()[0]
+
+    def _migrate_v1_v2(self):
+        """v1 (tlsh TEXT, 可含 first_seen/hit_count 旧列) → v2 BLOB 表
+
+        v1 库为自增长小库 (max_entries=50000), 全量转换在秒级完成。
+        大小写混存 (app 小写 / scanner 大写) 的重复条目按规范化后去重;
+        无效 TLSH (非法 hex/长度) 条目丢弃。
+        """
+        rows = self._conn.execute(
+            "SELECT tlsh, sha256, size, name FROM tlsh_entries"
+        ).fetchall()
+        converted = []
+        for tlsh_text, sha256, size, name in rows:
+            b = tlsh_module.to_binary(tlsh_text)
+            if b is None:
+                continue  # 无效条目丢弃
+            if isinstance(sha256, str):
+                try:
+                    sha256 = bytes.fromhex(sha256)
+                except (ValueError, TypeError):
+                    sha256 = None
+            lv, q1, q2 = tlsh_header_fields(b)
+            converted.append((b, lv, q1, q2, sha256, size, name or "unknown"))
+        self._conn.execute("DROP TABLE tlsh_entries")
+        self._conn.execute(self._ENTRIES_DDL)
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO tlsh_entries "
+            "(tlsh, lv, q1, q2, sha256, size, name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            converted,
+        )
+        self._conn.commit()
 
     @property
     def count(self):
@@ -1694,64 +1793,74 @@ class TlshLibrary:
             return 0
         return self._count
 
+    def _reader(self):
+        """当前线程的持久只读连接 (懒建; 与写入连接隔离)"""
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._tls.conn = conn
+        return conn
+
     def insert(self, tlsh_hex, sha256_hex, name, size):
         """插入/更新一条 TLSH 记录 (自增长, 线程安全)
 
+        TLSH 规范化为大写后按 35B BLOB 主键去重 (大小写不敏感);
         已存在 (同 tlsh) → 更新 sha256/size/name; 不存在 → 新增。
-        超过 max_entries 时淘汰 ROWID 最旧 (最先插入) 的条目。
+        超过 max_entries 时淘汰 rowid 最旧 (最先插入) 的条目。
+        无效 TLSH (非法 hex/长度) 直接忽略, 不入库。
         """
         if not tlsh_hex or not sha256_hex:
+            return
+        b = tlsh_to_binary(tlsh_hex)
+        if b is None:
             return
         # hex → BLOB (32 字节 vs 64 字符, 节省 50% 空间, 与 ssdeep 库一致)
         try:
             sha256_blob = bytes.fromhex(sha256_hex)
         except (ValueError, TypeError):
             sha256_blob = None
+        lv, q1, q2 = tlsh_header_fields(b)
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "SELECT 1 FROM tlsh_entries WHERE tlsh = ?", (tlsh_hex,)
+                    "INSERT OR IGNORE INTO tlsh_entries "
+                    "(tlsh, lv, q1, q2, sha256, size, name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (b, lv, q1, q2, sha256_blob, size, name or "unknown"),
                 )
-                if cur.fetchone():
-                    # 已存在 → 更新关联信息
-                    self._conn.execute(
-                        "UPDATE tlsh_entries SET sha256 = ?, size = ?, name = ? "
-                        "WHERE tlsh = ?",
-                        (sha256_blob, size, name or "unknown", tlsh_hex),
-                    )
-                else:
-                    # 新条目 → 插入
-                    self._conn.execute(
-                        "INSERT INTO tlsh_entries (tlsh, sha256, size, name) "
-                        "VALUES (?, ?, ?, ?)",
-                        (tlsh_hex, sha256_blob, size, name or "unknown"),
-                    )
+                if cur.rowcount == 1:
+                    # 新条目 → 淘汰最旧 (rowid 最小 = 最先插入)
                     self._count += 1
-                    # 淘汰最旧条目 (ROWID 最小 = 最先插入)
                     if self._count > self.max_entries:
                         self._conn.execute(
                             "DELETE FROM tlsh_entries WHERE rowid = "
                             "(SELECT MIN(rowid) FROM tlsh_entries)"
                         )
                         self._count -= 1
+                else:
+                    # 已存在 → 更新关联信息
+                    self._conn.execute(
+                        "UPDATE tlsh_entries SET sha256 = ?, size = ?, name = ? "
+                        "WHERE tlsh = ?",
+                        (sha256_blob, size, name or "unknown", b),
+                    )
                 self._conn.commit()
             except sqlite3.Error:
                 pass
 
     def check_exact(self, tlsh_hex):
-        """精确匹配 TLSH 签名 (主键查询, 走索引)"""
+        """精确匹配 TLSH 签名 (BLOB 主键查询, 走索引; 大小写不敏感)"""
         if not tlsh_hex:
             return []
-        conn = sqlite3.connect(
-            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
-        )
-        try:
-            row = conn.execute(
-                "SELECT size, name, LOWER(hex(sha256)) FROM tlsh_entries WHERE tlsh = ?",
-                (tlsh_hex,)
-            ).fetchone()
-        finally:
-            conn.close()
+        b = tlsh_to_binary(tlsh_hex)
+        if b is None:
+            return []
+        conn = self._reader()
+        row = conn.execute(
+            "SELECT size, name, LOWER(hex(sha256)) FROM tlsh_entries WHERE tlsh = ?",
+            (b,)
+        ).fetchone()
         if row is None:
             return []
         sig_size, name, sha256_hex = row
@@ -1766,13 +1875,16 @@ class TlshLibrary:
         }]
 
     def delete(self, tlsh_hex):
-        """删除一条 TLSH 记录; 返回删除条数 (0/1)"""
+        """删除一条 TLSH 记录 (大小写不敏感); 返回删除条数 (0/1)"""
         if not tlsh_hex:
+            return 0
+        b = tlsh_to_binary(tlsh_hex)
+        if b is None:
             return 0
         with self._lock:
             try:
                 cur = self._conn.execute(
-                    "DELETE FROM tlsh_entries WHERE tlsh = ?", (tlsh_hex,)
+                    "DELETE FROM tlsh_entries WHERE tlsh = ?", (b,)
                 )
                 self._conn.commit()
                 deleted = cur.rowcount
@@ -1782,51 +1894,139 @@ class TlshLibrary:
             except sqlite3.Error:
                 return 0
 
+    # ---------------------------------------------------------------- 检索
+    @staticmethod
+    def _wrap_ranges(center, d, hi):
+        """模 (hi+1) 环绕距离 ≤ d 的整数闭区间列表 (1-2 个, 可索引范围扫描)
+
+        例: center=3, d=2, hi=255 → [(1, 5)];
+            center=1, d=2, hi=255 → [(0, 3), (255, 255)]  (环绕下界)
+        """
+        if d >= hi:
+            return [(0, hi)]
+        lo, hi2 = center - d, center + d
+        if lo >= 0 and hi2 <= hi:
+            return [(lo, hi2)]
+        r = hi + 1
+        ranges = []
+        for l, h in ((lo, hi2), (lo + r, hi2 + r), (lo - r, hi2 - r)):
+            l, h = max(l, 0), min(h, hi)
+            if l <= h:
+                ranges.append((l, h))
+        return ranges
+
     def search(self, query_tlsh, threshold=None, top_k=None):
         """检索与 query_tlsh 距离 ≤ threshold 的库内条目, 按距离升序取 top_k
 
         返回 [{engine, type, name, size, sha256, score, tlsh, detail}, ...]
         其中 score = TLSH 距离 (越小越相似, 与 ssdeep score 语义相反)。
+
+        剪枝原理 (零召回损失): 距离各项贡献均非负, 故
+          Lvalue: ldiff==1→+1, ldiff≥2→ldiff×12 ⇒ 允许 ldiff ≤ max(1, threshold//12)
+          Q 比率: qdiff≤1→+qdiff, qdiff≥2→(qdiff-1)×12 ⇒ 允许 qdiff ≤ max(1, threshold//12+1)
+        不满足者由 SQL 的 lv 索引范围条件直接排除; 幸存候选再精确打分,
+        结果与旧版全表暴力 diff 完全一致。
         """
         if not query_tlsh:
+            return []
+        qb = tlsh_to_binary(query_tlsh)
+        if qb is None:
             return []
         threshold = self.threshold if threshold is None else threshold
         top_k = self.top_k if top_k is None else top_k
 
-        # 用只读连接 (与写入连接隔离, 无锁竞争)
-        conn = sqlite3.connect(
-            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
-        )
-        try:
-            rows = conn.execute(
-                "SELECT tlsh, LOWER(hex(sha256)), size, name FROM tlsh_entries"
-            ).fetchall()
-        finally:
-            conn.close()
+        # ---- 剪枝界 (由 threshold 反推的必要条件) ----
+        max_ld = max(1, threshold // tlsh_module.LENGTH_MULT)
+        max_qd = max(1, threshold // tlsh_module.LENGTH_MULT + 1)
+        qlv, qq1, qq2 = tlsh_header_fields(qb)
 
-        if not rows:
-            return []
+        conds, params = [], []
+        for col, center, d, hi in (("lv", qlv, max_ld, 255),
+                                    ("q1", qq1, max_qd, 15),
+                                    ("q2", qq2, max_qd, 15)):
+            ranges = self._wrap_ranges(center, d, hi)
+            conds.append("(" + " OR ".join(
+                f"{col} BETWEEN ? AND ?" for _ in ranges) + ")")
+            for lo, hi2 in ranges:
+                params.extend((lo, hi2))
 
+        sql = ("SELECT tlsh, LOWER(hex(sha256)), size, name FROM tlsh_entries "
+               "WHERE " + " AND ".join(conds))
+
+        conn = self._reader()
+        cur = conn.execute(sql, params)
+        use_np = _tlsb_np is not None
         scored = []
-        for lib_tlsh, lib_sha256, lib_size, lib_name in rows:
-            if lib_tlsh == query_tlsh:
-                continue  # 跳过自身 (刚入库的条目)
-            distance = tlsh_diff(query_tlsh, lib_tlsh)
-            if distance < 0:
-                continue  # 无效 TLSH, 跳过
-            if distance <= threshold:
-                scored.append((distance, {
-                    "engine": "TLSH Hash DB",
-                    "type": "fuzzy-similar",
-                    "name": lib_name or "unknown",
-                    "size": lib_size,
-                    "sha256": lib_sha256 or "",
-                    "score": distance,
-                    "tlsh": lib_tlsh,
-                    "detail": f"TLSH 距离 {distance} (越小越相似)",
-                }))
+        while True:
+            rows = cur.fetchmany(self._CHUNK_ROWS)
+            if not rows:
+                break
+            if use_np and len(rows) >= self._NP_MIN_ROWS:
+                dists = self._score_numpy(qb, [r[0] for r in rows])
+                for (lib_tlsh, lib_sha256, lib_size, lib_name), distance in \
+                        zip(rows, dists):
+                    if lib_tlsh == qb or distance > threshold:
+                        continue
+                    scored.append((int(distance), {
+                        "engine": "TLSH Hash DB",
+                        "type": "fuzzy-similar",
+                        "name": lib_name or "unknown",
+                        "size": lib_size,
+                        "sha256": lib_sha256 or "",
+                        "score": int(distance),
+                        "tlsh": tlsh_binary_to_hex(lib_tlsh),
+                        "detail": f"TLSH 距离 {int(distance)} (越小越相似)",
+                    }))
+            else:
+                for lib_tlsh, lib_sha256, lib_size, lib_name in rows:
+                    if lib_tlsh == qb:
+                        continue  # 跳过自身 (刚入库的条目)
+                    distance = tlsh_diff_bin(qb, lib_tlsh, threshold)
+                    if 0 <= distance <= threshold:
+                        scored.append((distance, {
+                            "engine": "TLSH Hash DB",
+                            "type": "fuzzy-similar",
+                            "name": lib_name or "unknown",
+                            "size": lib_size,
+                            "sha256": lib_sha256 or "",
+                            "score": distance,
+                            "tlsh": tlsh_binary_to_hex(lib_tlsh),
+                            "detail": f"TLSH 距离 {distance} (越小越相似)",
+                        }))
         scored.sort(key=lambda x: x[0])
         return [hit for _, hit in scored[:top_k]]
+
+    @staticmethod
+    def _score_numpy(qb, blobs):
+        """numpy 向量化: 一批候选 TLSH (35B BLOB 列表) → 距离数组
+
+        与 diff_bin 逐条结果一致 (无提前终止, 全量精确计算)。
+        """
+        np = _tlsb_np
+        swap, dist_tbl = _tlsh_np_tables()
+        arr = np.frombuffer(b"".join(blobs), dtype=np.uint8).reshape(len(blobs), 35)
+        q = np.frombuffer(qb, dtype=np.uint8)
+
+        # 1. 校验和
+        total = (arr[:, 0] != q[0]).astype(np.int64)
+        # 2. Lvalue (模 256 环绕)
+        l1 = swap[arr[:, 1]].astype(np.int64)
+        l2 = int(swap[q[1]])
+        d = np.abs(l1 - l2)
+        d = np.minimum(d, 256 - d)
+        total += np.where(d == 1, 1, np.where(d > 1, d * tlsh_module.LENGTH_MULT, 0))
+        # 3. Q 比率 (模 16 环绕, 低/高 nibble 各一)
+        qb2 = int(swap[q[2]])
+        for shift in (0, 4):
+            a = (swap[arr[:, 2]].astype(np.int64) >> shift) & 0x0F
+            b = (qb2 >> shift) & 0x0F
+            d = np.abs(a - b)
+            d = np.minimum(d, 16 - d)
+            total += np.where(d <= 1, d, (d - 1) * tlsh_module.QRATIO_MULT)
+        # 4. body: 65536 字节对距离矩阵 2D gather
+        #    (sum 指定 int64: 避免 Windows 下 uint8 求和产出 uint64 触发类型提升)
+        total += dist_tbl[arr[:, 3:35], q[3:35]].sum(axis=1, dtype=np.int64)
+        return total
 
     def stats(self):
         """返回库统计信息"""
@@ -1842,30 +2042,75 @@ class TlshLibrary:
             if self._conn:
                 self._conn.close()
                 self._conn = None
+        conn = getattr(self._tls, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except sqlite3.Error:
+                pass
+            self._tls.conn = None
 
 
 # ============================================================
 # SSDeep 自增长相似度检索库 (单文件 SQLite, 无 bloom, 无分片)
 # ============================================================
+
+# base64 字母表 -> 6bit 索引 (与 ppdeep 的 B64 一致); 7-gram 编码用
+_SSDEEP_B64_MAP = {
+    ch: i for i, ch in enumerate(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+}
+
 class SsdeepLibrary:
-    """SSDeep 自增长相似度检索库
+    """SSDeep 自增长相似度检索库 (Tier 1/2/3 加速版)
 
     数据来源:
-      1. 从 hdb 文件批量导入 (build_ssdeep_db.py / build_fuzzy_db.py)
+      1. 从 hdb 文件批量导入 (build_fuzzy_db.py)
       2. 每次精确哈希命中 (SHA256/MD5) 的样本自动入库累积 (自增长)
     检索: 与库内 ssdeep 签名做 ppdeep.compare 模糊匹配 (得分 0-100, 越高越相似)。
 
-    表结构: ssdeep (主键) / sha256 (BLOB 二进制, 32 字节) / size / name — 仅 4 字段。
-    不使用分片 Bloom filter — ssdeep 为变长 TEXT 主键, 精确查询走主键索引;
-    相似度检索走 GLOB 前缀 + 7-gram 预过滤 + ppdeep.compare, 无需 Bloom 预筛。
-    线程安全: 写入 (insert/import_hdb) 用 threading.Lock 保护;
-    读取 (search/check_exact) 用只读连接, 与写入连接隔离, 无锁竞争。
+    5000 万条规模加速架构 (三层):
+      Tier 1 - SQL 层: 归一化 blocksize 列 + (blocksize,size) 复合索引, 检索按
+              块大小定点范围扫描, 替代旧版 GLOB 'B:*' + 字典序 LIMIT 截断
+              (后者在 5000 万条下召回率不足 0.1%, 是召回崩塌根源)。
+      Tier 2 - 7-gram 倒排索引: ssdeep_gram(gram, entry_id) 表, 导入/入库时把
+              strip(h1) ∪ strip(h2) 的 7-gram 编码为 42 位整数写入; 检索按查询
+              gram 命中候选 (稀有 gram 优先 + posting 截断), 候选从百万级降到
+              几十~几百, 再 ppdeep.compare 精算验证。共享 7-gram 是阈值 ≥50 命中
+              的实际必要条件 (仅共享极短公共子串时 ppdeep 得分必然远低于 50)。
+      Tier 3 - 并行检索: 候选块大小 {B//2, B, B*2} 各开独立只读连接, 线程池并行
+              倒排探针, 合并候选后统一精算验证 (WAL 下与写连接隔离)。
+    淘汰: 超 max_entries 时按 id (插入序) 淘汰最旧条目, 并级联删除其 gram 索引。
+
+    表结构:
+      ssdeep_entries(id INTEGER PK, blocksize, ssdeep UNIQUE, sha256 BLOB, size, name)
+      ssdeep_gram(gram, entry_id, PK(gram, entry_id)) WITHOUT ROWID
+    线程安全: 写入用 threading.Lock; 检索用独立只读连接, 无锁竞争。
     """
 
     SSDEEP_SIM_THRESHOLD = 50   # 相似度阈值 (0-100, ssdeep 官方: >=50 高度可能相关)
     SSDEEP_SIM_TOP_K = 5        # 返回得分最高的前 N 条
-    SSDEEP_SIM_LIMIT = 500      # 每候选块大小最多取多少行
-    SSDEEP_MAX_ENTRIES = 50000 # 库容量上限 (自增长, 超限淘汰最旧)
+    SSDEEP_SIM_GRAM_PROBE = 4   # 稀有 gram 探针数下限 (每条候选块大小)
+    SSDEEP_SIM_MIN_CANDIDATES = 64  # 候选达到该量即停止继续探针 (recall/latency 平衡)
+    SSDEEP_SIM_LIMIT = 2000     # 每候选块大小候选上限 (安全网, 替代旧版 500 的字典序截断)
+    SSDEEP_MAX_ENTRIES = 50000  # 库容量上限 (自增长, 超限淘汰最旧)
+    _GRAM_BATCH = 8             # 稀有度评估分批 (限制 COUNT 查询次数)
+    _IN_BATCH = 900             # SQLite 参数占位符上限安全值
+
+    # 新 schema (Tier 1): id 数字主键 (插入序=淘汰序), blocksize 归一化列
+    _ENTRIES_DDL = (
+        "CREATE TABLE IF NOT EXISTS ssdeep_entries("
+        " id INTEGER PRIMARY KEY,"
+        " blocksize INTEGER NOT NULL,"
+        " ssdeep TEXT NOT NULL UNIQUE,"
+        " sha256 BLOB, size INTEGER, name TEXT)"
+    )
+    # Tier 2 倒排索引: 42 位 gram 编码 -> entry_id
+    _GRAM_DDL = (
+        "CREATE TABLE IF NOT EXISTS ssdeep_gram("
+        " gram INTEGER NOT NULL, entry_id INTEGER NOT NULL,"
+        " PRIMARY KEY(gram, entry_id)) WITHOUT ROWID"
+    )
 
     def __init__(self, db_path, threshold=None, top_k=None, max_entries=None):
         self.db_path = db_path
@@ -1884,20 +2129,27 @@ class SsdeepLibrary:
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        # 旧表迁移: 如果存在含 first_seen/hit_count 列的旧表, 删除重建
+        # 旧表迁移: 最旧版含 first_seen/hit_count 列 → 直接重建;
+        # 旧 4 列版 (ssdeep TEXT PK, 无 blocksize/id) → 迁移到新 schema + 回填 gram
         cols = self._conn.execute("PRAGMA table_info(ssdeep_entries)").fetchall()
         if cols:
             col_names = {c[1] for c in cols}
             if "first_seen" in col_names or "hit_count" in col_names:
                 self._conn.execute("DROP TABLE ssdeep_entries")
-        self._conn.execute("""
-            CREATE TABLE IF NOT EXISTS ssdeep_entries (
-                ssdeep     TEXT PRIMARY KEY,
-                sha256     BLOB,
-                size       INTEGER,
-                name       TEXT
-            )
-        """)
+                cols = []
+        # 倒排表与淘汰用索引须先就绪 (旧 4 列迁移会回填 gram)
+        self._conn.execute(self._GRAM_DDL)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ssdeep_gram_entry "
+            "ON ssdeep_gram(entry_id)")                    # 淘汰级联删除用
+        if cols:
+            col_names = {c[1] for c in cols}
+            if "id" not in col_names or "blocksize" not in col_names:
+                self._migrate_v1()
+        self._conn.execute(self._ENTRIES_DDL)
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ssdeep_bs_size "
+            "ON ssdeep_entries(blocksize, size)")          # Tier 1: 块大小+大小 定点扫描
         self._conn.execute(
             "CREATE TABLE IF NOT EXISTS imported_files(name TEXT PRIMARY KEY)"
         )
@@ -1910,6 +2162,27 @@ class SsdeepLibrary:
                 "SELECT name FROM imported_files"
             ).fetchall()
         }
+
+    def _migrate_v1(self):
+        """旧版 4 列 schema (ssdeep TEXT PK) → 新 schema + 回填 7-gram 索引"""
+        old = "ssdeep_entries_old"
+        self._conn.execute(f"ALTER TABLE ssdeep_entries RENAME TO {old}")
+        self._conn.execute(self._ENTRIES_DDL)
+        cur = self._conn.execute(f"SELECT ssdeep, sha256, size, name FROM {old}")
+        while True:
+            batch = cur.fetchmany(10000)
+            if not batch:
+                break
+            pending = []
+            for row in batch:
+                std = self._ssdeep_to_standard(row[0])
+                if std is None:
+                    continue
+                pending.append(
+                    (self._parse_block_size(std), std, row[1], row[2], row[3]))
+            self._flush_import(pending)
+        self._conn.execute(f"DROP TABLE IF EXISTS {old}")
+        self._conn.commit()
 
     @property
     def count(self):
@@ -1949,6 +2222,14 @@ class SsdeepLibrary:
         return f"{block}:{parts[1]}:{parts[2]}"
 
     @staticmethod
+    def _parse_block_size(std):
+        """解析标准格式 ssdeep 的块大小 (非法返回 0)"""
+        try:
+            return int(std.split(":", 1)[0])
+        except (ValueError, IndexError):
+            return 0
+
+    @staticmethod
     def _ssdeep_strip(s):
         """压缩连续重复字符 (与 ppdeep._strip_sequences 语义一致)"""
         if len(s) <= 3:
@@ -1960,16 +2241,75 @@ class SsdeepLibrary:
         return "".join(out)
 
     @staticmethod
-    def _ssdeep_grams7(s):
-        """7-gram 集合 (ppdeep._common_substring 的 ROLL_WINDOW=7); 长度 <7 返回空集"""
+    def _ssdeep_gram_codes(s):
+        """7-gram → 42 位整数编码集合 (base64 字母表 6bit/字符, 一一对应无碰撞)。
+        ssdeep hash 只含 base64 字符; 长度 <7 或含非法字符返回空集。
+        滚动 42 位窗口实现 (每字符 O(1)), 替代逐窗口 7 次内循环。"""
         if len(s) < 7:
             return set()
-        return {s[i:i + 7] for i in range(len(s) - 6)}
+        codes = set()
+        v = 0
+        mask = (1 << 36) - 1  # 低 6*6=36 位 (前 6 字符)
+        for i, ch in enumerate(s):
+            idx = _SSDEEP_B64_MAP.get(ch)
+            if idx is None:
+                return set()
+            v = ((v & mask) << 6) | idx
+            if i >= 6:
+                codes.add(v)
+        return codes
+
+    def _entry_gram_codes(self, std):
+        """条目倒排 gram 集合: strip(h1) ∪ strip(h2) 的 7-gram 编码 (Tier 2 建索引用)"""
+        try:
+            _b, _h1, _h2 = std.split(":", 2)
+        except ValueError:
+            return set()
+        codes = self._ssdeep_gram_codes(self._ssdeep_strip(_h1))
+        codes |= self._ssdeep_gram_codes(self._ssdeep_strip(_h2))
+        return codes
 
     # ---------- 导入 ----------
 
+    def _flush_import(self, pending):
+        """批量写入条目 + 回填其 7-gram 倒排 (Tier 2)。
+
+        条目 id 通过 ssdeep UNIQUE 索引反查 (分批 IN, 规避 SQLite 变量数上限);
+        gram 用 INSERT OR IGNORE 幂等去重。返回本次真实新增的条目数。
+        """
+        before_entries = self._conn.total_changes
+        self._conn.executemany(
+            "INSERT OR IGNORE INTO ssdeep_entries(blocksize, ssdeep, sha256, size, name)"
+            " VALUES(?,?,?,?,?)",
+            pending)
+        new_entries = self._conn.total_changes - before_entries
+        if new_entries == 0:
+            return 0
+        idmap = {}
+        for i in range(0, len(pending), self._IN_BATCH):
+            keys = [r[1] for r in pending[i:i + self._IN_BATCH]]
+            qm = ",".join("?" * len(keys))
+            for eid, ssd in self._conn.execute(
+                    f"SELECT id, ssdeep FROM ssdeep_entries WHERE ssdeep IN ({qm})", keys):
+                idmap[ssd] = eid
+        gram_rows = []
+        for r in pending:
+            eid = idmap.get(r[1])
+            if eid is None:
+                continue
+            for g in self._entry_gram_codes(r[1]):
+                gram_rows.append((g, eid))
+        if gram_rows:
+            # 按 PK(gram, entry_id) 序写入 -> b-tree 顺序追加, 避免随机页分裂
+            gram_rows.sort()
+            for i in range(0, len(gram_rows), self._IN_BATCH):
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO ssdeep_gram(gram, entry_id) VALUES(?,?)",
+                    gram_rows[i:i + self._IN_BATCH])
+        return new_entries
+
     def import_hdb(self, filepath, batch=50_000):
-        """从 ClamAV 8 字段 hdb 文件导入 ssdeep 签名。
+        """从 ClamAV 8 字段 hdb 文件导入 ssdeep 签名 (含 7-gram 倒排构建)。
 
         行格式: sha256:filesize:result:ssdeep:vhash:authentihash:imphash:rich_header_hash
         仅提取 ssdeep 字段 (parts[3]); sha256 存为 BLOB 二进制 (32 字节)。
@@ -2002,24 +2342,27 @@ class SsdeepLibrary:
                 name = parts[2].strip()
                 ssdeep_val = parts[3].strip() or None
                 if ssdeep_val:
-                    # 归一化为标准格式 (冒号分隔), 与 insert() 保持一致
                     std = self._ssdeep_to_standard(ssdeep_val)
                     if std:
-                        ssdeep_val = std
-                    pending.append((ssdeep_val, sha256_blob, size, name))
+                        # (blocksize, ssdeep, sha256_blob, size, name) 与 _flush_import 5 列一致
+                        pending.append((
+                            self._parse_block_size(std), std,
+                            sha256_blob, size, name))
 
         inserted = 0
         with self._lock:
-            for i in range(0, len(pending), batch):
-                chunk = pending[i:i + batch]
-                before = self._conn.total_changes
-                self._conn.executemany(
-                    "INSERT OR IGNORE INTO ssdeep_entries(ssdeep, sha256, size, name) "
-                    "VALUES(?,?,?,?)",
-                    chunk,
-                )
-                self._conn.commit()
-                inserted += self._conn.total_changes - before
+            # 批量导入期暂挂 idx_ssdeep_gram_entry (唯一使用方是淘汰/删除,
+            # 导入期不触发), 倒排写入只维护 PK b-tree; 结束后重建
+            self._conn.execute("DROP INDEX IF EXISTS idx_ssdeep_gram_entry")
+            try:
+                for i in range(0, len(pending), batch):
+                    chunk = pending[i:i + batch]
+                    inserted += self._flush_import(chunk)
+                    self._conn.commit()
+            finally:
+                self._conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_ssdeep_gram_entry "
+                    "ON ssdeep_gram(entry_id)")
             self._count = self._conn.execute(
                 "SELECT COUNT(*) FROM ssdeep_entries"
             ).fetchone()[0]
@@ -2031,64 +2374,72 @@ class SsdeepLibrary:
 
     # ---------- 写入 (自增长) ----------
 
+    def _evict_oldest(self):
+        """淘汰最旧 (id 最小) 条目并级联删除其 gram 索引 (Tier 2 一致性)"""
+        row = self._conn.execute(
+            "SELECT id FROM ssdeep_entries ORDER BY id LIMIT 1").fetchone()
+        if row:
+            self._conn.execute(
+                "DELETE FROM ssdeep_gram WHERE entry_id = ?", (row[0],))
+            self._conn.execute(
+                "DELETE FROM ssdeep_entries WHERE id = ?", (row[0],))
+            self._count -= 1
+
     def insert(self, ssdeep_val, sha256_hex, name, size):
         """插入/更新一条 ssdeep 记录 (自增长, 线程安全)
 
         sha256_hex: 64 位 hex 字符串, 内部转为 BLOB 二进制存储 (节省 50% 空间)。
         ssdeep_val 归一化为标准格式 (块大小:hash1:hash2, 冒号分隔) 后存储,
         确保 insert (ppdeep 标准格式) 与 import_hdb (ClamAV 短横线格式) 数据一致,
-        精确匹配与 GLOB 前缀检索均能命中。
-        已存在 (同 ssdeep) → 更新 sha256/size/name; 不存在 → 新增。
-        超过 max_entries 时淘汰 ROWID 最旧 (最先插入) 的条目。
+        精确匹配与倒排检索均能命中。
+        已存在 (同 ssdeep) → 更新 sha256/size/name (gram 不变); 不存在 → 新增 + 回填 gram。
+        超过 max_entries 时淘汰 id 最旧 (最先插入) 的条目 (级联删 gram)。
         """
         if not ssdeep_val or not sha256_hex:
             return
-        # 归一化为标准格式 (冒号分隔), 统一存储格式
         std = self._ssdeep_to_standard(ssdeep_val)
         if std:
             ssdeep_val = std
-        # hex → BLOB (32 字节 vs 64 字符, 节省 50% 空间)
         try:
             sha256_blob = bytes.fromhex(sha256_hex)
         except (ValueError, TypeError):
             sha256_blob = None
         with self._lock:
             try:
-                cur = self._conn.execute(
-                    "SELECT 1 FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
-                )
-                if cur.fetchone():
+                row = self._conn.execute(
+                    "SELECT id FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
+                ).fetchone()
+                if row:
                     self._conn.execute(
                         "UPDATE ssdeep_entries SET sha256 = ?, size = ?, name = ? "
-                        "WHERE ssdeep = ?",
-                        (sha256_blob, size, name or "unknown", ssdeep_val),
+                        "WHERE id = ?",
+                        (sha256_blob, size, name or "unknown", row[0]),
                     )
                 else:
-                    self._conn.execute(
-                        "INSERT INTO ssdeep_entries (ssdeep, sha256, size, name) "
-                        "VALUES (?, ?, ?, ?)",
-                        (ssdeep_val, sha256_blob, size, name or "unknown"),
-                    )
-                    self._count += 1
-                    if self._count > self.max_entries:
-                        self._conn.execute(
-                            "DELETE FROM ssdeep_entries WHERE rowid = "
-                            "(SELECT MIN(rowid) FROM ssdeep_entries)"
-                        )
-                        self._count -= 1
+                    added = self._flush_import([(
+                        self._parse_block_size(ssdeep_val), ssdeep_val,
+                        sha256_blob, size, name or "unknown")])
+                    if added:
+                        self._count += 1
+                        if self._count > self.max_entries:
+                            self._evict_oldest()
                 self._conn.commit()
             except sqlite3.Error:
                 pass
 
     # ---------- 精确匹配 ----------
 
-    def check_exact(self, ssdeep_value, file_size=None):
-        """精确匹配 ssdeep 签名 (主键查询, 走索引)"""
-        if not ssdeep_value:
-            return []
-        conn = sqlite3.connect(
+    def _ro_conn(self):
+        """独立只读连接 (WAL 下与写连接隔离, 无锁竞争); 调用方负责 close()"""
+        return sqlite3.connect(
             f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
         )
+
+    def check_exact(self, ssdeep_value, file_size=None):
+        """精确匹配 ssdeep 签名 (UNIQUE 索引查询)"""
+        if not ssdeep_value:
+            return []
+        conn = self._ro_conn()
         try:
             row = conn.execute(
                 "SELECT size, name, LOWER(hex(sha256)) FROM ssdeep_entries WHERE ssdeep = ?",
@@ -2120,28 +2471,35 @@ class SsdeepLibrary:
             ssdeep_val = std
         with self._lock:
             try:
-                cur = self._conn.execute(
-                    "DELETE FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
-                )
+                row = self._conn.execute(
+                    "SELECT id FROM ssdeep_entries WHERE ssdeep = ?", (ssdeep_val,)
+                ).fetchone()
+                if row is None:
+                    return 0
+                self._conn.execute(
+                    "DELETE FROM ssdeep_gram WHERE entry_id = ?", (row[0],))
+                self._conn.execute(
+                    "DELETE FROM ssdeep_entries WHERE id = ?", (row[0],))
                 self._conn.commit()
-                deleted = cur.rowcount
-                if deleted:
-                    self._count = max(self._count - 1, 0)
-                return deleted
+                self._count = max(self._count - 1, 0)
+                return 1
             except sqlite3.Error:
                 return 0
 
     # ---------- 相似度检索 ----------
 
     def search(self, query_ssdeep, file_size=None, threshold=None, top_k=None):
-        """ssdeep 相似度检索: 与库中 ssdeep 签名做 ppdeep.compare 模糊匹配 (得分 0-100)。
+        """ssdeep 相似度检索 (Tier 1/2/3 加速)
 
         候选筛选 (避免全库逐条比对, 控制检索量):
           1. 解析查询块大小 B; 候选块大小 ∈ {B//2, B, B*2}
           2. 文件大小 ±2 倍过滤
-          3. GLOB 'B:*' (ssdeep 主键前缀索引, 标准冒号格式) + size 过滤 + LIMIT
-          4. 7-gram 预过滤: 无公共 7 子串的候选 compare 必然得 0, 直接跳过
-        返回得分 >= threshold 的命中, 按得分降序取 top_k。
+          3. Tier 2: 按候选块大小用查询 7-gram 倒排探针 (稀有 gram 优先
+             + posting 截断), 候选从百万级降到几十~几百; 共享 7-gram 是
+             ppdeep 得分非零的必要条件, 因此无漏检
+          4. ppdeep.compare 精算验证, 返回得分 >= threshold 的命中
+        无 7-gram 的短哈希查询 (理论只能得 0 分) 退化为 Tier 1 定点范围
+        扫描兜底。Tier 3: 各候选块大小开独立只读连接, 线程池并行探针。
         """
         if not SSDEEP_AVAILABLE or not query_ssdeep:
             return []
@@ -2153,78 +2511,148 @@ class SsdeepLibrary:
             return []
         try:
             q_block = int(query_std.split(":", 1)[0])
+            _qb, _qh1, _qh2 = query_std.split(":", 2)
         except ValueError:
             return []
-        _qb, _qh1, _qh2 = query_std.split(":", 2)
         q_s1 = self._ssdeep_strip(_qh1)
         q_s2 = self._ssdeep_strip(_qh2)
-        q_g1 = self._ssdeep_grams7(q_s1)
-        q_g2 = self._ssdeep_grams7(q_s2)
+        q_g1 = self._ssdeep_gram_codes(q_s1)
+        q_g2 = self._ssdeep_gram_codes(q_s2)
         cand_blocks = sorted({b for b in (q_block, q_block // 2, q_block * 2) if b > 0})
         if file_size is not None and file_size > 0:
             size_lo, size_hi = file_size // 2, file_size * 2
         else:
             size_lo, size_hi = None, None
 
-        conn = sqlite3.connect(
-            f"file:{self.db_path}?mode=ro", uri=True, check_same_thread=False
-        )
-        try:
+        # ppdeep.compare 的字符串配对决定探针 gram 集:
+        #   bs == B    : 比较 (q_s1, e_s1) 与 (q_s2, e_s2) -> 探针 q_g1 ∪ q_g2
+        #   bs == B//2 : 比较 (q_s1, e_s2)                 -> 探针 q_g1
+        #   bs == B*2  : 比较 (q_s2, e_s1)                 -> 探针 q_g2
+        bs_grams = {}
+        for bs in cand_blocks:
+            if bs == q_block:
+                bs_grams[bs] = q_g1 | q_g2
+            elif bs * 2 == q_block:
+                bs_grams[bs] = q_g1
+            else:
+                bs_grams[bs] = q_g2
+
+        if len(cand_blocks) == 1:
+            scored = self._search_bs(
+                cand_blocks[0], query_std, bs_grams[cand_blocks[0]],
+                size_lo, size_hi, threshold)
+        else:
             scored = []
-            for bsize in cand_blocks:
-                sql = ("SELECT ssdeep, size, name, LOWER(hex(sha256)) FROM ssdeep_entries"
-                       " WHERE ssdeep GLOB ?")
-                params = [f"{bsize}:*"]
-                if size_lo is not None:
-                    sql += " AND (size IS NULL OR size BETWEEN ? AND ?)"
-                    params += [size_lo, size_hi]
-                sql += " LIMIT ?"
-                params.append(self.SSDEEP_SIM_LIMIT)
-                try:
-                    rows = conn.execute(sql, params).fetchall()
-                except sqlite3.Error:
-                    continue
-                for clam_val, sig_size, name, sha256_hex in rows:
-                    std = self._ssdeep_to_standard(clam_val)
-                    if std is None or std == query_std:
-                        continue
+            with ThreadPoolExecutor(max_workers=len(cand_blocks)) as executor:
+                futures = [
+                    executor.submit(self._search_bs, bs, query_std, bs_grams[bs],
+                                    size_lo, size_hi, threshold)
+                    for bs in cand_blocks
+                ]
+                for fut in as_completed(futures):
                     try:
-                        c_block, c_h1, c_h2 = std.split(":", 2)
-                        c_block = int(c_block)
-                    except ValueError:
-                        continue
-                    # 7-gram 预过滤
-                    if c_block == q_block:
-                        if not (q_g1 & self._ssdeep_grams7(self._ssdeep_strip(c_h1))
-                                or q_g2 & self._ssdeep_grams7(self._ssdeep_strip(c_h2))):
-                            continue
-                    elif q_block == c_block * 2:
-                        if not (q_g1 & self._ssdeep_grams7(self._ssdeep_strip(c_h2))):
-                            continue
-                    elif c_block == q_block * 2:
-                        if not (q_g2 & self._ssdeep_grams7(self._ssdeep_strip(c_h1))):
-                            continue
-                    else:
-                        continue
-                    try:
-                        score = ppdeep.compare(query_std, std)
+                        scored.extend(fut.result())
                     except Exception:
-                        continue
-                    if score >= threshold:
-                        scored.append((score, {
-                            "engine": "SSDeep Hash DB",
-                            "type": "fuzzy-similar",
-                            "name": name or "unknown",
-                            "size": sig_size,
-                            "sha256": sha256_hex,
-                            "score": score,
-                            "ssdeep": clam_val,
-                            "detail": f"ssdeep 相似度 {score}/100",
-                        }))
-        finally:
-            conn.close()
+                        continue  # 单线程失败不影响整体
         scored.sort(key=lambda x: -x[0])
         return [hit for _, hit in scored[:top_k]]
+
+    def _search_bs(self, bs, query_std, query_grams, size_lo, size_hi, threshold):
+        """单个候选块大小的 Tier 2 gram 倒排探针 + 精算 (线程内独立只读连接)"""
+        try:
+            conn = self._ro_conn()
+        except sqlite3.Error:
+            return []
+        try:
+            grams = sorted(query_grams)
+            if not grams:
+                # 短哈希 (无 7-gram): 退化为 Tier 1 定点范围扫描兜底
+                return self._search_bs_tier1(conn, bs, query_std,
+                                             size_lo, size_hi, threshold)
+            # 稀有度评估: 各 gram 在当前块大小下的 posting 量 (分批)。
+            # 用 VALUES 驱动的相关子查询强制 gram 主键驱动的执行计划;
+            # 直连 JOIN 会让 SQLite 按 idx_ssdeep_bs_size 扫该块大小全表再反查
+            # gram, 20k 库即 ~400ms, 大库下不可接受。
+            rarity = {}
+            for i in range(0, len(grams), self._GRAM_BATCH):
+                chunk = grams[i:i + self._GRAM_BATCH]
+                rows = conn.execute(
+                    "WITH gs(g) AS (VALUES (" + "),(".join("?" * len(chunk)) + "))"
+                    " SELECT gs.g, (SELECT COUNT(*) FROM ssdeep_gram sg"
+                    "  JOIN ssdeep_entries e ON e.id = sg.entry_id"
+                    "  WHERE sg.gram = gs.g AND e.blocksize = ?)"
+                    " FROM gs", chunk + [bs]).fetchall()
+                for g, cnt in rows:
+                    rarity[g] = cnt
+            # 只探针本块大小下有 posting 的 gram (posting 0 的 gram 无候选可出,
+            # 随机/未命中查询可省去 ~200 次空探针), 稀有 (posting 少) 优先
+            probe_grams = sorted(
+                (g for g, cnt in rarity.items() if cnt > 0),
+                key=lambda g: (rarity[g], g))
+            candidates = {}
+            probed = 0
+            for g in probe_grams:
+                if (probed >= self.SSDEEP_SIM_GRAM_PROBE
+                        and len(candidates) >= self.SSDEEP_SIM_MIN_CANDIDATES):
+                    break
+                if len(candidates) >= self.SSDEEP_SIM_LIMIT:
+                    break
+                rows = conn.execute(
+                    "SELECT e.id, e.ssdeep, e.size, e.name, LOWER(hex(e.sha256))"
+                    " FROM ssdeep_gram g JOIN ssdeep_entries e ON e.id = g.entry_id"
+                    " WHERE g.gram = ? AND e.blocksize = ? LIMIT ?",
+                    (g, bs, self.SSDEEP_SIM_LIMIT)).fetchall()
+                for eid, ssd, size, name, sha in rows:
+                    if eid not in candidates:
+                        candidates[eid] = (ssd, size, name, sha)
+                probed += 1
+            return self._score_candidates(
+                candidates.values(), query_std, size_lo, size_hi, threshold)
+        finally:
+            conn.close()
+
+    def _search_bs_tier1(self, conn, bs, query_std, size_lo, size_hi, threshold):
+        """Tier 1 兜底: 按 (blocksize, size) 复合索引定点范围扫描 (有界)"""
+        sql = ("SELECT e.ssdeep, e.size, e.name, LOWER(hex(e.sha256))"
+               " FROM ssdeep_entries e WHERE e.blocksize = ?")
+        params = [bs]
+        if size_lo is not None:
+            sql += " AND (e.size IS NULL OR e.size BETWEEN ? AND ?)"
+            params += [size_lo, size_hi]
+        sql += " LIMIT ?"
+        params.append(self.SSDEEP_SIM_LIMIT)
+        try:
+            rows = conn.execute(sql, params).fetchall()
+        except sqlite3.Error:
+            return []
+        return self._score_candidates(rows, query_std, size_lo, size_hi, threshold)
+
+    @staticmethod
+    def _score_candidates(candidate_rows, query_std, size_lo, size_hi, threshold):
+        """候选行 size 过滤 + ppdeep.compare 精算, 返回 [(score, hit), ...]"""
+        scored = []
+        for ssd, size, name, sha in candidate_rows:
+            if ssd == query_std:
+                continue
+            if (size_lo is not None and size is not None
+                    and not (size_lo <= size <= size_hi)):
+                continue
+            try:
+                score = ppdeep.compare(query_std, ssd)
+            except Exception:
+                continue
+            if score >= threshold:
+                scored.append((score, {
+                    "engine": "SSDeep Hash DB",
+                    "type": "fuzzy-similar",
+                    "name": name or "unknown",
+                    "size": size,
+                    "sha256": sha,
+                    "score": score,
+                    "ssdeep": ssd,
+                    "detail": f"ssdeep 相似度 {score}/100",
+                }))
+        return scored
 
     # ---------- 统计 ----------
 
@@ -2559,6 +2987,9 @@ class Scanner:
         start = time.time()
         detections = list(self.yara_scanner.scan_data(data))
 
+        # 模糊哈希库入库用 SHA256: 优先复用阶段1传入, 缺失时惰性重算一次 (R2)
+        _sha256_or_none = sha256
+
         # 静态信息与模糊哈希 (ssdeep/tlsh/imphash/authentihash + PE 元数据 + 壳检测)
         static_start = time.time()
         static_info = staticinfo.compute_static_info(data)
@@ -2587,14 +3018,15 @@ class Scanner:
             sim_hits = self.ssdeep_library.search(
                 ssdeep_val, file_size=len(data))
             detections.extend(sim_hits)
-            # 入库 (自增长): 仅在精确哈希命中时
-            if hash_hit:
-                _sha = sha256
-                if not _sha:
-                    _sha = hashlib.sha256(data).hexdigest()
-                self.ssdeep_library.insert(
-                    ssdeep_val, _sha, hash_hit_name or "unknown", len(data)
-                )
+
+        # 入库 (自增长, 两个模糊哈希库共用): 仅在精确哈希命中时, 库内仅累积已知恶意样本;
+        # sha256 缺失时只惰性重算一次, 避免同一 data 被重复全量哈希 (R2)
+        if hash_hit and _sha256_or_none is None:
+            _sha256_or_none = sha256 or hashlib.sha256(data).hexdigest()
+        if ssdeep_val and self.ssdeep_library is not None and hash_hit:
+            self.ssdeep_library.insert(
+                ssdeep_val, _sha256_or_none, hash_hit_name or "unknown", len(data)
+            )
 
         # TLSH 相似度检测 (始终执行) + 自增长入库 (仅在精确哈希命中时)
         tlsh_val = fuzzy_info.get("tlsh")
@@ -2602,11 +3034,8 @@ class Scanner:
             tlsh_hits = self.tlsh_library.search(tlsh_val)
             detections.extend(tlsh_hits)
             if hash_hit:
-                _sha = sha256
-                if not _sha:
-                    _sha = hashlib.sha256(data).hexdigest()
                 self.tlsh_library.insert(
-                    tlsh_val, _sha, hash_hit_name or "unknown", len(data)
+                    tlsh_val, _sha256_or_none, hash_hit_name or "unknown", len(data)
                 )
 
         elapsed_ms = round((time.time() - start) * 1000, 1)

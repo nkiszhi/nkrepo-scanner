@@ -527,10 +527,10 @@ function peBlock(pe) {
     '<div><div class="k">ImageBase</div><div class="v">' + esc(pe.image_base) + '</div></div>' +
     '</div>';
   if (pe.sections && pe.sections.length) {
-    html += '<table class="pe-tbl"><tr><th>节区</th><th>VirtualSize</th><th>RawSize</th><th>Flags</th></tr>' +
+    html += '<div class="tbl-scroll"><table class="pe-tbl"><tr><th>节区</th><th>VirtualSize</th><th>RawSize</th><th>Flags</th></tr>' +
       pe.sections.map(s =>
         '<tr><td>' + esc(s.name) + '</td><td class="sz">' + fmtHex(s.vsize) + '</td>' +
-        '<td class="sz">' + fmtHex(s.rsize) + '</td><td>' + esc(s.flags) + '</td></tr>').join('') + '</table>';
+        '<td class="sz">' + fmtHex(s.rsize) + '</td><td>' + esc(s.flags) + '</td></tr>').join('') + '</table></div>';
   }
   if (pe.imports && pe.imports.length) {
     html += '<div class="imports">' + pe.imports.map(i => {

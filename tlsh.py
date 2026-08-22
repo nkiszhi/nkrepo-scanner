@@ -11,6 +11,11 @@ tlsh.py - 纯 Python 实现的 TLSH (Trend Micro Locality Sensitive Hash)
 """
 import math
 
+try:  # numpy 为可选加速依赖 (缺失时自动回退纯 Python)
+    import numpy as _np
+except ImportError:  # pragma: no cover
+    _np = None
+
 # ---------------------------------------------------------------- 常量
 V_TABLE = bytes([
     1, 87, 49, 12, 176, 178, 102, 166, 121, 193, 6, 84, 249, 230, 44, 163,
@@ -61,6 +66,18 @@ def _b_mapping(salt, i, j, k):
     return h
 
 
+# 预计算 2 级查表: Q[s][i][j] = V_TABLE[V_TABLE[V_TABLE[s] ^ i] ^ j]
+# 于是 _b_mapping(s, i, j, k) = V_TABLE[Q[s][i][j] ^ k] —— 把每次映射从 4 次链式查表
+# 降至 1 次查表。update() 热循环只用 7 个固定 salt, 预计算内存约 7×256×256 = 458KB。
+_SALTS = (0, 2, 3, 5, 7, 11, 13)
+_Q = {
+    s: [bytes(V_TABLE[V_TABLE[V_TABLE[s] ^ i] ^ j] for j in range(256))
+        for i in range(256)]
+    for s in _SALTS
+}
+_Q0, _Q2, _Q3, _Q5, _Q7, _Q11, _Q13 = (_Q[s] for s in _SALTS)
+
+
 def _l_capturing(length):
     if length <= 656:
         i = int(math.log(length) / LOG_1_5)
@@ -83,101 +100,18 @@ def _set_qhigh(q, x):
     return (q & 0x0F) | ((x & 0x0F) << 4)
 
 
-def _partition(buf, left, right):
-    """快排分区 (与官方实现一致: 取中点作 pivot, 原地交换)"""
-    if left == right:
-        return left
-    if left + 1 == right:
-        if buf[left] > buf[right]:
-            buf[left], buf[right] = buf[right], buf[left]
-        return left
-
-    ret = left
-    pivot = (left + right) >> 1
-    val = buf[pivot]
-    buf[pivot] = buf[right]
-    buf[right] = val
-
-    for i in range(left, right):
-        if buf[i] < val:
-            buf[ret], buf[i] = buf[i], buf[ret]
-            ret += 1
-    buf[right], buf[ret] = buf[ret], buf[right]
-    return ret
-
-
 def _find_quartile(a_bucket):
-    """对 128 个有效桶求 q1/q2/q3 (quickselect, 与官方 find_quartile 一致)"""
-    buf = list(a_bucket[:EFF_BUCKETS])
-    short_cut_left = [0] * EFF_BUCKETS
-    short_cut_right = [0] * EFF_BUCKETS
-    spl = 0
-    spr = 0
+    """对 128 个有效桶求 q1/q2/q3
+
+    性能优化 (2026-08-22): quickselect 是求顺序统计量的手段, 排序后直接取
+    索引 31/63/95 与官方 find_quartile 输出**完全等价** (确定性顺序统计量,
+    无平局歧义), 128 元素排序远快于多轮分区。
+    """
+    buf = sorted(a_bucket[:EFF_BUCKETS])
     p1 = EFF_BUCKETS // 4 - 1          # 31
     p2 = EFF_BUCKETS // 2 - 1          # 63
     p3 = EFF_BUCKETS - EFF_BUCKETS // 4 - 1  # 95
-    end = EFF_BUCKETS - 1              # 127
-    q1 = q2 = q3 = 0
-
-    l, r = 0, end
-    while True:
-        ret = _partition(buf, l, r)
-        if ret > p2:
-            r = ret - 1
-            short_cut_right[spr] = ret
-            spr += 1
-        elif ret < p2:
-            l = ret + 1
-            short_cut_left[spl] = ret
-            spl += 1
-        else:
-            q2 = buf[p2]
-            break
-
-    short_cut_left[spl] = p2 - 1
-    short_cut_right[spr] = p2 + 1
-
-    l = 0
-    for i in range(spl + 1):
-        r = short_cut_left[i]
-        if r > p1:
-            while True:
-                ret = _partition(buf, l, r)
-                if ret > p1:
-                    r = ret - 1
-                elif ret < p1:
-                    l = ret + 1
-                else:
-                    q1 = buf[p1]
-                    break
-            break
-        elif r < p1:
-            l = r
-        else:
-            q1 = buf[p1]
-            break
-
-    r = end
-    for i in range(spr + 1):
-        l = short_cut_right[i]
-        if l < p3:
-            while True:
-                ret = _partition(buf, l, r)
-                if ret > p3:
-                    r = ret - 1
-                elif ret < p3:
-                    l = ret + 1
-                else:
-                    q3 = buf[p3]
-                    break
-            break
-        elif l > p3:
-            r = l
-        else:
-            q3 = buf[p3]
-            break
-
-    return q1, q2, q3
+    return buf[p1], buf[p2], buf[p3]
 
 
 class Tlsh:
@@ -194,49 +128,63 @@ class Tlsh:
         self._valid = False
 
     def update(self, data):
-        """喂入字节数据 (可多次调用)"""
+        """喂入字节数据 (可多次调用)
+
+        性能优化 (2026-08-22): 将热循环内 7 次 _b_mapping 函数调用 + 链式查表
+        内联为基于预计算 Q 表的单次查表 (输出与官方算法逐字节一致)。
+        """
         if not data:
             return
         w = self.slide_window
-        j = self.data_len % RNG_SIZE
-        fed_len = self.data_len
         checksum = self.checksum
         a_bucket = self.a_bucket
+        VT = V_TABLE
+        Q0, Q2, Q3, Q5, Q7, Q11, Q13 = _Q0, _Q2, _Q3, _Q5, _Q7, _Q11, _Q13
+        fed_len = self.data_len
+        j = fed_len % RNG_SIZE
 
-        for i in range(len(data)):
-            b = data[i]
+        for b in data:
             w[j] = b
 
             if fed_len >= 4:  # 至少 5 字节才开始计算
-                j1 = _rng_idx(j - 1)
-                j2 = _rng_idx(j - 2)
-                j3 = _rng_idx(j - 3)
-                j4 = _rng_idx(j - 4)
+                # 窗口索引取模内联 (等价于 _rng_idx, 避免热循环调用开销):
+                # j ∈ [0, RNG_SIZE-1], 对负数一次 += RNG_SIZE 即回到有效范围 (RNG_SIZE>=5 恒成立)
+                j1 = j - 1
+                if j1 < 0:
+                    j1 += RNG_SIZE
+                j2 = j - 2
+                if j2 < 0:
+                    j2 += RNG_SIZE
+                j3 = j - 3
+                if j3 < 0:
+                    j3 += RNG_SIZE
+                j4 = j - 4
+                if j4 < 0:
+                    j4 += RNG_SIZE
 
-                for k in range(TLSH_CHECKSUM_LEN):
-                    if k == 0:
-                        checksum[k] = _b_mapping(0, w[j], w[j1], checksum[k])
-                    else:
-                        checksum[k] = _b_mapping(checksum[k - 1], w[j], w[j1], checksum[k])
+                wj = w[j]
+                wA = w[j1]
+                wB = w[j2]
+                wC = w[j3]
+                wD = w[j4]
 
-                # 6 个桶更新 (与官方一致; JS port 中 b_mapping(2,..) 重复计算但只累加一次)
-                r = _b_mapping(2, w[j], w[j1], w[j2])
-                a_bucket[r] += 1
-                r = _b_mapping(3, w[j], w[j1], w[j3])
-                a_bucket[r] += 1
-                r = _b_mapping(5, w[j], w[j2], w[j3])
-                a_bucket[r] += 1
-                r = _b_mapping(7, w[j], w[j2], w[j4])
-                a_bucket[r] += 1
-                r = _b_mapping(11, w[j], w[j1], w[j4])
-                a_bucket[r] += 1
-                r = _b_mapping(13, w[j], w[j3], w[j4])
-                a_bucket[r] += 1
+                # 校验和 (TLSH_CHECKSUM_LEN=1): checksum[0] = _b_mapping(0, wj, wA, checksum[0])
+                checksum[0] = VT[Q0[wj][wA] ^ checksum[0]]
 
-            j = _rng_idx(j + 1)
+                # 6 个桶更新 (与官方一致; 等价于 _b_mapping(salt, wj, x, y) 各累加一次)
+                a_bucket[VT[Q2[wj][wA] ^ wB]] += 1
+                a_bucket[VT[Q3[wj][wA] ^ wC]] += 1
+                a_bucket[VT[Q5[wj][wB] ^ wC]] += 1
+                a_bucket[VT[Q7[wj][wB] ^ wD]] += 1
+                a_bucket[VT[Q11[wj][wA] ^ wD]] += 1
+                a_bucket[VT[Q13[wj][wC] ^ wD]] += 1
+
+            j += 1
+            if j == RNG_SIZE:
+                j = 0
             fed_len += 1
 
-        self.data_len += len(data)
+        self.data_len = fed_len
 
     def final(self):
         """完成计算; 返回 True=成功, False=输入过短或复杂度不足"""
@@ -247,22 +195,22 @@ class Tlsh:
 
         # 非零桶必须超过一半, 否则视为变化不足
         nonzero = 0
-        for i in range(CODE_SIZE):
-            for j in range(4):
-                if self.a_bucket[4 * i + j] > 0:
-                    nonzero += 1
+        for k in self.a_bucket[:EFF_BUCKETS]:
+            if k > 0:
+                nonzero += 1
         if nonzero <= 4 * CODE_SIZE // 2:
             return False
 
+        q1_3, q2_3, q3_3 = q1, q2, q3  # 局部化 (热循环免属性/全局查找)
         for i in range(CODE_SIZE):
             h = 0
             for j in range(4):
                 k = self.a_bucket[4 * i + j]
-                if q3 < k:
+                if q3_3 < k:
                     h += 3 << (j * 2)
-                elif q2 < k:
+                elif q2_3 < k:
                     h += 2 << (j * 2)
-                elif q1 < k:
+                elif q1_3 < k:
                     h += 1 << (j * 2)
             self.tmp_code[i] = h
 
@@ -277,22 +225,102 @@ class Tlsh:
         """返回 70 位大写 hex; 未 final 或失败时返回 None"""
         if not self._valid:
             return None
-        out = [
-            _swap_byte(self.checksum[0]),
-            _swap_byte(self.Lvalue),
-            _swap_byte(self.Q),
-        ]
-        out.extend(self.tmp_code[CODE_SIZE - 1 - i] for i in range(CODE_SIZE))
-        return "".join(f"{b:02X}" for b in out)
+        # bytes.hex().upper() 远快于逐字节 f-string 拼接
+        out = bytearray(CODE_SIZE + 3)
+        out[0] = _swap_byte(self.checksum[0])
+        out[1] = _swap_byte(self.Lvalue)
+        out[2] = _swap_byte(self.Q)
+        tc = self.tmp_code
+        for i in range(CODE_SIZE):
+            out[3 + i] = tc[CODE_SIZE - 1 - i]
+        return out.hex().upper()
 
     def reset(self):
         self.__init__()
 
 
 def hash_bytes(data):
-    """便捷函数: 计算 bytes 的 TLSH, 不适用时返回 None"""
+    """便捷函数: 计算 bytes 的 TLSH, 不适用时返回 None
+
+    性能优化 (2026-08-22): 安装 numpy 且输入 ≥ _NP_MIN_LEN 字节时走
+    _hash_bytes_np() 向量化路径 (6 组桶计数用 2D gather + bincount 一次算完,
+    仅校验和保持逐字节链式循环), 输出与纯 Python 路径逐字节一致。
+    """
+    if data is None:
+        return None
+    if _np is not None and len(data) >= _NP_MIN_LEN:
+        try:
+            return _hash_bytes_np(data)
+        except Exception:
+            pass  # 向量化路径异常时回退纯 Python (保证正确性优先)
     t = Tlsh()
     t.update(data)
+    if not t.final():
+        return None
+    return t.hexdigest()
+
+
+# ---------------------------------------------------------------- numpy 向量化路径 (可选)
+_NP_MIN_LEN = 2048          # 低于此长度 numpy 调度开销不划算
+_np_tables_cache = None
+
+
+def _np_tables():
+    """缓存 VT/Q 表的 numpy 形式 (VT: (256,), Q[s]: (256,256) uint8)"""
+    global _np_tables_cache
+    if _np_tables_cache is None:
+        VT = _np.frombuffer(V_TABLE, dtype=_np.uint8)
+        Qn = {
+            s: _np.frombuffer(b"".join(_Q[s]), dtype=_np.uint8).reshape(256, 256)
+            for s in _SALTS
+        }
+        _np_tables_cache = (VT, Qn)
+    return _np_tables_cache
+
+
+def _hash_bytes_np(data):
+    """numpy 向量化计算 TLSH (输出与 Tlsh.update+final 逐字节一致)
+
+    update() 每字节的 6 次桶更新形如 a_bucket[VT[Q[s][wj][wX] ^ wY]] += 1,
+    桶索引只依赖滑窗字节 → 可对整个输入一次性 2D gather 后 bincount 计数;
+    校验和 checksum[0] = VT[Q0[wj][wA] ^ checksum[0]] 是顺序依赖的链, 只能
+    逐字节推进 (已预取 Q0 查表结果, 每次仅 1 次 xor + 1 次查表)。
+    """
+    np = _np
+    VTn, Qn = _np_tables()
+    arr = np.frombuffer(data, dtype=np.uint8)
+    n = arr.size
+
+    wj = arr[4:]     # 当前字节 (位置 i)
+    wA = arr[3:-1]   # i-1
+    wB = arr[2:-2]   # i-2
+    wC = arr[1:-3]   # i-3
+    wD = arr[0:-4]   # i-4
+
+    # 6 组桶计数: (salt, (二元组), 第三字节) 与 update() 内联实现一一对应
+    counts = np.zeros(256, dtype=np.int64)
+    for salt, pair, third in (
+        (2,  (wj, wA), wB),
+        (3,  (wj, wA), wC),
+        (5,  (wj, wB), wC),
+        (7,  (wj, wB), wD),
+        (11, (wj, wA), wD),
+        (13, (wj, wC), wD),
+    ):
+        bidx = VTn[Qn[salt][pair] ^ third]
+        counts += np.bincount(bidx, minlength=256)
+
+    # 校验和链: c = VT[Q0[wj][wA] ^ c] (顺序依赖, 无法向量化)
+    m = Qn[0][wj, wA].tolist()
+    VTp = V_TABLE
+    c = 0
+    for x in m:
+        c = VTp[x ^ c]
+
+    t = Tlsh()
+    t.data_len = n
+    t.checksum[0] = c
+    t.a_bucket = counts.tolist()
     if not t.final():
         return None
     return t.hexdigest()
@@ -324,13 +352,125 @@ def _mod_diff(x, y, R):
 
 
 def _h_distance(x, y):
-    """单字节 body code 差异: 4 个 2-bit 四分位对差异之和 (对应官方 h_distance)"""
+    """单字节 body code 差异: 4 个 2-bit 四分位对差异之和 (对应官方 h_distance)
+
+    保留供参考/单点调试; 批量比对请用 byte_dist_table() / diff_bin()。
+    """
     diff = 0
     for a in range(4):
         va = (x >> (a * 2)) & 0x3
         vb = (y >> (a * 2)) & 0x3
         diff += _BIT_PAIRS_DIFF[va][vb]
     return diff
+
+
+# ---------------------------------------------------------------- 字节对距离表 (性能优化)
+# 65536 项预合成表: _BYTE_DIST[x*256 + y] = h_distance(x, y)
+# 把每字节 4 次"移位+查 4×4 权重矩阵"合并为一次查表 (首用懒构建, 一次约 0.1s)
+_BYTE_DIST = None
+
+
+def byte_dist_table():
+    """返回 65536 字节的字节对距离表 (懒构建; 幂等, 可多线程安全调用)"""
+    global _BYTE_DIST
+    if _BYTE_DIST is None:
+        bp = _BIT_PAIRS_DIFF
+        t = bytearray(65536)
+        for x in range(256):
+            base = x << 8
+            x0 = bp[x & 3]
+            x1 = bp[(x >> 2) & 3]
+            x2 = bp[(x >> 4) & 3]
+            x3 = bp[(x >> 6) & 3]
+            for y in range(256):
+                t[base | y] = (
+                    x0[y & 3] + x1[(y >> 2) & 3]
+                    + x2[(y >> 4) & 3] + x3[(y >> 6) & 3]
+                )
+        _BYTE_DIST = bytes(t)
+    return _BYTE_DIST
+
+
+# ---------------------------------------------------------------- 二进制表示与字段提取
+TLSH_BIN_LEN = 35  # 1(checksum) + 1(Lvalue) + 1(Q) + 32(body)
+
+
+def to_binary(h):
+    """TLSH hex → 35 字节二进制; 兼容可选 T1/t1 前缀与大小写; 无效返回 None"""
+    if not h:
+        return None
+    h = h.upper()
+    if h.startswith("T1"):
+        h = h[2:]
+    if len(h) != TLSH_STRING_LEN:
+        return None
+    try:
+        return bytes.fromhex(h)
+    except ValueError:
+        return None
+
+
+def binary_to_hex(b):
+    """35 字节二进制 → 70 位大写 hex (本项目 / VirusTotal 存储格式)"""
+    return b.hex().upper() if b is not None else None
+
+
+def header_fields(b):
+    """从 35 字节二进制 TLSH 提取头部字段: (lv, q1, q2)
+
+    lv: 反 swap 后的 Lvalue (0..255); q1/q2: 反 swap 后 Q 字节的低/高 nibble (各 0..15)。
+    """
+    q = _swap_byte(b[2])
+    return _swap_byte(b[1]), q & 0x0F, (q >> 4) & 0x0F
+
+
+def diff_bin(b1, b2, threshold=None):
+    """计算两个 35 字节二进制 TLSH 的距离 (语义与 diff() 完全一致)
+
+    b1/b2 为 to_binary() 的输出。给出 threshold 时启用提前终止:
+    累计距离一旦超过 threshold 立即返回 — 返回值 ≤ 真实距离, 只可用于
+    淘汰判断; 未触发提前终止 (返回值 ≤ threshold) 时为精确距离。
+    """
+    if b1 is None or b2 is None or len(b1) != TLSH_BIN_LEN or len(b2) != TLSH_BIN_LEN:
+        return -1
+
+    total = 0
+
+    # 1. 校验和 (byte 0): 不同则 +1 (TLSH_CHECKSUM_LEN=1, 仅 1 字节)
+    if b1[0] != b2[0]:
+        total += 1
+
+    # 2. 长度值 (byte 1, 存储为 _swap_byte(Lvalue)): 反 swap 后做 mod_diff
+    ldiff = _mod_diff(_swap_byte(b1[1]), _swap_byte(b2[1]), RANGE_LVALUE)
+    if ldiff == 1:
+        total += 1
+    elif ldiff > 1:
+        total += ldiff * LENGTH_MULT
+
+    # 3. Q 比率 (byte 2): 低 nibble = Q1ratio, 高 nibble = Q2ratio
+    q1b = _swap_byte(b1[2])
+    q2b = _swap_byte(b2[2])
+    for qa, qb in ((q1b & 0x0F, q2b & 0x0F), ((q1b >> 4) & 0x0F, (q2b >> 4) & 0x0F)):
+        qdiff = _mod_diff(qa, qb, RANGE_QRATIO)
+        if qdiff <= 1:
+            total += qdiff
+        else:
+            total += (qdiff - 1) * QRATIO_MULT
+
+    if threshold is not None and total > threshold:
+        return total
+
+    # 4. body code (bytes 3..34): 预合成字节对距离表一次查表/字节
+    dist = byte_dist_table()
+    if threshold is None:
+        for i in range(3, 35):
+            total += dist[(b1[i] << 8) | b2[i]]
+        return total
+    for i in range(3, 35):
+        total += dist[(b1[i] << 8) | b2[i]]
+        if total > threshold:
+            return total
+    return total
 
 
 def diff(h1_hex, h2_hex):
@@ -340,59 +480,15 @@ def diff(h1_hex, h2_hex):
       1. 校验和 (1 字节): 不同则 +1
       2. 长度值 Lvalue: mod_diff(L1, L2, 256); ldiff==0→+0, ldiff==1→+1, else +ldiff×12
       3. Q 比率 (Q1/Q2 各一): mod_diff(Q1, Q2, 16); qdiff≤1→+qdiff, else +(qdiff-1)×12
-      4. body code (32 字节): 逐字节 h_distance 累加
+      4. body code (32 字节): 逐字节 h_distance 累加 (预合成 65536 字节对表)
 
     返回 -1 表示输入无效 (长度不匹配/非 hex)。
     """
-    if not h1_hex or not h2_hex:
+    b1 = to_binary(h1_hex)
+    b2 = to_binary(h2_hex)
+    if b1 is None or b2 is None:
         return -1
-    h1_hex = h1_hex.upper()
-    h2_hex = h2_hex.upper()
-    # 去除可选的 "T1" 前缀 (py-tlsh 兼容; 用 startswith 而非 lstrip 避免误删合法字符)
-    if h1_hex.startswith("T1"):
-        h1_hex = h1_hex[2:]
-    if h2_hex.startswith("T1"):
-        h2_hex = h2_hex[2:]
-    if len(h1_hex) != TLSH_STRING_LEN or len(h2_hex) != TLSH_STRING_LEN:
-        return -1
-    try:
-        b1 = bytes.fromhex(h1_hex)
-        b2 = bytes.fromhex(h2_hex)
-    except ValueError:
-        return -1
-
-    total = 0
-
-    # 1. 校验和 (hex byte 0): 不同则 +1 (TLSH_CHECKSUM_LEN=1, 仅 1 字节)
-    if b1[0] != b2[0]:
-        total += 1
-
-    # 2. 长度值 (hex byte 1, 存储为 _swap_byte(Lvalue)): 反 swap 后做 mod_diff
-    l1 = _swap_byte(b1[1])
-    l2 = _swap_byte(b2[1])
-    ldiff = _mod_diff(l1, l2, RANGE_LVALUE)
-    if ldiff == 1:
-        total += 1
-    elif ldiff > 1:
-        total += ldiff * LENGTH_MULT
-
-    # 3. Q 比率 (hex byte 2, 存储为 _swap_byte(Q)):
-    #    低 nibble = Q1ratio, 高 nibble = Q2ratio; 各做 mod_diff(q, RANGE_QRATIO=16)
-    q1b = _swap_byte(b1[2])
-    q2b = _swap_byte(b2[2])
-    for qa, qb in [(q1b & 0x0F, q2b & 0x0F), ((q1b >> 4) & 0x0F, (q2b >> 4) & 0x0F)]:
-        qdiff = _mod_diff(qa, qb, RANGE_QRATIO)
-        if qdiff <= 1:
-            total += qdiff
-        else:
-            total += (qdiff - 1) * QRATIO_MULT
-
-    # 4. body code (hex bytes 3..34, 存储为 tmp_code 反序):
-    #    两哈希同序, 逐位 h_distance 累加即可 (反序不影响求和)
-    for i in range(CODE_SIZE):
-        total += _h_distance(b1[3 + i], b2[3 + i])
-
-    return total
+    return diff_bin(b1, b2)
 
 
 # 别名, 与官方 py-tlsh API 一致
